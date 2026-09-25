@@ -4,8 +4,8 @@
 // This file MUST stay untagged. vm_test.go guards each of its tests with a
 // runtime GOOS check rather than a build tag, which invites "tidying" the pair
 // into //go:build linux -- and the moment a constraint lands on this file the
-// macOS leg fails to compile with "undefined: argAfter" in a file whose author
-// never opened it. Nothing on a linux host notices: only
+// macOS leg fails to compile with "undefined: testMACAddress" in a file whose
+// author never opened it. Nothing on a linux host notices: only
 // `GOOS=darwin GOARCH=arm64 go vet ./internal/vm/` compiles vm_darwin_test.go,
 // since `go build` does not read _test.go files at all.
 package vm

@@ -192,7 +192,9 @@ func TestBuildMacOSEmptyMACOmitsMACEntirely(t *testing.T) {
 	if runtime.GOARCH != "arm64" {
 		t.Skip("macOS support is Apple Silicon only")
 	}
-	cfg := macOSBridgeConfig("en1")
+	// shared attaches to no host interface, so BridgeIface stays empty:
+	// StartConfig documents it as meaningful for bridged mode only.
+	cfg := macOSBridgeConfig("")
 	cfg.NetworkMode = "shared"
 	_, args, err := buildMacOS(cfg)
 	if err != nil {

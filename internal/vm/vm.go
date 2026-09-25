@@ -28,8 +28,13 @@ type StartConfig struct {
 	// needs none, so both must leave it empty.
 	BridgeIface  string
 	LinuxTapName string
-	// MACAddress is the guest NIC address. An empty value leaves it off the
-	// command line entirely, so QEMU falls back to its own default.
+	// MACAddress is the guest NIC address, in the usual colon-separated hex
+	// form. Leaving it empty (or whitespace-only) omits it from the command
+	// line, so QEMU falls back to its own default. A non-empty value that is
+	// not a well-formed MAC is an error, not a fallback: the realistic source
+	// is a hand-edited or corrupted state file, and a silent fallback would
+	// put two VMs on the same default address. Leading zeroes may be omitted
+	// per octet; the address is padded to the form QEMU parses.
 	MACAddress    string
 	MacOSBiosPath string
 	Detached      bool
