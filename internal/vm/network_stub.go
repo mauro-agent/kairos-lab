@@ -13,6 +13,10 @@ func PrepareLinuxBridge(_ *state.State, _ string) error {
 	return nil
 }
 
+func PrepareLinuxShared(_ *state.State, _ string) error {
+	return nil
+}
+
 func CleanupLinuxBridge(_ *state.State) error {
 	return nil
 }
