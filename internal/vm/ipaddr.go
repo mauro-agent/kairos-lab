@@ -19,11 +19,15 @@ import (
 // Three sources answer that question, and they are tried in a fixed order
 // that is about trustworthiness, not convenience:
 //
-//  1. the DHCP lease file -- the server's own record of what it handed out,
-//     so it is authoritative and it is a plain file read;
+//  1. the DHCP lease file -- OUR server's own record of what it handed out,
+//     which makes it authoritative about a shared-mode guest and says nothing
+//     at all about any other kind, so it is consulted in shared mode ONLY.
+//     See Resolve for the gate and why widening it reports the wrong address;
 //  2. the ARP/neighbour cache -- evidence the host has actually exchanged
 //     frames with that MAC, which is one subprocess and needs no agent in the
-//     guest, but ages out and can hold a stale entry from a previous boot;
+//     guest, but ages out and can hold a stale entry from a previous boot.
+//     This is the FIRST source in bridged mode, where the lease is held by a
+//     DHCP server on the LAN that we have no file for;
 //  3. the QEMU guest agent -- the guest's own answer, correct when it comes
 //     but present only if the image ships qemu-guest-agent, and on macOS
 //     usually unreachable (see guestAgentIP).
@@ -48,9 +52,18 @@ const (
 // longer does not help -- past that point the answer is a diagnostic, not
 // more patience.
 //
-// A one-second tick costs less than it looks: the lease file is the first
-// source and needs no subprocess at all, so ARP only runs on the ticks where
-// no lease has appeared yet.
+// A one-second tick is a budget for the sources and not just a sleep, and the
+// guest agent is what spends it. Every tick that finds no address runs all
+// three sources to completion: the lease read (no subprocess, microseconds),
+// one ARP/neighbour subprocess, and then the guest agent -- which, because
+// QEMU is always started with a guest-agent chardev and wait=off, ACCEPTS the
+// connection even on a guest that ships no agent and then answers nothing, so
+// it costs its full read timeout on every one of those ticks. That is why
+// qgaReadTimeout is well under this interval: with the two at 2s and 1s the
+// real cadence was 1.8s, and a 45s budget bought 23 attempts rather than 45.
+//
+// DefaultIPPollTimeout has no consumer in the tree yet -- M5 is the caller
+// that will pass it -- so nothing but TestPollDefaults pins its value today.
 const (
 	DefaultIPPollInterval = 1 * time.Second
 	DefaultIPPollTimeout  = 45 * time.Second
@@ -68,9 +81,16 @@ type IPLookup struct {
 	// recorded at the moment it applied ipv4.method shared. Empty means "use
 	// the platform default", which is right on macOS and a fallback on Linux
 	// -- see sharedLeaseFilePath for why the recorded path is the better one.
+	//
+	// It is read only in shared mode, so the path a bridged run deliberately
+	// cleared can never be reached through the default either; see Resolve.
 	LeaseFile string
-	// BridgeName derives the default lease path on Linux and is unused on
-	// macOS, where bootpd keeps one file for every vmnet client.
+	// BridgeName is the interface this VM's frames reach the host on. It
+	// derives the default lease path on Linux, and it is the interface the
+	// ARP source prefers an entry on. On macOS it does neither: bootpd keeps
+	// one file for every vmnet client, and the vmnet interface the framework
+	// picks (bridge100 and up) is not this name and is not recorded anywhere
+	// -- see arpInterfaceName in the platform files.
 	BridgeName string
 	// QGASocketPath is the unix socket QEMU was given as the guest-agent
 	// chardev backend.
@@ -116,11 +136,37 @@ func (l IPLookup) Resolve(ctx context.Context) (IPResult, bool) {
 	// The agent is still asked, because it reports the address the guest
 	// itself sees (10.0.2.15 behind SLIRP) -- true of the guest, even though
 	// the way in from the host is the forwarded ports on localhost.
-	if l.Mode != "user" {
-		if ip := l.leaseIP(); ip != "" {
+	// The lease file is a SHARED-MODE SOURCE, and this gate is deliberately
+	// "== shared" rather than "!= user". Do not widen it back.
+	//
+	// In shared mode the DHCP server is ours: NetworkManager started the
+	// dnsmasq behind the bridge, PrepareLinuxShared recorded the lease file it
+	// writes, and a line in that file for this MAC is that server saying what
+	// it handed this guest. In bridged mode none of that holds. The lease is
+	// held by a DHCP server on the physical network that we did not start and
+	// have no file for, which is exactly why PrepareLinuxBridge CLEARS
+	// state.Network.DHCPLeaseFile -- and an empty LeaseFile falling through to
+	// defaultLeaseFile would recompute, on Linux, the very path that was just
+	// cleared, and on macOS would read /var/db/dhcpd_leases, which is vmnet
+	// SHARED's database and has nothing to do with a bridged guest. Either way
+	// the file read is a previous run's record of this same disk -- MACForDisk
+	// is deterministic, so the stale line matches -- and it answers on the
+	// first tick, labelled dhcp-lease, which is the source a user trusts most.
+	// The 45-second poll cannot correct it, because it already succeeded.
+	//
+	// What covers bridged mode instead is the ARP cache below: the host has
+	// exchanged frames with this MAC whatever server leased the address, which
+	// is the source's whole point.
+	if l.Mode == "shared" {
+		if ip := l.leaseIP(time.Now()); ip != "" {
 			return IPResult{IP: ip, Source: IPSourceDHCPLease}, true
 		}
-		if ip := arpLookup(ctx, l.MAC); ip != "" {
+	}
+	// user mode is the one mode with no host sources at all; every other mode
+	// -- shared, bridged, and anything unrecognised that fell back to a real
+	// bridge -- can have a neighbour entry for this MAC.
+	if l.Mode != "user" {
+		if ip := arpLookup(ctx, l.MAC, arpInterfaceName(l.Mode, l.BridgeName)); ip != "" {
 			return IPResult{IP: ip, Source: IPSourceARP}, true
 		}
 	}
@@ -173,7 +219,9 @@ func (l IPLookup) Poll(ctx context.Context, timeout, interval time.Duration) (IP
 }
 
 // leaseIP reads the DHCP lease file this VM's server writes and returns the
-// address recorded for its MAC, or "".
+// address recorded for its MAC at now, or "". Resolve calls it in shared mode
+// and in no other; now is threaded down to the parser, which drops a record
+// whose lease had already run out.
 //
 // The recorded path wins over the computed one. PrepareLinuxShared stores the
 // lease path at the point it applies ipv4.method shared, because the file is
@@ -182,7 +230,19 @@ func (l IPLookup) Poll(ctx context.Context, timeout, interval time.Duration) (IP
 // writes the day those two names differ. The default is the fallback for a
 // state file written before that field existed, and on macOS it is simply the
 // one path bootpd uses.
-func (l IPLookup) leaseIP() string {
+//
+// Neither path is trusted blindly, and only one of them can be checked here.
+// defaultLeaseFile validates BridgeName before building a path out of it (see
+// ipaddr_linux.go). LeaseFile itself is used VERBATIM and is not validated at
+// all: it is a whole path out of state.json, and the check it would need is a
+// path check -- some rule about where a lease file may live -- not the
+// interface-name rule the other half uses. That is a deliberate omission
+// recorded here rather than an oversight. What bounds it today is that this
+// is a read performed as the invoking user, whose content is parsed and never
+// printed, and whose only observable effect is an address that must also
+// match this VM's MAC; anyone able to write state.json can already do worse
+// through the fields the network paths consume.
+func (l IPLookup) leaseIP(now time.Time) string {
 	path := l.LeaseFile
 	if path == "" {
 		path = defaultLeaseFile(l.BridgeName)
@@ -190,19 +250,19 @@ func (l IPLookup) leaseIP() string {
 	if path == "" {
 		return ""
 	}
-	return leaseLookup(path, l.MAC)
+	return leaseLookup(path, l.MAC, now)
 }
 
 // lookupLeaseFile is the half of leaseLookup that is identical on every
 // platform: read the file, hand the bytes to the platform's parser. The
 // platform file supplies only the parser, so the two cannot drift apart about
 // what "best effort" means.
-func lookupLeaseFile(path, mac string, parse func(content, mac string) string) string {
+func lookupLeaseFile(path, mac string, now time.Time, parse func(content, mac string, now time.Time) string) string {
 	content := leaseFileContent(path)
 	if content == "" {
 		return ""
 	}
-	return parse(content, mac)
+	return parse(content, mac, now)
 }
 
 // leaseFileContent returns the contents of a DHCP lease file, or "" for every
@@ -220,7 +280,14 @@ func lookupLeaseFile(path, mac string, parse func(content, mac string) string) s
 // Anything else -- a directory in place of the file, an I/O error -- is
 // treated the same way, because the caller's next move is identical in every
 // case: try the next source.
-func leaseFileContent(path string) string {
+//
+// It is a package-level var for the same reason hostCommandOutput below is:
+// it is the file-read seam, and ipaddr_test.go swaps it to observe WHICH path
+// leaseIP chose -- the default-path branch names a file under /var that no
+// test may create, and an untested branch there is how the platform default
+// silently becomes the wrong file. Nothing in production assigns it; the
+// tests restore it with t.Cleanup.
+var leaseFileContent = func(path string) string {
 	b, err := os.ReadFile(path)
 	if err != nil {
 		return ""
@@ -271,7 +338,8 @@ const qgaGetInterfaces = `{"execute":"guest-network-get-interfaces"}`
 const qgaMaxResponse = 1 << 20
 
 // qgaReadTimeout bounds one exchange with the agent, and it is the single
-// most important line in this file.
+// most important line in this file. It is also the thing that sets the real
+// poll cadence, which is why it is well under DefaultIPPollInterval.
 //
 // QEMU is started with "-chardev socket,...,server=on,wait=off". wait=off
 // means QEMU itself listens and accepts, so the connect succeeds and the
@@ -281,15 +349,45 @@ const qgaMaxResponse = 1 << 20
 // its own, this source does not fail: it blocks, for as long as the VM is
 // running, and it takes the whole poll with it.
 //
-// It is a var only so ipaddr_test.go can shorten it; nothing in production
-// assigns it.
-var qgaReadTimeout = 2 * time.Second
+// 500ms and not something longer. This timeout is paid on EVERY tick of a
+// poll that has not found an address yet -- which is every tick, for the
+// whole boot, on the many guests that ship no agent -- so it is added to the
+// interval rather than hidden inside it: at 2s it turned a 1s tick into a
+// 1.8s one and cut a 45s budget to 23 attempts. It buys nothing on the guests
+// that DO have an agent either, because qemu-ga answers a local unix socket
+// in microseconds; half a second is already orders of magnitude of headroom
+// for one line of JSON over a socket on the same machine.
+//
+// It is a var only so ipaddr_test.go can shorten or lengthen it; nothing in
+// production assigns it.
+var qgaReadTimeout = 500 * time.Millisecond
 
 // qgaDial is the exec-equivalent seam for the socket, swapped by
 // ipaddr_test.go for an in-process net.Pipe. Nothing in production assigns it.
 var qgaDial = func(ctx context.Context, path string) (net.Conn, error) {
 	var d net.Dialer
 	return d.DialContext(ctx, "unix", path)
+}
+
+// qgaDeadline is the clamp: the earlier of "one exchange from now" and
+// whatever the caller's context already allows.
+//
+// Both halves matter. Without the first, a source that never answers holds
+// the poll forever. Without the second, a poll that is about to end can be
+// extended past its own deadline by a source that started just before it --
+// and on the last tick of a 45s budget that is a read outliving the thing
+// that asked for it.
+//
+// It is a function of an explicit now, and not of time.Now(), so that the
+// clamp itself is testable: the alternative is inferring which of two
+// mechanisms ended a read from how long it took, which is exactly the kind of
+// test that passes for the wrong reason.
+func qgaDeadline(now time.Time, ctx context.Context) time.Time {
+	deadline := now.Add(qgaReadTimeout)
+	if d, ok := ctx.Deadline(); ok && d.Before(deadline) {
+		return d
+	}
+	return deadline
 }
 
 // guestAgentIP asks the guest for its own interface list and returns the
@@ -307,7 +405,18 @@ func (l IPLookup) guestAgentIP(ctx context.Context) string {
 	if l.QGASocketPath == "" {
 		return ""
 	}
-	conn, err := qgaDial(ctx, l.QGASocketPath)
+	// The deadline is computed BEFORE the dial and bounds it too. Poll with a
+	// timeout of zero or less is a documented mode, and in it ctx carries no
+	// deadline of its own, so a dial bounded by ctx alone is bounded by
+	// nothing: a unix socket whose listener has accepted but whose peer never
+	// completes, or a path on a wedged filesystem, would hold this source for
+	// the life of the VM -- the very failure qgaReadTimeout exists to stop,
+	// one syscall earlier than where it was being applied.
+	deadline := qgaDeadline(time.Now(), ctx)
+	dialCtx, cancelDial := context.WithDeadline(ctx, deadline)
+	defer cancelDial()
+
+	conn, err := qgaDial(dialCtx, l.QGASocketPath)
 	if err != nil {
 		// Expected until QEMU has created the socket, and expected forever on
 		// a macOS host where QEMU runs as root. Neither is worth saying.
@@ -315,13 +424,6 @@ func (l IPLookup) guestAgentIP(ctx context.Context) string {
 	}
 	defer conn.Close()
 
-	// The deadline is the smaller of "one exchange" and whatever the caller's
-	// context already allows, so a cancelled poll cannot be extended by this
-	// source and a long-running poll cannot be stalled by it either.
-	deadline := time.Now().Add(qgaReadTimeout)
-	if d, ok := ctx.Deadline(); ok && d.Before(deadline) {
-		deadline = d
-	}
 	if err := conn.SetDeadline(deadline); err != nil {
 		return ""
 	}
