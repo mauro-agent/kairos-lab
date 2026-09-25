@@ -1,6 +1,7 @@
 package vm
 
 import (
+	"net"
 	"strconv"
 	"strings"
 	"testing"
@@ -152,5 +153,119 @@ func TestNormalizeMACRoundTripsGeneratedMAC(t *testing.T) {
 	}
 	if got == "" {
 		t.Fatalf("generated MAC %q normalised to an empty value", mac)
+	}
+}
+
+func TestCanonicalMAC(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		in     string
+		want   string
+		wantOK bool
+	}{
+		{"padded form passes through", "52:54:00:12:34:56", "52:54:00:12:34:56", true},
+		// The direction that matters: macOS prints MACs zero-stripped, and
+		// this is where they get padded back into something a parser accepts.
+		{"macos stripped form is padded", "52:54:0:12:34:56", "52:54:00:12:34:56", true},
+		{"mixed padding is padded", "52:54:00:0a:4:f", "52:54:00:0a:04:0f", true},
+		{"all-zero address", "0:0:0:0:0:0", "00:00:00:00:00:00", true},
+		{"uppercase lowercased", "52:54:00:AB:CD:EF", "52:54:00:ab:cd:ef", true},
+		{"surrounding whitespace trimmed", "  52:54:00:12:34:56\n", "52:54:00:12:34:56", true},
+		{"broadcast address", "ff:ff:ff:ff:ff:ff", "ff:ff:ff:ff:ff:ff", true},
+		{"empty string", "", "", false},
+		{"whitespace only", "   ", "", false},
+		{"not a mac", "not-a-mac", "", false},
+		{"five octets", "52:54:00:12:34", "", false},
+		{"seven octets", "52:54:00:12:34:56:78", "", false},
+		{"three-digit octet", "52:54:000:12:34:56", "", false},
+		{"empty octet", "52:54::12:34:56", "", false},
+		{"non-hex octet", "52:54:00:12:34:zz", "", false},
+		{"dash separated", "52-54-00-12-34-56", "", false},
+		{"trailing colon", "52:54:00:12:34:56:", "", false},
+		// A MAC with QEMU option syntax glued on: comma is the option
+		// separator, so this must never reach a -device value.
+		{"trailing qemu option", "52:54:00:12:34:56,romfile=/tmp/evil.rom", "", false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			got, ok := CanonicalMAC(tc.in)
+			if got != tc.want || ok != tc.wantOK {
+				t.Errorf("CanonicalMAC(%q) = (%q, %t), want (%q, %t)",
+					tc.in, got, ok, tc.want, tc.wantOK)
+			}
+		})
+	}
+}
+
+// TestCanonicalMACAndNormalizeMACAgreeOnValidity is the property the shared
+// parser exists for: the two formatters may disagree about the SHAPE of the
+// result, never about which inputs are addresses. If they drift, a MAC that
+// matches a DHCP lease could still be refused on its way to the QEMU command
+// line, or the reverse.
+func TestCanonicalMACAndNormalizeMACAgreeOnValidity(t *testing.T) {
+	for _, in := range []string{
+		"52:54:00:12:34:56",
+		"52:54:0:12:34:56",
+		"0:0:0:0:0:0",
+		"00:00:00:00:00:00",
+		"52:54:00:AB:CD:EF",
+		"  52:54:00:12:34:56\n",
+		"ff:ff:ff:ff:ff:ff",
+		"",
+		"   ",
+		"not-a-mac",
+		"52:54:00:12:34",
+		"52:54:00:12:34:56:78",
+		"52:54:000:12:34:56",
+		"52:54::12:34:56",
+		"52:54:00:12:34:zz",
+		"52-54-00-12-34-56",
+		"52:54:00:12:34:56:",
+		"0x52:54:0:12:34:56",
+		"52:54:00:12:34:56,romfile=/tmp/evil.rom",
+	} {
+		_, normOK := NormalizeMAC(in)
+		_, canonOK := CanonicalMAC(in)
+		if normOK != canonOK {
+			t.Errorf("NormalizeMAC(%q) ok=%t but CanonicalMAC(%q) ok=%t: "+
+				"the two must accept exactly the same addresses", in, normOK, in, canonOK)
+		}
+	}
+}
+
+// TestCanonicalMACIsTheParseableForm pins why the two forms are not
+// interchangeable, so nobody "simplifies" CanonicalMAC into NormalizeMAC: the
+// stripped comparison form is not a MAC a parser accepts, and the padded one
+// is. net.ParseMAC stands in for QEMU's own parser here.
+func TestCanonicalMACIsTheParseableForm(t *testing.T) {
+	const stripped = "52:54:0:12:34:56"
+
+	canonical, ok := CanonicalMAC(stripped)
+	if !ok {
+		t.Fatalf("CanonicalMAC(%q) rejected a MAC macOS prints every day", stripped)
+	}
+	if _, err := net.ParseMAC(canonical); err != nil {
+		t.Errorf("net.ParseMAC(%q) = %v, the canonical form must be parseable", canonical, err)
+	}
+
+	// And the comparison form is not: this is the bug the split prevents.
+	normalised, ok := NormalizeMAC("52:54:00:12:34:56")
+	if !ok {
+		t.Fatal("NormalizeMAC rejected a padded MAC")
+	}
+	if _, err := net.ParseMAC(normalised); err == nil {
+		t.Errorf("net.ParseMAC(%q) unexpectedly succeeded: if the stripped form "+
+			"became parseable, the reason CanonicalMAC exists needs rewriting, "+
+			"not deleting", normalised)
+	}
+}
+
+func TestCanonicalMACRoundTripsGeneratedMAC(t *testing.T) {
+	mac := MACForDisk("kairos-core-20250101-120000")
+	got, ok := CanonicalMAC(mac)
+	if !ok {
+		t.Fatalf("generated MAC %q should be canonicalisable", mac)
+	}
+	if got != mac {
+		t.Errorf("CanonicalMAC(%q) = %q, a generated MAC is already canonical", mac, got)
 	}
 }
