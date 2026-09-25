@@ -67,10 +67,28 @@ const maxInterfaceNameLen = 15
 // sequence forges a plan row and erases the real one after it, subverting the
 // confirmation prompt that immediately follows.
 //
-// One rule closes all three: accept exactly what the kernel accepts for an
-// interface name and nothing else. That leaves no space to separate an
-// argument, no dot to walk a path and no control character to reach a
-// terminal.
+// This rule closes the first two of those, and only those: no space to
+// separate an argument, no dot to walk a path. Both of those consumers sit
+// downstream of a call to this function. The cleanup plan does not. It is
+// printed before anything validates -- `reset` and `cleanup` build and print
+// their plan straight from store.Load(), and only reach the check inside
+// cleanupNMConnections after the user has already answered the prompt. So the
+// third vector is closed at the print boundary instead: every state-derived
+// name is rendered with %q, in internal/app where the plan rows are built and
+// in the errors below, which are printed to the same terminal. Two mechanisms
+// and not one; dropping either reopens its own half.
+//
+// The rule is also deliberately stricter than the kernel, which is what makes
+// it usable as an argv and path guard. dev_valid_name() rejects only an empty
+// name, a name of IFNAMSIZ bytes or more, exactly "." or "..", and any '/',
+// ':' or whitespace -- it accepts a leading '-', and it accepts a dot
+// anywhere else. Neither is safe here: a leading '-' is read as an option by
+// the nmcli and ip invocations, and a dot is what walks out of NMSTATEDIR.
+// The known cost of the narrower rule is that a legitimate VLAN name like
+// "eth0.100" is rejected. That is accepted rather than worked around: these
+// two fields name the bridge and the tap kairos-lab creates for itself, both
+// default to names this rule allows, and nothing in the tool puts a VLAN
+// interface in either.
 func validateStoredInterfaceName(field, name string) error {
 	switch {
 	case name == "":

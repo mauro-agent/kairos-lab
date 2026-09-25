@@ -98,19 +98,28 @@ func TestValidateStoredInterfaceNameRejects(t *testing.T) {
 	tests := []struct {
 		name  string
 		value string
+		// wantMsg is a fragment only one arm of the validator can produce.
+		// "." and ".." are the cases that need it: every other rejection here
+		// is the only thing standing between the value and an error, but a
+		// dot is already outside the character class, so the arm that names
+		// it would be deletable with the whole suite still green if these two
+		// asserted nothing more specific than the generic wording. Set it
+		// wherever an arm exists for the sake of its message rather than for
+		// the rejection itself.
+		wantMsg string
 	}{
-		{"empty", ""},
-		{"dot", "."},
-		{"dot dot", ".."},
-		{"too long by one", "0123456789012345"},
-		{"embedded space splits an argv", attackNMProfileName},
-		{"path traversal escapes NMSTATEDIR", attackPathTraversal},
-		{"newline and CSI forge a plan row", attackPlanRowInjection},
-		{"shell metacharacters", "eth0;reboot"},
-		{"slash", "net/eth0"},
-		{"leading dash looks like a flag", "--help"},
-		{"non-ascii rune", "eth\u00f80"},
-		{"nul-ish control byte", "eth0\x00"},
+		{name: "empty", value: ""},
+		{name: "dot", value: ".", wantMsg: "that is a directory reference, not an interface name"},
+		{name: "dot dot", value: "..", wantMsg: "that is a directory reference, not an interface name"},
+		{name: "too long by one", value: "0123456789012345"},
+		{name: "embedded space splits an argv", value: attackNMProfileName},
+		{name: "path traversal escapes NMSTATEDIR", value: attackPathTraversal},
+		{name: "newline and CSI forge a plan row", value: attackPlanRowInjection},
+		{name: "shell metacharacters", value: "eth0;reboot"},
+		{name: "slash", value: "net/eth0"},
+		{name: "leading dash looks like a flag", value: "--help"},
+		{name: "non-ascii rune", value: "eth\u00f80"},
+		{name: "nul-ish control byte", value: "eth0\x00"},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -119,6 +128,9 @@ func TestValidateStoredInterfaceNameRejects(t *testing.T) {
 				t.Fatalf("validateStoredInterfaceName(%q) = nil, want an error", tt.value)
 			}
 			msg := err.Error()
+			if tt.wantMsg != "" && !strings.Contains(msg, tt.wantMsg) {
+				t.Errorf("error %q does not contain %q: the arm that produces that message is no longer reached, and the generic one has taken over", msg, tt.wantMsg)
+			}
 			if !strings.Contains(msg, "bridge name") {
 				t.Errorf("error does not name the field it came from: %q", msg)
 			}

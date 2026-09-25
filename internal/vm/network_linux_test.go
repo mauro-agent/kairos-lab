@@ -7,11 +7,21 @@
 // -- every symbol they touch exists only on Linux, and the darwin build of
 // the package would not compile them.
 //
-// Nothing here goes near the host. sudo and the host probes it sits next to
-// are package-level vars (see the comment above sudo); newFakeHost swaps them
-// for an in-process fake that records the argv of every command the code
-// would have handed to root, and restores the originals with t.Cleanup so no
-// test can leak its fake into another.
+// Almost nothing here goes near the host. sudo, findBridgeSlave and the host
+// probes beside them are package-level vars (see the comment above sudo);
+// newFakeHost swaps them for an in-process fake that records the argv of
+// every command the code would have handed to root, and restores the
+// originals with t.Cleanup so no test can leak its fake into another.
+//
+// "Almost", because one test is a deliberate exception:
+// TestTapOwnerUIDHonoursSudoUserFirst runs a real
+// `id -u kairoslab-no-such-user` through uidForUser. Faking the resolver
+// there would gut the test, whose entire claim is that an unresolvable
+// SUDO_USER is an error and not a silent fall back to the current uid, which
+// under sudo is root's -- only the real resolver can establish that. The
+// subprocess is read-only, changes nothing on the host, and fails the same
+// way everywhere, since the account it asks about is one no host has. No
+// other test in this file starts a process.
 package vm
 
 import (
@@ -29,9 +39,14 @@ import (
 // onto them, so a probe made after a command sees what that command did
 // rather than a frozen snapshot.
 type fakeHost struct {
-	conns    map[string]bool
-	links    map[string]bool
-	bridges  map[string]bool
+	conns   map[string]bool
+	links   map[string]bool
+	bridges map[string]bool
+	// slaves is what findBridgeSlave reports for a bridge: the first physical
+	// interface enslaved to it, or "" when there is none. A missing key is
+	// the shared-mode shape -- that bridge's only port is the tap, and
+	// findBridgeSlave skips tap interfaces, so it answers "" for it.
+	slaves   map[string]string
 	commands [][]string
 }
 
@@ -41,22 +56,25 @@ func newFakeHost(t *testing.T) *fakeHost {
 		conns:   map[string]bool{},
 		links:   map[string]bool{},
 		bridges: map[string]bool{},
+		slaves:  map[string]string{},
 	}
 
 	origSudo := sudo
 	origNMActive := networkManagerActive
 	origNmcli := nmcliAvailable
 	origConnExists := nmConnectionExists
-	origIsBridge := IsLinuxBridge
+	origIsBridge := isLinuxBridge
 	origLinkExists := linkExists
+	origFindSlave := findBridgeSlave
 	origDelay := staleCleanupSettleDelay
 	t.Cleanup(func() {
 		sudo = origSudo
 		networkManagerActive = origNMActive
 		nmcliAvailable = origNmcli
 		nmConnectionExists = origConnExists
-		IsLinuxBridge = origIsBridge
+		isLinuxBridge = origIsBridge
 		linkExists = origLinkExists
+		findBridgeSlave = origFindSlave
 		staleCleanupSettleDelay = origDelay
 	})
 
@@ -64,8 +82,9 @@ func newFakeHost(t *testing.T) *fakeHost {
 	networkManagerActive = func() bool { return true }
 	nmcliAvailable = func() bool { return true }
 	nmConnectionExists = func(name string) bool { return name != "" && h.conns[name] }
-	IsLinuxBridge = func(name string) bool { return name != "" && h.bridges[name] }
+	isLinuxBridge = func(name string) bool { return name != "" && h.bridges[name] }
 	linkExists = func(name string) bool { return name != "" && (h.links[name] || h.bridges[name]) }
+	findBridgeSlave = func(bridge string) string { return h.slaves[bridge] }
 	staleCleanupSettleDelay = 0
 
 	// Both variables empty keeps tapOwnerUID on its os.Getuid() branch, so the
@@ -305,12 +324,13 @@ func TestPrepareLinuxBridgeClearsDHCPLeaseFile(t *testing.T) {
 // a root-run command.
 //
 // The half that matters is that NOTHING is issued. The stale-cleanup block in
-// the preflight runs before any other validation and hands the stored name
-// straight to `nmcli connection delete` and `ip link delete`, so a name that
-// gets as far as that block is already a deleted host network. Each case
-// therefore seeds the fake host with the malformed name PRESENT as a
-// connection and a link: without the validator the preflight would find it
-// "stale" and delete it.
+// the preflight hands the stored name straight to `nmcli connection delete`
+// and `ip link delete`, so a name that gets as far as that block is already a
+// deleted host network -- which is why the validator is placed ahead of it
+// rather than anywhere else in the preflight. Each case seeds the fake host
+// with the malformed name PRESENT as a connection and a link, so a validator
+// that were removed, or moved back below the stale block, would leave the
+// preflight finding it "stale" and deleting it.
 func TestPrepareLinuxSharedRejectsStoredNamesBeforeIssuingAnything(t *testing.T) {
 	tests := []struct {
 		name   string
@@ -360,7 +380,10 @@ func TestPrepareLinuxSharedRejectsStoredNamesBeforeIssuingAnything(t *testing.T)
 // MASQUERADE rule, and NetworkManager persists these connections as keyfiles:
 // with autoconnect on, one `--network shared` run would put all of that on
 // every subsequent boot. kairos-lab activates both explicitly on each start,
-// so nothing is lost. Bridged is shipped behaviour and keeps autoconnect yes.
+// so a start still works; what is given up is re-activation after a
+// NetworkManager restart, which leaves a running guest's network down until
+// the next start. See prepareLinuxSharedWithNM for the trade in full.
+// Bridged is shipped behaviour and keeps autoconnect yes.
 func TestSharedDisablesAutoconnectAndBridgedKeepsIt(t *testing.T) {
 	t.Run("shared", func(t *testing.T) {
 		h := newFakeHost(t)
@@ -535,4 +558,62 @@ func TestCleanupNMConnectionsStillRemovesAValidBridge(t *testing.T) {
 			t.Errorf("missing %q in:\n%s", want, joined)
 		}
 	}
+}
+
+// The reconnect is the last thing a teardown does and the only command in it
+// that puts the host back the way it was: deleting the bridge leaves whatever
+// was enslaved to it with no active connection, and `nmcli device connect
+// <iface>` is what gives that interface one again. Nothing covered it until
+// findBridgeSlave became swappable, because reaching the branch at all meant
+// running a real `ip -o link show master` against the test host.
+//
+// It must also not fire when there is nothing to put back. A shared-mode
+// bridge has no physical slave -- its only port is the tap, which
+// findBridgeSlave skips -- and reconnecting a device that was never enslaved
+// is an unrequested change to the host's networking.
+func TestCleanupNMConnectionsReconnectsAnEnslavedHostNIC(t *testing.T) {
+	t.Run("bridge with a physical slave", func(t *testing.T) {
+		h := newFakeHost(t)
+		h.conns[DefaultBridgeName] = true
+		h.conns[DefaultBridgeName+"-uplink"] = true
+		h.bridges[DefaultBridgeName] = true
+		h.slaves[DefaultBridgeName] = "eth0"
+
+		if err := cleanupNMConnections(DefaultBridgeName); err != nil {
+			t.Fatalf("cleanupNMConnections(%q) = %v, want nil", DefaultBridgeName, err)
+		}
+		assertSequence(t, h.lines(), []string{
+			"nmcli connection delete kairoslab0-uplink",
+			"nmcli connection delete kairoslab0",
+			"ip link delete kairoslab0",
+			// After the deletes, never before: the point of reconnecting is to
+			// replace the slave profile that has just been removed.
+			"nmcli device connect eth0",
+		})
+	})
+
+	t.Run("bridge whose only slave is the tap", func(t *testing.T) {
+		h := newFakeHost(t)
+		h.conns[DefaultBridgeName] = true
+		h.conns[DefaultBridgeName+"-tap"] = true
+		h.bridges[DefaultBridgeName] = true
+		h.links[DefaultTapName] = true
+		// No h.slaves entry: findBridgeSlave skips tap interfaces, so a bridge
+		// with only a tap on it reports no slave.
+
+		if err := cleanupNMConnections(DefaultBridgeName); err != nil {
+			t.Fatalf("cleanupNMConnections(%q) = %v, want nil", DefaultBridgeName, err)
+		}
+		assertSequence(t, h.lines(), []string{
+			"nmcli connection delete kairoslab0-tap",
+			"nmcli connection delete kairoslab0",
+			"ip link delete kairoslab-tap0",
+			"ip link delete kairoslab0",
+		})
+		for _, line := range h.lines() {
+			if strings.Contains(line, "device connect") {
+				t.Errorf("reconnected a device that was never enslaved: %s", line)
+			}
+		}
+	})
 }

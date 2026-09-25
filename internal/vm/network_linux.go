@@ -273,8 +273,16 @@ func prepareLinuxSharedWithNM(bridge, tap string) error {
 	// running and nothing asking for them. kairos-lab brings both connections
 	// up explicitly on every start -- `nmcli connection up` activates a
 	// connection whose autoconnect is no, since autoconnect governs only what
-	// NetworkManager starts on its own -- so autoconnect buys this path
-	// nothing and costs a permanent host footprint.
+	// NetworkManager starts on its own.
+	//
+	// It is a trade and not a free win. What autoconnect still buys is
+	// re-activation on an event nothing here watches for: `systemctl restart
+	// NetworkManager` under a running shared-mode guest leaves the bridge and
+	// the tap down and takes the guest's network with them until the next
+	// `start`, where the bridged path comes back on its own. That is the cost
+	// accepted here, against a DHCP server, a DNS forwarder, IPv4 forwarding
+	// and a MASQUERADE rule appearing on every boot of a host that chose
+	// shared once. The recoverable failure is the better one.
 	if !nmConnectionExists(bridgeConn) {
 		if err := sudo("nmcli", "connection", "add", "type", "bridge", "ifname", bridge, "con-name", bridgeConn, "autoconnect", "no", "stp", "no"); err != nil {
 			return err
@@ -432,8 +440,15 @@ var linkExists = func(name string) bool {
 	return true
 }
 
-// findBridgeSlave finds a physical interface enslaved to the given bridge
-func findBridgeSlave(bridge string) string {
+// findBridgeSlave finds a physical interface enslaved to the given bridge.
+//
+// A var for the same reason sudo and the probes below are: it shells out to
+// `ip -o link show master <bridge>`, and it is the only thing that decides
+// whether the cleanup path issues `nmcli device connect <iface>` -- the one
+// command in a teardown that puts the host's own NIC back. A plain function
+// here made that branch both untestable and, in the tests that reach it, a
+// real subprocess. The body is unchanged.
+var findBridgeSlave = func(bridge string) string {
 	// List interfaces that have this bridge as master
 	out, err := exec.Command("ip", "-o", "link", "show", "master", bridge).Output()
 	if err != nil {
@@ -457,11 +472,11 @@ func findBridgeSlave(bridge string) string {
 	return ""
 }
 
-// sudo, and the host probes further down this file, are package-level vars
-// rather than plain functions so network_linux_test.go can swap them for
-// in-process fakes and assert the exact argv sequence these paths hand to
-// root. Nothing in production assigns them; the tests restore the originals
-// with t.Cleanup. The bodies are unchanged.
+// sudo, findBridgeSlave above it and the host probes further down this file
+// are package-level vars rather than plain functions so network_linux_test.go
+// can swap them for in-process fakes and assert the exact argv sequence these
+// paths hand to root. Nothing in production assigns them; the tests restore
+// the originals with t.Cleanup. The bodies are unchanged.
 var sudo = func(name string, args ...string) error {
 	argv := append([]string{name}, args...)
 	cmd := exec.Command("sudo", argv...)
@@ -479,7 +494,17 @@ func IsPathGone(path string) bool {
 	return errors.Is(err, os.ErrNotExist)
 }
 
-var IsLinuxBridge = func(name string) bool {
+// IsLinuxBridge is a function and not a var so that it is the same kind of
+// identifier as the !linux IsLinuxBridge in network_stub.go. When this was an
+// exported var, `vm.IsLinuxBridge = f` compiled on Linux and failed to compile
+// on darwin, which is a GOOS-specific break waiting for the first caller
+// outside this package to write it. The swappable seam the tests need stays,
+// one level down and unexported.
+func IsLinuxBridge(name string) bool {
+	return isLinuxBridge(name)
+}
+
+var isLinuxBridge = func(name string) bool {
 	if runtime.GOOS != "linux" || name == "" {
 		return false
 	}

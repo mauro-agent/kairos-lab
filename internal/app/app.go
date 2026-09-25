@@ -813,9 +813,16 @@ func runReset(args []string, stdin io.Reader, stdout io.Writer, store *state.Sto
 	printRemovalPlan(stdout, "reset", toRemove, toSkip)
 	hasStaleNetwork := vm.HasStaleNetworkResources(st)
 	if runtime.GOOS == "linux" && st.Network.CreatedByKairosLab {
+		// %q, not raw concatenation: both names come out of state.json, which
+		// anything running as the user can write, and these rows reach the
+		// terminal just above the confirmation prompt -- a stored newline plus
+		// a CSI sequence would forge a plan row and erase the real one, so the
+		// user would consent to a plan they were never shown. The validator in
+		// internal/vm only fires later, inside the cleanup itself. The stale
+		// arm below carries constants only and needs no quoting.
 		printList(stdout, "Will clean up network resources", []string{
-			"bridge: " + nonEmpty(st.Network.BridgeName, vm.DefaultBridgeName),
-			"tap: " + nonEmpty(st.Network.TapName, vm.DefaultTapName),
+			fmt.Sprintf("bridge: %q", nonEmpty(st.Network.BridgeName, vm.DefaultBridgeName)),
+			fmt.Sprintf("tap: %q", nonEmpty(st.Network.TapName, vm.DefaultTapName)),
 		})
 	} else if hasStaleNetwork {
 		printList(stdout, "Will clean up stale network resources (from failed/interrupted setup)", []string{
@@ -850,21 +857,32 @@ func runReset(args []string, stdin io.Reader, stdout io.Writer, store *state.Sto
 		state.RemoveDisk(st, d.Name)
 	}
 
+	networkCleanupFailed := false
 	if runtime.GOOS == "linux" && st.Network.CreatedByKairosLab {
 		writeLine(stdout, "Cleaning up bridged network...")
 		if err := vm.CleanupLinuxBridge(st); err != nil {
 			writef(stdout, "warning: bridge cleanup failed: %v\n", err)
+			networkCleanupFailed = true
 		}
 	} else if hasStaleNetwork {
 		writeLine(stdout, "Cleaning up stale bridged network resources...")
 		if err := vm.CleanupStaleNetworkResources(st); err != nil {
 			writef(stdout, "warning: stale network cleanup failed: %v\n", err)
+			networkCleanupFailed = true
 		}
 	}
 
 	st.VM = state.VM{}
 	if err := store.Save(st); err != nil {
 		return err
+	}
+	// The disks and files are gone either way, which is why the failure above
+	// is a warning and not an abort. But a cleanup that refused to run leaves
+	// the bridge and tap on the host and st.Network untouched, so "reset
+	// complete" would be a lie and the next reset would print the same
+	// warning forever. Name the file the user has to edit to get out of it.
+	if networkCleanupFailed {
+		return fmt.Errorf("reset incomplete: disks and files were removed, but the network resources are still on the host. Fix the bridge and tap names in stored configuration (%s), then run reset again", store.StatePath)
 	}
 	writeLine(stdout, "reset complete")
 	return nil
@@ -917,9 +935,16 @@ func runCleanup(args []string, stdin io.Reader, stdout io.Writer, store *state.S
 
 	hasStaleNetwork := vm.HasStaleNetworkResources(st)
 	if runtime.GOOS == "linux" && st.Network.CreatedByKairosLab {
+		// %q, not raw concatenation: both names come out of state.json, which
+		// anything running as the user can write, and these rows reach the
+		// terminal just above the confirmation prompt -- a stored newline plus
+		// a CSI sequence would forge a plan row and erase the real one, so the
+		// user would consent to a plan they were never shown. The validator in
+		// internal/vm only fires later, inside the cleanup itself. The stale
+		// arm below carries constants only and needs no quoting.
 		printList(stdout, "Will clean up network resources", []string{
-			"bridge: " + nonEmpty(st.Network.BridgeName, vm.DefaultBridgeName),
-			"tap: " + nonEmpty(st.Network.TapName, vm.DefaultTapName),
+			fmt.Sprintf("bridge: %q", nonEmpty(st.Network.BridgeName, vm.DefaultBridgeName)),
+			fmt.Sprintf("tap: %q", nonEmpty(st.Network.TapName, vm.DefaultTapName)),
 		})
 	} else if hasStaleNetwork {
 		printList(stdout, "Will clean up stale network resources (from failed/interrupted setup)", []string{
@@ -946,15 +971,18 @@ func runCleanup(args []string, stdin io.Reader, stdout io.Writer, store *state.S
 		return fmt.Errorf("a VM is still running (PID %d). Exit the VM first (Ctrl-a x in serial console)", st.VM.PID)
 	}
 
+	networkCleanupFailed := false
 	if runtime.GOOS == "linux" && st.Network.CreatedByKairosLab {
 		writeLine(stdout, "Cleaning up bridged network...")
 		if err := vm.CleanupLinuxBridge(st); err != nil {
 			writef(stdout, "warning: bridge cleanup failed: %v\n", err)
+			networkCleanupFailed = true
 		}
 	} else if hasStaleNetwork {
 		writeLine(stdout, "Cleaning up stale bridged network resources...")
 		if err := vm.CleanupStaleNetworkResources(st); err != nil {
 			writef(stdout, "warning: stale network cleanup failed: %v\n", err)
+			networkCleanupFailed = true
 		}
 	}
 
@@ -989,6 +1017,13 @@ func runCleanup(args []string, stdin io.Reader, stdout io.Writer, store *state.S
 	}
 	if err := store.RemoveStateFile(); err != nil && !errors.Is(err, os.ErrNotExist) {
 		return err
+	}
+	// Same reasoning as reset, minus the way out: the state file has just been
+	// removed, so there is no stored name left to correct and no command left
+	// to re-run. The leftover bridge and tap have to be removed by hand, and
+	// saying "cleanup complete" here would be how the user never learns that.
+	if networkCleanupFailed {
+		return fmt.Errorf("cleanup incomplete: files and dependencies were removed, but the network resources are still on the host. Stored configuration is gone, so delete the leftover bridge and tap connections with nmcli by hand")
 	}
 	writeLine(stdout, "cleanup complete")
 	return nil
