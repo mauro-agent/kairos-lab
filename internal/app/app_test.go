@@ -535,3 +535,67 @@ func TestOrdinaryPlanRowsAreNotQuoted(t *testing.T) {
 		t.Errorf("an ordinary plan came out quoted:\n%s", out)
 	}
 }
+
+// The removal echo and its error sibling both carry a stored path, and both
+// run AFTER the consent prompt -- so neither is the consent vector, and that
+// is exactly why they went unguarded twice. The escape at those call sites
+// was reverted in a mutation run and the whole suite stayed green: the
+// existing full-flow tests poison a path that never exists, so it lands in
+// the skip list and the removal arm never executes with a payload at all.
+// This test makes the payload reach that arm: a file that really exists,
+// inside a managed directory, in a parent the process cannot write to, so
+// os.Remove fails and both halves print.
+func TestRemovalEchoAndItsErrorAreBothInert(t *testing.T) {
+	if os.Geteuid() == 0 {
+		t.Skip("root ignores the directory mode this test relies on")
+	}
+	cfgDir := t.TempDir()
+	cacheDir := t.TempDir()
+	t.Setenv("KAIROS_LAB_CONFIG_DIR", cfgDir)
+	t.Setenv("KAIROS_LAB_CACHE_DIR", cacheDir)
+
+	// A real file whose NAME carries the payload. Keep the forged row shaped
+	// like the plan's own rows, so a miss would be invisible to a reader.
+	locked := filepath.Join(cacheDir, "locked")
+	if err := os.MkdirAll(locked, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	// No '/' in the payload: this is one filename, not a path. The forged row
+	// still imitates a real plan row, which is all the attack needs.
+	victim := filepath.Join(locked, "vm.log\n  - everything else (will be KEPT)\x1b[2K\r")
+	if err := os.WriteFile(victim, []byte("x"), 0o644); err != nil {
+		t.Fatalf("create victim: %v", err)
+	}
+	// Read+execute only: the entry is listable and statable, but unlink fails.
+	if err := os.Chmod(locked, 0o500); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.Chmod(locked, 0o755) })
+
+	store := seedInjectedState(t, func(st *state.State) {
+		st.ManagedFiles = []string{victim}
+		st.ManagedDirs = append(st.ManagedDirs, cacheDir)
+		st.Network.CreatedByKairosLab = false
+		st.Network.CleanupRequired = false
+	})
+	_ = store
+
+	var stdout, stderr bytes.Buffer
+	err := Run([]string{"cleanup", "-yes"}, strings.NewReader(""), &stdout, &stderr, "test")
+
+	// The removal must actually have been attempted and failed -- otherwise
+	// this test passes without ever exercising the lines it exists to guard.
+	if err == nil {
+		t.Fatalf("cleanup succeeded; the removal arm never failed, so nothing was exercised.\nstdout:\n%s", stdout.String())
+	}
+	if !strings.Contains(err.Error(), "remove file") {
+		t.Fatalf("error %q is not the removal failure this test needs", err)
+	}
+	if !strings.Contains(stdout.String(), "Removing file:") {
+		t.Fatalf("the removal echo never printed, so the arm was not reached:\n%s", stdout.String())
+	}
+
+	assertPlanIsInert(t, stdout.String())
+	assertPlanIsInert(t, stderr.String())
+	assertPlanIsInert(t, err.Error())
+}

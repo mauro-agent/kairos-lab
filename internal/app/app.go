@@ -851,9 +851,12 @@ func runReset(args []string, stdin io.Reader, stdout io.Writer, store *state.Sto
 	}
 
 	for _, p := range toRemove {
+		// planValue on both halves: the echo and the error that may follow it
+		// carry the same stored path, and the error is the one that can
+		// rewrite the echo above it -- the only record of what was deleted.
 		writef(stdout, "Removing: %s\n", planValue(p))
 		if err := os.Remove(p); err != nil && !errors.Is(err, os.ErrNotExist) {
-			return fmt.Errorf("remove %s: %w", p, err)
+			return fmt.Errorf("remove %s: %w", planValue(p), bareFileError(err))
 		}
 		state.RemoveManagedFile(st, p)
 	}
@@ -1032,14 +1035,14 @@ func runCleanup(args []string, stdin io.Reader, stdout io.Writer, store *state.S
 	for _, p := range filesToRemove {
 		writef(stdout, "Removing file: %s\n", planValue(p))
 		if err := os.Remove(p); err != nil && !errors.Is(err, os.ErrNotExist) {
-			return fmt.Errorf("remove file %s: %w", p, err)
+			return fmt.Errorf("remove file %s: %w", planValue(p), bareFileError(err))
 		}
 	}
 	sort.Sort(sort.Reverse(sort.StringSlice(dirsToRemove)))
 	for _, d := range dirsToRemove {
 		writef(stdout, "Removing directory: %s\n", planValue(d))
 		if err := os.RemoveAll(d); err != nil {
-			return fmt.Errorf("remove directory %s: %w", d, err)
+			return fmt.Errorf("remove directory %s: %w", planValue(d), bareFileError(err))
 		}
 	}
 	if err := store.RemoveStateFile(); err != nil && !errors.Is(err, os.ErrNotExist) {
@@ -1582,6 +1585,20 @@ func printRemovalPlan(stdout io.Writer, label string, remove []string, skip map[
 // runes, and OSC-8 hyperlinks (which need an ESC or a C1 OSC to begin). It
 // also escapes bytes that are not valid UTF-8 at all, including encoded
 // surrogates, as \x escapes.
+// bareFileError strips the path an *os.PathError carries, leaving the reason.
+// The caller already prints that path once, through planValue; the copy inside
+// the error is redundant, and because %w renders it verbatim it is the one
+// that carries a stored newline or escape sequence to the terminal. Unwrapping
+// to the syscall errno keeps errors.Is working -- os.ErrPermission and friends
+// match the errno, not the wrapper.
+func bareFileError(err error) error {
+	var pathErr *os.PathError
+	if errors.As(err, &pathErr) {
+		return pathErr.Err
+	}
+	return err
+}
+
 func planValue(s string) string {
 	// The range loop below decodes an invalid byte as utf8.RuneError, and
 	// U+FFFD is printable -- so a raw 0x9b (8-bit CSI, invalid on its own in
