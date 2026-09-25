@@ -7,6 +7,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"runtime"
+	"strconv"
 	"strings"
 	"time"
 
@@ -39,13 +40,59 @@ func linuxNetworkPreflight(st *state.State, runtimeDir, mode string) (bridge, ta
 		tap = DefaultTapName
 	}
 
-	// Check for stale bridge from previous run
-	if IsLinuxBridge(bridge) || nmConnectionExists(bridge) {
+	// Both names were just read out of state.json, and both are about to be
+	// interpolated into root-run nmcli and ip commands, into a filesystem path
+	// and into the cleanup plan the user is asked to confirm. Validate them
+	// here, at the single point where both modes resolve them, rather than at
+	// each of those call sites. A rejected name is an error and not a quiet
+	// fall back to the default: a value someone put in state.json that
+	// silently does nothing is its own surprise.
+	if err := validateStoredInterfaceName("bridge name", bridge); err != nil {
+		return "", "", err
+	}
+	if err := validateStoredInterfaceName("tap name", tap); err != nil {
+		return "", "", err
+	}
+
+	// Check for stale resources from a previous run. The predicate is shared
+	// with HasStaleNetworkResources so the two cannot disagree about what
+	// stale means; see hasStaleBridgeResources for why every term of it
+	// matters to the shared path too.
+	if hasStaleBridgeResources(bridge) {
 		fmt.Println("Found stale network configuration, cleaning up...")
 		_ = cleanupNMConnections(bridge)
-		time.Sleep(2 * time.Second)
+		time.Sleep(staleCleanupSettleDelay)
 	}
 	return bridge, tap, nil
+}
+
+// staleCleanupSettleDelay is how long the preflight waits after tearing down a
+// stale bridge, giving NetworkManager time to finish releasing the interfaces
+// before they are recreated. It is a var only so network_linux_test.go can
+// zero it; nothing in production assigns it.
+var staleCleanupSettleDelay = 2 * time.Second
+
+// hasStaleBridgeResources reports whether a previous run left any part of this
+// bridge behind: the bridge link, the bridge connection, the <bridge>-uplink
+// connection or the <bridge>-tap connection.
+//
+// Every term matters to BOTH modes, including the -uplink one that only the
+// bridged path ever creates. cleanupNMConnections downgrades a failed delete
+// to a printed warning and its caller discards the result, so a teardown can
+// end with the bridge connection gone and the -uplink connection still on the
+// host. That orphan carries `master <bridge> slave-type bridge` and
+// autoconnect, so the next `--network shared` run brings its bridge up and
+// NetworkManager enslaves the host's physical NIC to a NAT bridge -- which
+// destroys the "no uplink is enslaved" invariant that is the entire reason
+// shared mode exists, and takes the host's connectivity with it. The bridged
+// path survives the same orphan only because it recreates and re-modifies the
+// -uplink connection itself.
+//
+// linuxNetworkPreflight and HasStaleNetworkResources both call this so the
+// narrower of the two predicates cannot drift back into existence.
+func hasStaleBridgeResources(bridge string) bool {
+	return IsLinuxBridge(bridge) || nmConnectionExists(bridge) ||
+		nmConnectionExists(bridge+"-uplink") || nmConnectionExists(bridge+"-tap")
 }
 
 func PrepareLinuxBridge(st *state.State, runtimeDir string) error {
@@ -95,6 +142,14 @@ func PrepareLinuxBridge(st *state.State, runtimeDir string) error {
 	st.Network.BridgeName = bridge
 	st.Network.BridgeInterface = uplink
 	st.Network.TapName = tap
+	// There is no NetworkManager DHCP server in bridged mode; the guest leases
+	// from whatever server the physical network runs. Clear the field rather
+	// than merely not writing it, for the same reason PrepareLinuxShared
+	// clears BridgeInterface: `start --network shared` followed by
+	// `start --network bridged` never runs cleanup in between, so an earlier
+	// shared run leaves a lease path here, and the reader of this field would
+	// report a previous guest's address as this one's.
+	st.Network.DHCPLeaseFile = ""
 	st.Network.CleanupRequired = true
 	st.Network.CreatedByKairosLab = true
 	st.Network.LastPreparedAt = state.NowRFC3339()
@@ -102,7 +157,7 @@ func PrepareLinuxBridge(st *state.State, runtimeDir string) error {
 }
 
 func prepareLinuxBridgeWithNM(bridge, tap, uplink string) error {
-	if _, err := exec.LookPath("nmcli"); err != nil {
+	if !nmcliAvailable() {
 		return fmt.Errorf("NetworkManager is active but nmcli is not installed")
 	}
 	bridgeConn := bridge
@@ -199,7 +254,7 @@ func PrepareLinuxShared(st *state.State, runtimeDir string) error {
 }
 
 func prepareLinuxSharedWithNM(bridge, tap string) error {
-	if _, err := exec.LookPath("nmcli"); err != nil {
+	if !nmcliAvailable() {
 		return fmt.Errorf("NetworkManager is active but nmcli is not installed")
 	}
 	bridgeConn := bridge
@@ -209,8 +264,19 @@ func prepareLinuxSharedWithNM(bridge, tap string) error {
 		return err
 	}
 
+	// autoconnect is off on both connections this path creates, where the
+	// bridged path leaves it on. ipv4.method shared is not an idle setting: a
+	// bridge carrying it runs a DHCP server and a DNS forwarder, and turns on
+	// IPv4 forwarding and a MASQUERADE rule. NetworkManager persists these
+	// connections as keyfiles, so with autoconnect on, a user who chose shared
+	// mode once would get all four on every subsequent boot, with no VM
+	// running and nothing asking for them. kairos-lab brings both connections
+	// up explicitly on every start -- `nmcli connection up` activates a
+	// connection whose autoconnect is no, since autoconnect governs only what
+	// NetworkManager starts on its own -- so autoconnect buys this path
+	// nothing and costs a permanent host footprint.
 	if !nmConnectionExists(bridgeConn) {
-		if err := sudo("nmcli", "connection", "add", "type", "bridge", "ifname", bridge, "con-name", bridgeConn, "autoconnect", "yes", "stp", "no"); err != nil {
+		if err := sudo("nmcli", "connection", "add", "type", "bridge", "ifname", bridge, "con-name", bridgeConn, "autoconnect", "no", "stp", "no"); err != nil {
 			return err
 		}
 	}
@@ -225,19 +291,21 @@ func prepareLinuxSharedWithNM(bridge, tap string) error {
 	// upstream to source router advertisements, so auto would only leave the
 	// bridge soliciting an address that cannot arrive. ignore says what is
 	// actually true.
-	if err := sudo("nmcli", "connection", "modify", bridgeConn, "connection.interface-name", bridge, "ipv4.method", "shared", "ipv6.method", "ignore", "bridge.stp", "no", "connection.autoconnect", "yes"); err != nil {
+	if err := sudo("nmcli", "connection", "modify", bridgeConn, "connection.interface-name", bridge, "ipv4.method", "shared", "ipv6.method", "ignore", "bridge.stp", "no", "connection.autoconnect", "no"); err != nil {
 		return err
 	}
 
-	// The tap is built exactly as the bridged path builds it: the guest end is
-	// the same either way, only what sits on the other side of the bridge
-	// differs.
+	// The tap is built as the bridged path builds it -- the guest end is the
+	// same either way, only what sits on the other side of the bridge differs
+	// -- except for autoconnect, which is off here for the reason above: a tap
+	// left to come up on its own at boot brings its controller, and therefore
+	// the DHCP server and the NAT rule, up with it.
 	if !nmConnectionExists(tapConn) {
-		if err := sudo("nmcli", "connection", "add", "type", "tun", "ifname", tap, "con-name", tapConn, "mode", "tap", "owner", uid, "master", bridgeConn, "slave-type", "bridge", "autoconnect", "yes"); err != nil {
+		if err := sudo("nmcli", "connection", "add", "type", "tun", "ifname", tap, "con-name", tapConn, "mode", "tap", "owner", uid, "master", bridgeConn, "slave-type", "bridge", "autoconnect", "no"); err != nil {
 			return err
 		}
 	}
-	if err := sudo("nmcli", "connection", "modify", tapConn, "connection.interface-name", tap, "tun.mode", "tap", "tun.owner", uid, "master", bridgeConn, "slave-type", "bridge", "connection.autoconnect", "yes"); err != nil {
+	if err := sudo("nmcli", "connection", "modify", tapConn, "connection.interface-name", tap, "tun.mode", "tap", "tun.owner", uid, "master", bridgeConn, "slave-type", "bridge", "connection.autoconnect", "no"); err != nil {
 		return err
 	}
 
@@ -282,8 +350,7 @@ func HasStaleNetworkResources(st *state.State) bool {
 	if bridge == "" {
 		bridge = DefaultBridgeName
 	}
-	return IsLinuxBridge(bridge) || nmConnectionExists(bridge) ||
-		nmConnectionExists(bridge+"-uplink") || nmConnectionExists(bridge+"-tap")
+	return hasStaleBridgeResources(bridge)
 }
 
 // CleanupStaleNetworkResources removes kairos-lab network resources that aren't
@@ -300,6 +367,16 @@ func CleanupStaleNetworkResources(st *state.State) error {
 }
 
 func cleanupNMConnections(bridgeConn string) error {
+	// Every destructive command below is built from this one name, which comes
+	// out of state.json -- a 0644 file any process running as the user can
+	// write. linuxNetworkPreflight validates it before a start, but reset and
+	// cleanup reach here without passing through the preflight, so the same
+	// check has to sit at the choke point too. Without it a stored name of
+	// "eth0" turns into `sudo nmcli connection delete eth0` and
+	// `sudo ip link delete eth0`, and the host loses its network.
+	if err := validateStoredInterfaceName("bridge name", bridgeConn); err != nil {
+		return fmt.Errorf("refusing to clean up network resources: %w", err)
+	}
 	uplinkConn := bridgeConn + "-uplink"
 	tapConn := bridgeConn + "-tap"
 	tap := DefaultTapName
@@ -344,7 +421,7 @@ func cleanupNMConnections(bridgeConn string) error {
 	return nil
 }
 
-func linkExists(name string) bool {
+var linkExists = func(name string) bool {
 	if name == "" {
 		return false
 	}
@@ -380,7 +457,12 @@ func findBridgeSlave(bridge string) string {
 	return ""
 }
 
-func sudo(name string, args ...string) error {
+// sudo, and the host probes further down this file, are package-level vars
+// rather than plain functions so network_linux_test.go can swap them for
+// in-process fakes and assert the exact argv sequence these paths hand to
+// root. Nothing in production assigns them; the tests restore the originals
+// with t.Cleanup. The bodies are unchanged.
+var sudo = func(name string, args ...string) error {
 	argv := append([]string{name}, args...)
 	cmd := exec.Command("sudo", argv...)
 	cmd.Stdin = os.Stdin
@@ -397,7 +479,7 @@ func IsPathGone(path string) bool {
 	return errors.Is(err, os.ErrNotExist)
 }
 
-func IsLinuxBridge(name string) bool {
+var IsLinuxBridge = func(name string) bool {
 	if runtime.GOOS != "linux" || name == "" {
 		return false
 	}
@@ -462,14 +544,22 @@ func isVirtualInterface(name string) bool {
 	return false
 }
 
-func networkManagerActive() bool {
+var networkManagerActive = func() bool {
 	if _, err := exec.LookPath("systemctl"); err != nil {
 		return false
 	}
 	return exec.Command("systemctl", "is-active", "--quiet", "NetworkManager").Run() == nil
 }
 
-func nmConnectionExists(name string) bool {
+// nmcliAvailable reports whether the nmcli binary is on PATH. It is separate
+// from nmConnectionExists so a test can drive the prepare paths on a host that
+// has no NetworkManager installed at all.
+var nmcliAvailable = func() bool {
+	_, err := exec.LookPath("nmcli")
+	return err == nil
+}
+
+var nmConnectionExists = func(name string) bool {
 	if name == "" {
 		return false
 	}
@@ -480,17 +570,22 @@ func nmConnectionExists(name string) bool {
 }
 
 // tapOwnerUID resolves the uid the tap device is handed to, so QEMU can open
-// it without privileges. Under sudo the invoking user is the one that matters,
-// not root.
+// it without privileges. Under sudo the invoking user is the one that matters
+// and not root, which is why SUDO_USER is consulted first and why uidForUser
+// exists at all.
+//
+// Everything else falls through to os.Getuid(), the kernel's own answer for
+// who this process is: no subprocess, and nothing to validate. There is
+// deliberately no $USER step. $USER is set by login shells and by little
+// else, so under a systemd unit, cron, `env -i` or a minimal container shell
+// it is absent -- and a chain ending in a literal "root" then handed the tap
+// to uid 0 while the process ran as somebody else, leaving QEMU unable to
+// open the device it had just asked to have created.
 func tapOwnerUID() (string, error) {
-	user := os.Getenv("SUDO_USER")
-	if user == "" {
-		user = os.Getenv("USER")
+	if user := os.Getenv("SUDO_USER"); user != "" {
+		return uidForUser(user)
 	}
-	if user == "" {
-		user = "root"
-	}
-	return uidForUser(user)
+	return strconv.Itoa(os.Getuid()), nil
 }
 
 func uidForUser(user string) (string, error) {
