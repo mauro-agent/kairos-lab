@@ -14,6 +14,8 @@ import (
 	"strconv"
 	"strings"
 	"time"
+	"unicode"
+	"unicode/utf8"
 
 	"github.com/kairos-io/kairos-lab/internal/cleanup"
 	"github.com/kairos-io/kairos-lab/internal/deps"
@@ -807,22 +809,26 @@ func runReset(args []string, stdin io.Reader, stdout io.Writer, store *state.Sto
 	if len(disksToRemove) > 0 {
 		writeLine(stdout, "Will remove disks:")
 		for _, d := range disksToRemove {
-			writef(stdout, "  - %s\n", d.Name)
+			writef(stdout, "  - %s\n", planValue(d.Name))
 		}
 	}
 	printRemovalPlan(stdout, "reset", toRemove, toSkip)
 	hasStaleNetwork := vm.HasStaleNetworkResources(st)
 	if runtime.GOOS == "linux" && st.Network.CreatedByKairosLab {
-		// %q, not raw concatenation: both names come out of state.json, which
-		// anything running as the user can write, and these rows reach the
-		// terminal just above the confirmation prompt -- a stored newline plus
-		// a CSI sequence would forge a plan row and erase the real one, so the
-		// user would consent to a plan they were never shown. The validator in
-		// internal/vm only fires later, inside the cleanup itself. The stale
-		// arm below carries constants only and needs no quoting.
+		// Both names come out of state.json, which anything running as the
+		// user can write, and these rows reach the terminal just above the
+		// confirmation prompt -- a stored newline plus a CSI sequence would
+		// forge a plan row and erase the real one, so the user would consent
+		// to a plan they were never shown. The validator in internal/vm only
+		// fires later, inside the cleanup itself. Nothing is escaped here:
+		// printList runs every row through planValue, which quotes a row only
+		// when it carries something a terminal would act on, so an ordinary
+		// run still reads "bridge: kairoslab0". Escaping at this call site
+		// would protect these two rows and no others -- which is exactly the
+		// hole this replaced.
 		printList(stdout, "Will clean up network resources", []string{
-			fmt.Sprintf("bridge: %q", nonEmpty(st.Network.BridgeName, vm.DefaultBridgeName)),
-			fmt.Sprintf("tap: %q", nonEmpty(st.Network.TapName, vm.DefaultTapName)),
+			"bridge: " + nonEmpty(st.Network.BridgeName, vm.DefaultBridgeName),
+			"tap: " + nonEmpty(st.Network.TapName, vm.DefaultTapName),
 		})
 	} else if hasStaleNetwork {
 		printList(stdout, "Will clean up stale network resources (from failed/interrupted setup)", []string{
@@ -845,7 +851,7 @@ func runReset(args []string, stdin io.Reader, stdout io.Writer, store *state.Sto
 	}
 
 	for _, p := range toRemove {
-		writef(stdout, "Removing: %s\n", p)
+		writef(stdout, "Removing: %s\n", planValue(p))
 		if err := os.Remove(p); err != nil && !errors.Is(err, os.ErrNotExist) {
 			return fmt.Errorf("remove %s: %w", p, err)
 		}
@@ -857,18 +863,24 @@ func runReset(args []string, stdin io.Reader, stdout io.Writer, store *state.Sto
 		state.RemoveDisk(st, d.Name)
 	}
 
-	networkCleanupFailed := false
+	// The error itself is kept, not a bool: it is the only thing that knows
+	// WHICH part of the teardown failed. A refusal means nothing was touched
+	// and a stored name has to be corrected; a partial failure means some
+	// connections and links went and others did not, with the stored names
+	// perfectly fine. The outcome reported at the end says which of those
+	// happened by carrying this error into it.
+	var networkCleanupErr error
 	if runtime.GOOS == "linux" && st.Network.CreatedByKairosLab {
 		writeLine(stdout, "Cleaning up bridged network...")
 		if err := vm.CleanupLinuxBridge(st); err != nil {
 			writef(stdout, "warning: bridge cleanup failed: %v\n", err)
-			networkCleanupFailed = true
+			networkCleanupErr = err
 		}
 	} else if hasStaleNetwork {
 		writeLine(stdout, "Cleaning up stale bridged network resources...")
 		if err := vm.CleanupStaleNetworkResources(st); err != nil {
 			writef(stdout, "warning: stale network cleanup failed: %v\n", err)
-			networkCleanupFailed = true
+			networkCleanupErr = err
 		}
 	}
 
@@ -877,12 +889,17 @@ func runReset(args []string, stdin io.Reader, stdout io.Writer, store *state.Sto
 		return err
 	}
 	// The disks and files are gone either way, which is why the failure above
-	// is a warning and not an abort. But a cleanup that refused to run leaves
-	// the bridge and tap on the host and st.Network untouched, so "reset
-	// complete" would be a lie and the next reset would print the same
-	// warning forever. Name the file the user has to edit to get out of it.
-	if networkCleanupFailed {
-		return fmt.Errorf("reset incomplete: disks and files were removed, but the network resources are still on the host. Fix the bridge and tap names in stored configuration (%s), then run reset again", store.StatePath)
+	// is a warning and not an abort. But "reset complete" after a teardown
+	// that did not finish is a lie the user has no way to see through, and the
+	// next reset would print the same warning forever.
+	//
+	// What did not happen is not guessed at: the network layer returns the
+	// failures it collected, and this message carries them instead of
+	// asserting that every resource is still on the host and that a stored
+	// name is at fault. A refusal means exactly that; a partial teardown
+	// means some resources went and the names were never the problem.
+	if networkCleanupErr != nil {
+		return fmt.Errorf("reset incomplete: disks and files were removed, but the network cleanup did not finish: %w. What it names is still on the host; if the failure is about a stored bridge or tap name, correct it in stored configuration (%s), then run reset again", networkCleanupErr, store.StatePath)
 	}
 	writeLine(stdout, "reset complete")
 	return nil
@@ -935,16 +952,20 @@ func runCleanup(args []string, stdin io.Reader, stdout io.Writer, store *state.S
 
 	hasStaleNetwork := vm.HasStaleNetworkResources(st)
 	if runtime.GOOS == "linux" && st.Network.CreatedByKairosLab {
-		// %q, not raw concatenation: both names come out of state.json, which
-		// anything running as the user can write, and these rows reach the
-		// terminal just above the confirmation prompt -- a stored newline plus
-		// a CSI sequence would forge a plan row and erase the real one, so the
-		// user would consent to a plan they were never shown. The validator in
-		// internal/vm only fires later, inside the cleanup itself. The stale
-		// arm below carries constants only and needs no quoting.
+		// Both names come out of state.json, which anything running as the
+		// user can write, and these rows reach the terminal just above the
+		// confirmation prompt -- a stored newline plus a CSI sequence would
+		// forge a plan row and erase the real one, so the user would consent
+		// to a plan they were never shown. The validator in internal/vm only
+		// fires later, inside the cleanup itself. Nothing is escaped here:
+		// printList runs every row through planValue, which quotes a row only
+		// when it carries something a terminal would act on, so an ordinary
+		// run still reads "bridge: kairoslab0". Escaping at this call site
+		// would protect these two rows and no others -- which is exactly the
+		// hole this replaced.
 		printList(stdout, "Will clean up network resources", []string{
-			fmt.Sprintf("bridge: %q", nonEmpty(st.Network.BridgeName, vm.DefaultBridgeName)),
-			fmt.Sprintf("tap: %q", nonEmpty(st.Network.TapName, vm.DefaultTapName)),
+			"bridge: " + nonEmpty(st.Network.BridgeName, vm.DefaultBridgeName),
+			"tap: " + nonEmpty(st.Network.TapName, vm.DefaultTapName),
 		})
 	} else if hasStaleNetwork {
 		printList(stdout, "Will clean up stale network resources (from failed/interrupted setup)", []string{
@@ -971,18 +992,24 @@ func runCleanup(args []string, stdin io.Reader, stdout io.Writer, store *state.S
 		return fmt.Errorf("a VM is still running (PID %d). Exit the VM first (Ctrl-a x in serial console)", st.VM.PID)
 	}
 
-	networkCleanupFailed := false
+	// The error itself is kept, not a bool: it is the only thing that knows
+	// WHICH part of the teardown failed. A refusal means nothing was touched
+	// and a stored name has to be corrected; a partial failure means some
+	// connections and links went and others did not, with the stored names
+	// perfectly fine. The outcome reported at the end says which of those
+	// happened by carrying this error into it.
+	var networkCleanupErr error
 	if runtime.GOOS == "linux" && st.Network.CreatedByKairosLab {
 		writeLine(stdout, "Cleaning up bridged network...")
 		if err := vm.CleanupLinuxBridge(st); err != nil {
 			writef(stdout, "warning: bridge cleanup failed: %v\n", err)
-			networkCleanupFailed = true
+			networkCleanupErr = err
 		}
 	} else if hasStaleNetwork {
 		writeLine(stdout, "Cleaning up stale bridged network resources...")
 		if err := vm.CleanupStaleNetworkResources(st); err != nil {
 			writef(stdout, "warning: stale network cleanup failed: %v\n", err)
-			networkCleanupFailed = true
+			networkCleanupErr = err
 		}
 	}
 
@@ -1003,14 +1030,14 @@ func runCleanup(args []string, stdin io.Reader, stdout io.Writer, store *state.S
 	}
 
 	for _, p := range filesToRemove {
-		writef(stdout, "Removing file: %s\n", p)
+		writef(stdout, "Removing file: %s\n", planValue(p))
 		if err := os.Remove(p); err != nil && !errors.Is(err, os.ErrNotExist) {
 			return fmt.Errorf("remove file %s: %w", p, err)
 		}
 	}
 	sort.Sort(sort.Reverse(sort.StringSlice(dirsToRemove)))
 	for _, d := range dirsToRemove {
-		writef(stdout, "Removing directory: %s\n", d)
+		writef(stdout, "Removing directory: %s\n", planValue(d))
 		if err := os.RemoveAll(d); err != nil {
 			return fmt.Errorf("remove directory %s: %w", d, err)
 		}
@@ -1020,10 +1047,11 @@ func runCleanup(args []string, stdin io.Reader, stdout io.Writer, store *state.S
 	}
 	// Same reasoning as reset, minus the way out: the state file has just been
 	// removed, so there is no stored name left to correct and no command left
-	// to re-run. The leftover bridge and tap have to be removed by hand, and
-	// saying "cleanup complete" here would be how the user never learns that.
-	if networkCleanupFailed {
-		return fmt.Errorf("cleanup incomplete: files and dependencies were removed, but the network resources are still on the host. Stored configuration is gone, so delete the leftover bridge and tap connections with nmcli by hand")
+	// to re-run. Whatever the teardown could not remove has to be removed by
+	// hand, and saying "cleanup complete" here would be how the user never
+	// learns that.
+	if networkCleanupErr != nil {
+		return fmt.Errorf("cleanup incomplete: files and dependencies were removed, but the network cleanup did not finish: %w. What it names is still on the host, and stored configuration is gone, so remove those connections and links with nmcli by hand", networkCleanupErr)
 	}
 	writeLine(stdout, "cleanup complete")
 	return nil
@@ -1524,6 +1552,57 @@ func printRemovalPlan(stdout io.Writer, label string, remove []string, skip map[
 	printListWithReasons(stdout, "Will skip", skip)
 }
 
+// planValue renders a value bound for a plan the user is about to consent to.
+//
+// reset and cleanup build their plan straight from state.json -- a 0644 file
+// any process running as the user can write -- and print it directly above the
+// confirmation prompt. Every value in it is therefore untrusted text about to
+// be written to a terminal: a stored newline forges a plan row, and a CSI
+// sequence after it erases the real row that follows, so the user answers "y"
+// to a plan they were never shown. Nothing upstream can prevent this for the
+// plan, because the plan is printed before anything validates -- the interface
+// validator in internal/vm only fires later, inside the cleanup itself, and
+// paths, disk names and dependency names have no validator at all.
+//
+// So the guard lives here, at the point a value becomes a terminal line, and
+// not at the call sites: a call site has to remember, and the previous fix
+// escaped two rows while the identical attack walked through their siblings in
+// the same plan.
+//
+// A value whose runes are all printable is returned unchanged, so an ordinary
+// plan still reads "bridge: kairoslab0" and "- /home/u/.cache/kairos-lab/vm"
+// rather than being uniformly quoted into noise. Anything else is handed to
+// strconv.Quote.
+//
+// strconv.Quote, and not a hand-rolled escaper, because it is already exactly
+// this function: it escapes every rune unicode.IsPrint rejects, and IsPrint is
+// false for the whole of Cc, Cf, Co, Zl and Zp. That covers C0, DEL, the C1
+// block including 8-bit CSI U+009B and NEL U+0085, LS/PS U+2028/U+2029, the
+// bidi overrides such as RLO U+202E, the zero-width formatters, private-use
+// runes, and OSC-8 hyperlinks (which need an ESC or a C1 OSC to begin). It
+// also escapes bytes that are not valid UTF-8 at all, including encoded
+// surrogates, as \x escapes.
+func planValue(s string) string {
+	// The range loop below decodes an invalid byte as utf8.RuneError, and
+	// U+FFFD is printable -- so a raw 0x9b (8-bit CSI, invalid on its own in
+	// UTF-8) would pass the loop untouched. Reject invalid encoding first;
+	// strconv.Quote renders those bytes as \x escapes.
+	if !utf8.ValidString(s) {
+		return strconv.Quote(s)
+	}
+	for _, r := range s {
+		// The three whitespace controls are spelled out even though
+		// unicode.IsPrint already rejects all three. They are the runes that
+		// do the damage -- a newline is what makes a forged row a row -- and a
+		// reader should not have to know the Cc table to see that they are
+		// caught here.
+		if !unicode.IsPrint(r) || r == '\n' || r == '\r' || r == '\t' {
+			return strconv.Quote(s)
+		}
+	}
+	return s
+}
+
 func printList(w io.Writer, title string, values []string) {
 	writef(w, "- %s:\n", title)
 	if len(values) == 0 {
@@ -1531,7 +1610,7 @@ func printList(w io.Writer, title string, values []string) {
 		return
 	}
 	for _, v := range values {
-		writef(w, "  - %s\n", v)
+		writef(w, "  - %s\n", planValue(v))
 	}
 }
 
@@ -1547,7 +1626,10 @@ func printListWithReasons(w io.Writer, title string, values map[string]string) {
 	}
 	sort.Strings(keys)
 	for _, k := range keys {
-		writef(w, "  - %s (%s)\n", k, values[k])
+		// The reason is a constant from splitRemovalPaths today, but it goes
+		// through planValue too: this is the primitive, and the next reason
+		// added here should not have to be audited.
+		writef(w, "  - %s (%s)\n", planValue(k), planValue(values[k]))
 	}
 }
 

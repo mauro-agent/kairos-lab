@@ -1,6 +1,7 @@
 package vm
 
 import (
+	"fmt"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -187,4 +188,92 @@ func TestSharedLeaseFilePathEscapesWithoutValidation(t *testing.T) {
 			t.Errorf("sharedLeaseFilePath(%q) = %q, outside %q", name, p, nmStateDir)
 		}
 	}
+}
+
+// parseBridgeSlave lives in this untagged file, so its test belongs here
+// too: network_linux_test.go inherits the _linux.go constraint and would
+// run this on the ubuntu CI leg only, for logic that compiles on both.
+func TestParseBridgeSlave(t *testing.T) {
+	const bridge = DefaultBridgeName
+	tests := []struct {
+		name string
+		out  string
+		tap  string
+		want string
+	}{
+		{
+			name: "physical slave after the tap",
+			out: ipLinkLine(3, DefaultTapName, bridge) + "\n" +
+				ipLinkLine(4, "enp0s31f6", bridge) + "\n",
+			tap:  DefaultTapName,
+			want: "enp0s31f6",
+		},
+		{
+			// The shared-mode shape: the bridge's only port is the tap, and
+			// there is nothing to put back on the host.
+			name: "only the tap",
+			out:  ipLinkLine(3, DefaultTapName, bridge) + "\n",
+			tap:  DefaultTapName,
+			want: "",
+		},
+		{
+			name: "empty output",
+			out:  "",
+			tap:  DefaultTapName,
+			want: "",
+		},
+		{
+			name: "malformed output",
+			out:  "\n\n   \ngarbage\n4:\n",
+			tap:  DefaultTapName,
+			want: "",
+		},
+		{
+			// The regression the substring match caused: this host NIC is
+			// not the tap, and skipping it leaves the host with no active
+			// connection after a teardown and nothing said about it.
+			name: "host NIC whose name contains tap",
+			out: ipLinkLine(3, DefaultTapName, bridge) + "\n" +
+				ipLinkLine(4, "captap0", bridge) + "\n",
+			tap:  DefaultTapName,
+			want: "captap0",
+		},
+		{
+			name: "configured tap is skipped",
+			out: ipLinkLine(3, "kltap0", bridge) + "\n" +
+				ipLinkLine(4, "eth0", bridge) + "\n",
+			tap:  "kltap0",
+			want: "eth0",
+		},
+		{
+			// A tap name edited in state.json after the tap was created must
+			// not turn the real tap into a physical slave.
+			name: "default tap is skipped even when another one is configured",
+			out:  ipLinkLine(3, DefaultTapName, bridge) + "\n",
+			tap:  "kltap0",
+			want: "",
+		},
+		{
+			name: "trailing newline only",
+			out:  "\n",
+			tap:  DefaultTapName,
+			want: "",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := parseBridgeSlave(tt.out, tt.tap); got != tt.want {
+				t.Errorf("parseBridgeSlave(..., %q) = %q, want %q\nfrom:\n%s", tt.tap, got, tt.want, tt.out)
+			}
+		})
+	}
+}
+
+// ipLinkLine is one line of `ip -o link show`, continuation and all: the "\\"
+// before the link/ether half is what -o substitutes for the newline, and it
+// is there so the parser is fed the real shape rather than a tidied one.
+func ipLinkLine(index int, iface, bridge string) string {
+	return fmt.Sprintf(
+		"%d: %s: <BROADCAST,MULTICAST,UP,LOWER_UP> mtu 1500 qdisc noqueue master %s state UP mode DEFAULT group default qlen 1000\\    link/ether 02:00:00:00:00:%02x brd ff:ff:ff:ff:ff:ff",
+		index, iface, bridge, index)
 }

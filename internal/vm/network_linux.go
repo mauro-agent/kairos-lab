@@ -60,7 +60,11 @@ func linuxNetworkPreflight(st *state.State, runtimeDir, mode string) (bridge, ta
 	// matters to the shared path too.
 	if hasStaleBridgeResources(bridge) {
 		fmt.Println("Found stale network configuration, cleaning up...")
-		_ = cleanupNMConnections(bridge)
+		// The error is discarded here and nowhere else: a stale resource that
+		// will not go is not by itself a reason to refuse a start, and the
+		// `nmcli connection add` that follows fails loudly on its own if the
+		// leftover is genuinely in the way.
+		_ = cleanupNMConnections(bridge, tap)
 		time.Sleep(staleCleanupSettleDelay)
 	}
 	return bridge, tap, nil
@@ -77,16 +81,16 @@ var staleCleanupSettleDelay = 2 * time.Second
 // connection or the <bridge>-tap connection.
 //
 // Every term matters to BOTH modes, including the -uplink one that only the
-// bridged path ever creates. cleanupNMConnections downgrades a failed delete
-// to a printed warning and its caller discards the result, so a teardown can
-// end with the bridge connection gone and the -uplink connection still on the
-// host. That orphan carries `master <bridge> slave-type bridge` and
-// autoconnect, so the next `--network shared` run brings its bridge up and
-// NetworkManager enslaves the host's physical NIC to a NAT bridge -- which
-// destroys the "no uplink is enslaved" invariant that is the entire reason
-// shared mode exists, and takes the host's connectivity with it. The bridged
-// path survives the same orphan only because it recreates and re-modifies the
-// -uplink connection itself.
+// bridged path ever creates. cleanupNMConnections attempts every delete and
+// returns the ones that failed joined together, and the preflight's own call
+// discards that error, so a teardown can still end with the bridge connection
+// gone and the -uplink connection still on the host. That orphan carries
+// `master <bridge> slave-type bridge` and autoconnect, so the next
+// `--network shared` run brings its bridge up and NetworkManager enslaves the
+// host's physical NIC to a NAT bridge -- which destroys the "no uplink is
+// enslaved" invariant that is the entire reason shared mode exists, and takes
+// the host's connectivity with it. The bridged path survives the same orphan
+// only because it recreates and re-modifies the -uplink connection itself.
 //
 // linuxNetworkPreflight and HasStaleNetworkResources both call this so the
 // narrower of the two predicates cannot drift back into existence.
@@ -337,7 +341,7 @@ func CleanupLinuxBridge(st *state.State) error {
 	if bridgeConn == "" {
 		bridgeConn = DefaultBridgeName
 	}
-	if err := cleanupNMConnections(bridgeConn); err != nil {
+	if err := cleanupNMConnections(bridgeConn, st.Network.TapName); err != nil {
 		return err
 	}
 	st.Network.LastCleanupAttemptAt = state.NowRFC3339()
@@ -371,36 +375,63 @@ func CleanupStaleNetworkResources(st *state.State) error {
 	if bridge == "" {
 		bridge = DefaultBridgeName
 	}
-	return cleanupNMConnections(bridge)
+	return cleanupNMConnections(bridge, st.Network.TapName)
 }
 
-func cleanupNMConnections(bridgeConn string) error {
-	// Every destructive command below is built from this one name, which comes
-	// out of state.json -- a 0644 file any process running as the user can
-	// write. linuxNetworkPreflight validates it before a start, but reset and
-	// cleanup reach here without passing through the preflight, so the same
-	// check has to sit at the choke point too. Without it a stored name of
-	// "eth0" turns into `sudo nmcli connection delete eth0` and
-	// `sudo ip link delete eth0`, and the host loses its network.
+// cleanupNMConnections tears down the bridge, the tap and the NetworkManager
+// connections that go with them, and returns every step that failed, joined.
+//
+// It used to print each failure with fmt.Printf and return nil. That made a
+// PARTIAL teardown indistinguishable from a complete one to every caller: the
+// only non-nil return was the refusal below, so `reset` printed "reset
+// complete" over a host that still had the bridge, the tap and their
+// connections on it. The printing was the second half of the same problem --
+// fmt.Printf writes to process stdout, past the io.Writer the app layer
+// threads through reset and cleanup, so those warnings were invisible to the
+// app layer and to every test at that level.
+//
+// Collecting does not mean stopping. Every step below is still attempted
+// whatever the ones before it did: one connection that will not delete must
+// not strand the tap, the bridge and the reconnect behind it.
+func cleanupNMConnections(bridgeConn, tapName string) error {
+	// Every destructive command below is built from these two names, which
+	// come out of state.json -- a 0644 file any process running as the user
+	// can write. linuxNetworkPreflight validates them before a start, but
+	// reset and cleanup reach here without passing through the preflight, so
+	// the same check has to sit at the choke point too. Without it a stored
+	// name of "eth0" turns into `sudo nmcli connection delete eth0` and
+	// `sudo ip link delete eth0`, and the host loses its network. The tap name
+	// is checked for exactly the same reason as the bridge name: it is the
+	// argument of an `ip link delete` below.
 	if err := validateStoredInterfaceName("bridge name", bridgeConn); err != nil {
+		return fmt.Errorf("refusing to clean up network resources: %w", err)
+	}
+	tap := tapName
+	if tap == "" {
+		tap = DefaultTapName
+	}
+	if err := validateStoredInterfaceName("tap name", tap); err != nil {
 		return fmt.Errorf("refusing to clean up network resources: %w", err)
 	}
 	uplinkConn := bridgeConn + "-uplink"
 	tapConn := bridgeConn + "-tap"
-	tap := DefaultTapName
 
-	// Find the physical interface enslaved to the bridge before we delete anything
+	// Find the physical interface enslaved to the bridge before we delete
+	// anything. The tap is a port of this bridge too and must not be mistaken
+	// for it, which is why the name is passed down; see parseBridgeSlave.
 	var uplinkIface string
 	if IsLinuxBridge(bridgeConn) {
-		uplinkIface = findBridgeSlave(bridgeConn)
+		uplinkIface = findBridgeSlave(bridgeConn, tap)
 	}
+
+	var failures []error
 
 	// Delete all NM connections - use sudo (not sudoQuiet) so user can see
 	// what's happening and errors are visible
 	for _, conn := range []string{tapConn, uplinkConn, bridgeConn} {
 		if nmConnectionExists(conn) {
 			if err := sudo("nmcli", "connection", "delete", conn); err != nil {
-				fmt.Printf("warning: failed to delete connection %s: %v\n", conn, err)
+				failures = append(failures, fmt.Errorf("delete connection %s: %w", conn, err))
 			}
 		}
 	}
@@ -408,12 +439,12 @@ func cleanupNMConnections(bridgeConn string) error {
 	// Now clean up any lingering interfaces that NM didn't remove
 	if linkExists(tap) {
 		if err := sudo("ip", "link", "delete", tap); err != nil {
-			fmt.Printf("warning: failed to delete interface %s: %v\n", tap, err)
+			failures = append(failures, fmt.Errorf("delete interface %s: %w", tap, err))
 		}
 	}
 	if linkExists(bridgeConn) {
 		if err := sudo("ip", "link", "delete", bridgeConn); err != nil {
-			fmt.Printf("warning: failed to delete interface %s: %v\n", bridgeConn, err)
+			failures = append(failures, fmt.Errorf("delete interface %s: %w", bridgeConn, err))
 		}
 	}
 
@@ -422,11 +453,13 @@ func cleanupNMConnections(bridgeConn string) error {
 	if uplinkIface != "" {
 		fmt.Printf("Reconnecting %s...\n", uplinkIface)
 		if err := sudo("nmcli", "device", "connect", uplinkIface); err != nil {
-			fmt.Printf("warning: failed to reconnect %s: %v\n", uplinkIface, err)
+			failures = append(failures, fmt.Errorf("reconnect %s: %w", uplinkIface, err))
 		}
 	}
 
-	return nil
+	// nil when failures is empty, which is the whole point: a teardown that
+	// did everything asked of it still reports success.
+	return errors.Join(failures...)
 }
 
 var linkExists = func(name string) bool {
@@ -440,43 +473,39 @@ var linkExists = func(name string) bool {
 	return true
 }
 
-// findBridgeSlave finds a physical interface enslaved to the given bridge.
+// bridgeSlaveLinks returns the output of `ip -o link show master <bridge>`,
+// one line per interface enslaved to that bridge, or "" when the command
+// fails -- an unknown bridge, or no `ip` on PATH.
 //
-// A var for the same reason sudo and the probes below are: it shells out to
-// `ip -o link show master <bridge>`, and it is the only thing that decides
-// whether the cleanup path issues `nmcli device connect <iface>` -- the one
-// command in a teardown that puts the host's own NIC back. A plain function
-// here made that branch both untestable and, in the tests that reach it, a
-// real subprocess. The body is unchanged.
-var findBridgeSlave = func(bridge string) string {
-	// List interfaces that have this bridge as master
+// This is the swappable seam, and it sits one level BELOW findBridgeSlave,
+// which used to be the var itself. Replacing the whole function also replaced
+// the part that decides WHICH interface gets reconnected, so the filter in it
+// was never executed by a test: deleting that filter left the entire suite
+// green. With only the exec replaced, every test that reaches a teardown runs
+// the real parse and the real filter over output the fake supplies.
+var bridgeSlaveLinks = func(bridge string) string {
 	out, err := exec.Command("ip", "-o", "link", "show", "master", bridge).Output()
 	if err != nil {
 		return ""
 	}
-	// Parse output to find non-tap interfaces
-	lines := strings.Split(strings.TrimSpace(string(out)), "\n")
-	for _, line := range lines {
-		fields := strings.Fields(line)
-		if len(fields) < 2 {
-			continue
-		}
-		// Format: "3: enp0s31f6: <...>"
-		iface := strings.TrimSuffix(fields[1], ":")
-		// Skip tap interfaces
-		if strings.Contains(iface, "tap") {
-			continue
-		}
-		return iface
-	}
-	return ""
+	return string(out)
 }
 
-// sudo, findBridgeSlave above it and the host probes further down this file
+// findBridgeSlave finds the physical interface enslaved to the given bridge,
+// or "" when it has none. tap is the tap device in play; it is a port of this
+// same bridge and is never the answer. The choosing is parseBridgeSlave's, in
+// network_shared_parse.go, where it can be tested on any host.
+func findBridgeSlave(bridge, tap string) string {
+	return parseBridgeSlave(bridgeSlaveLinks(bridge), tap)
+}
+
+// sudo, bridgeSlaveLinks above it and the host probes further down this file
 // are package-level vars rather than plain functions so network_linux_test.go
 // can swap them for in-process fakes and assert the exact argv sequence these
-// paths hand to root. Nothing in production assigns them; the tests restore
-// the originals with t.Cleanup. The bodies are unchanged.
+// paths hand to root. Every one of them is an exec call and nothing more, so
+// what a fake replaces is the subprocess and never a decision: findBridgeSlave
+// is a plain function for that reason. Nothing in production assigns these;
+// the tests restore the originals with t.Cleanup.
 var sudo = func(name string, args ...string) error {
 	argv := append([]string{name}, args...)
 	cmd := exec.Command("sudo", argv...)

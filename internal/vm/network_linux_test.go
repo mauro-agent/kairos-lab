@@ -7,11 +7,14 @@
 // -- every symbol they touch exists only on Linux, and the darwin build of
 // the package would not compile them.
 //
-// Almost nothing here goes near the host. sudo, findBridgeSlave and the host
+// Almost nothing here goes near the host. sudo, bridgeSlaveLinks and the host
 // probes beside them are package-level vars (see the comment above sudo);
 // newFakeHost swaps them for an in-process fake that records the argv of
 // every command the code would have handed to root, and restores the
-// originals with t.Cleanup so no test can leak its fake into another.
+// originals with t.Cleanup so no test can leak its fake into another. What
+// the fake replaces is only ever a subprocess: findBridgeSlave, which decides
+// which interface a teardown reconnects, is a plain function and runs for
+// real in every test that reaches it.
 //
 // "Almost", because one test is a deliberate exception:
 // TestTapOwnerUIDHonoursSudoUserFirst runs a real
@@ -42,11 +45,20 @@ type fakeHost struct {
 	conns   map[string]bool
 	links   map[string]bool
 	bridges map[string]bool
-	// slaves is what findBridgeSlave reports for a bridge: the first physical
-	// interface enslaved to it, or "" when there is none. A missing key is
-	// the shared-mode shape -- that bridge's only port is the tap, and
-	// findBridgeSlave skips tap interfaces, so it answers "" for it.
-	slaves   map[string]string
+	// slaves lists the interfaces enslaved to a bridge, tap included. A
+	// missing key is a bridge with no ports at all; the shared-mode shape is
+	// the tap on its own, which findBridgeSlave must report as no slave.
+	//
+	// The list is in the order `ip -o link show master <bridge>` would print
+	// it, and the fake renders real-looking output from it, so the parse and
+	// the tap filter in findBridgeSlave run for real. Seeding the tap in the
+	// list is the point: a bridge always has its tap on it, and a filter that
+	// stopped working would return the tap here.
+	slaves map[string][]string
+	// failCmd, when set, decides which recorded commands fail. A failing
+	// command is still recorded but is not applied to the host state, which
+	// is how a partial teardown really behaves.
+	failCmd  func(argv []string) error
 	commands [][]string
 }
 
@@ -56,7 +68,7 @@ func newFakeHost(t *testing.T) *fakeHost {
 		conns:   map[string]bool{},
 		links:   map[string]bool{},
 		bridges: map[string]bool{},
-		slaves:  map[string]string{},
+		slaves:  map[string][]string{},
 	}
 
 	origSudo := sudo
@@ -65,7 +77,7 @@ func newFakeHost(t *testing.T) *fakeHost {
 	origConnExists := nmConnectionExists
 	origIsBridge := isLinuxBridge
 	origLinkExists := linkExists
-	origFindSlave := findBridgeSlave
+	origSlaveLinks := bridgeSlaveLinks
 	origDelay := staleCleanupSettleDelay
 	t.Cleanup(func() {
 		sudo = origSudo
@@ -74,7 +86,7 @@ func newFakeHost(t *testing.T) *fakeHost {
 		nmConnectionExists = origConnExists
 		isLinuxBridge = origIsBridge
 		linkExists = origLinkExists
-		findBridgeSlave = origFindSlave
+		bridgeSlaveLinks = origSlaveLinks
 		staleCleanupSettleDelay = origDelay
 	})
 
@@ -84,7 +96,7 @@ func newFakeHost(t *testing.T) *fakeHost {
 	nmConnectionExists = func(name string) bool { return name != "" && h.conns[name] }
 	isLinuxBridge = func(name string) bool { return name != "" && h.bridges[name] }
 	linkExists = func(name string) bool { return name != "" && (h.links[name] || h.bridges[name]) }
-	findBridgeSlave = func(bridge string) string { return h.slaves[bridge] }
+	bridgeSlaveLinks = h.slaveLinks
 	staleCleanupSettleDelay = 0
 
 	// Both variables empty keeps tapOwnerUID on its os.Getuid() branch, so the
@@ -97,8 +109,25 @@ func newFakeHost(t *testing.T) *fakeHost {
 func (h *fakeHost) run(name string, args ...string) error {
 	argv := append([]string{name}, args...)
 	h.commands = append(h.commands, argv)
+	if h.failCmd != nil {
+		if err := h.failCmd(argv); err != nil {
+			// Not applied: a command that failed changed nothing.
+			return err
+		}
+	}
 	h.apply(argv)
 	return nil
+}
+
+// slaveLinks renders `ip -o link show master <bridge>` from the fake's own
+// slave list, one line per enslaved interface, in the kernel's format.
+func (h *fakeHost) slaveLinks(bridge string) string {
+	var b strings.Builder
+	for i, iface := range h.slaves[bridge] {
+		b.WriteString(ipLinkLine(i+3, iface, bridge))
+		b.WriteString("\n")
+	}
+	return b.String()
 }
 
 func (h *fakeHost) apply(argv []string) {
@@ -525,7 +554,7 @@ func TestCleanupNMConnectionsRefusesAMalformedStoredName(t *testing.T) {
 			h.links[bridge] = true
 			h.bridges[bridge] = true
 
-			err := cleanupNMConnections(bridge)
+			err := cleanupNMConnections(bridge, DefaultTapName)
 			if err == nil {
 				t.Fatalf("cleanupNMConnections accepted a malformed stored name")
 			}
@@ -546,7 +575,7 @@ func TestCleanupNMConnectionsStillRemovesAValidBridge(t *testing.T) {
 	h.conns[DefaultBridgeName+"-tap"] = true
 	h.bridges[DefaultBridgeName] = true
 
-	if err := cleanupNMConnections(DefaultBridgeName); err != nil {
+	if err := cleanupNMConnections(DefaultBridgeName, DefaultTapName); err != nil {
 		t.Fatalf("cleanupNMConnections(%q) = %v, want nil", DefaultBridgeName, err)
 	}
 	joined := strings.Join(h.lines(), "\n")
@@ -563,23 +592,28 @@ func TestCleanupNMConnectionsStillRemovesAValidBridge(t *testing.T) {
 // The reconnect is the last thing a teardown does and the only command in it
 // that puts the host back the way it was: deleting the bridge leaves whatever
 // was enslaved to it with no active connection, and `nmcli device connect
-// <iface>` is what gives that interface one again. Nothing covered it until
-// findBridgeSlave became swappable, because reaching the branch at all meant
-// running a real `ip -o link show master` against the test host.
+// <iface>` is what gives that interface one again.
 //
-// It must also not fire when there is nothing to put back. A shared-mode
-// bridge has no physical slave -- its only port is the tap, which
-// findBridgeSlave skips -- and reconnecting a device that was never enslaved
-// is an unrequested change to the host's networking.
+// The tap is seeded as a slave in every case here, because it always is one:
+// the fake renders real `ip -o link show master` output and findBridgeSlave
+// parses it for real, so whether the tap or the host NIC comes back is
+// decided by the filter under test and not by the fake.
+//
+// The reconnect must also not fire when there is nothing to put back. A
+// shared-mode bridge has no physical slave -- its only port is the tap -- and
+// reconnecting a device that was never enslaved is an unrequested change to
+// the host's networking.
 func TestCleanupNMConnectionsReconnectsAnEnslavedHostNIC(t *testing.T) {
 	t.Run("bridge with a physical slave", func(t *testing.T) {
 		h := newFakeHost(t)
 		h.conns[DefaultBridgeName] = true
 		h.conns[DefaultBridgeName+"-uplink"] = true
 		h.bridges[DefaultBridgeName] = true
-		h.slaves[DefaultBridgeName] = "eth0"
+		// The tap is listed first, as the kernel would list it, so returning
+		// the first line instead of the first non-tap line is visible here.
+		h.slaves[DefaultBridgeName] = []string{DefaultTapName, "eth0"}
 
-		if err := cleanupNMConnections(DefaultBridgeName); err != nil {
+		if err := cleanupNMConnections(DefaultBridgeName, DefaultTapName); err != nil {
 			t.Fatalf("cleanupNMConnections(%q) = %v, want nil", DefaultBridgeName, err)
 		}
 		assertSequence(t, h.lines(), []string{
@@ -598,10 +632,9 @@ func TestCleanupNMConnectionsReconnectsAnEnslavedHostNIC(t *testing.T) {
 		h.conns[DefaultBridgeName+"-tap"] = true
 		h.bridges[DefaultBridgeName] = true
 		h.links[DefaultTapName] = true
-		// No h.slaves entry: findBridgeSlave skips tap interfaces, so a bridge
-		// with only a tap on it reports no slave.
+		h.slaves[DefaultBridgeName] = []string{DefaultTapName}
 
-		if err := cleanupNMConnections(DefaultBridgeName); err != nil {
+		if err := cleanupNMConnections(DefaultBridgeName, DefaultTapName); err != nil {
 			t.Fatalf("cleanupNMConnections(%q) = %v, want nil", DefaultBridgeName, err)
 		}
 		assertSequence(t, h.lines(), []string{
@@ -615,5 +648,172 @@ func TestCleanupNMConnectionsReconnectsAnEnslavedHostNIC(t *testing.T) {
 				t.Errorf("reconnected a device that was never enslaved: %s", line)
 			}
 		}
+	})
+
+	// The substring filter this replaced skipped any interface whose name
+	// merely contained "tap", so a host NIC called "captap0" was left with no
+	// active connection after a teardown and nothing said so.
+	t.Run("host NIC whose name contains tap", func(t *testing.T) {
+		h := newFakeHost(t)
+		h.conns[DefaultBridgeName] = true
+		h.bridges[DefaultBridgeName] = true
+		h.slaves[DefaultBridgeName] = []string{DefaultTapName, "captap0"}
+
+		if err := cleanupNMConnections(DefaultBridgeName, DefaultTapName); err != nil {
+			t.Fatalf("cleanupNMConnections(%q) = %v, want nil", DefaultBridgeName, err)
+		}
+		assertSequence(t, h.lines(), []string{
+			"nmcli connection delete kairoslab0",
+			"ip link delete kairoslab0",
+			"nmcli device connect captap0",
+		})
+	})
+}
+
+// A teardown that could not finish must say so. cleanupNMConnections used to
+// print each failure with fmt.Printf and return nil, so the only non-nil
+// return was the refusal above: `reset` printed "reset complete" over a host
+// that still had every one of these resources on it, and the warnings went to
+// process stdout where the app layer's own writer could not see them.
+func TestCleanupNMConnectionsReportsEveryFailure(t *testing.T) {
+	t.Run("every step fails", func(t *testing.T) {
+		h := newFakeHost(t)
+		h.conns[DefaultBridgeName] = true
+		h.conns[DefaultBridgeName+"-tap"] = true
+		h.conns[DefaultBridgeName+"-uplink"] = true
+		h.bridges[DefaultBridgeName] = true
+		h.links[DefaultTapName] = true
+		h.slaves[DefaultBridgeName] = []string{DefaultTapName, "eth0"}
+		h.failCmd = func([]string) error { return fmt.Errorf("exit status 1") }
+
+		err := cleanupNMConnections(DefaultBridgeName, DefaultTapName)
+		if err == nil {
+			t.Fatal("cleanupNMConnections reported success after every step failed")
+		}
+
+		// Collecting is not stopping: one resource that will not go must not
+		// strand the ones behind it.
+		assertSequence(t, h.lines(), []string{
+			"nmcli connection delete kairoslab0-tap",
+			"nmcli connection delete kairoslab0-uplink",
+			"nmcli connection delete kairoslab0",
+			"ip link delete kairoslab-tap0",
+			"ip link delete kairoslab0",
+			"nmcli device connect eth0",
+		})
+
+		// And every failure is named, since this error is what the app layer
+		// prints in place of "reset complete".
+		for _, want := range []string{
+			"delete connection kairoslab0-tap",
+			"delete connection kairoslab0-uplink",
+			"delete connection kairoslab0",
+			"delete interface kairoslab-tap0",
+			"delete interface kairoslab0",
+			"reconnect eth0",
+		} {
+			if !strings.Contains(err.Error(), want) {
+				t.Errorf("error does not mention %q:\n%v", want, err)
+			}
+		}
+	})
+
+	t.Run("one step fails", func(t *testing.T) {
+		h := newFakeHost(t)
+		h.conns[DefaultBridgeName] = true
+		h.conns[DefaultBridgeName+"-tap"] = true
+		h.bridges[DefaultBridgeName] = true
+		h.links[DefaultTapName] = true
+		h.failCmd = func(argv []string) error {
+			if strings.Join(argv, " ") == "nmcli connection delete kairoslab0-tap" {
+				return fmt.Errorf("exit status 1")
+			}
+			return nil
+		}
+
+		err := cleanupNMConnections(DefaultBridgeName, DefaultTapName)
+		if err == nil {
+			t.Fatal("a partial teardown reported success")
+		}
+		if !strings.Contains(err.Error(), "delete connection kairoslab0-tap") {
+			t.Errorf("error does not name the step that failed:\n%v", err)
+		}
+		if strings.Contains(err.Error(), "delete interface kairoslab0") {
+			t.Errorf("error names a step that succeeded:\n%v", err)
+		}
+		assertSequence(t, h.lines(), []string{
+			"nmcli connection delete kairoslab0-tap",
+			"nmcli connection delete kairoslab0",
+			"ip link delete kairoslab-tap0",
+			"ip link delete kairoslab0",
+		})
+	})
+
+	t.Run("nothing fails", func(t *testing.T) {
+		h := newFakeHost(t)
+		h.conns[DefaultBridgeName] = true
+		h.bridges[DefaultBridgeName] = true
+
+		if err := cleanupNMConnections(DefaultBridgeName, DefaultTapName); err != nil {
+			t.Fatalf("a teardown that did everything asked of it returned %v, want nil", err)
+		}
+	})
+}
+
+// The tap name reaches `sudo ip link delete <name>` exactly as the bridge
+// name does, so it is checked at the same choke point and for the same
+// reason. Before it was threaded through, this path deleted the constant
+// DefaultTapName whatever state.json said -- which left a configured tap on
+// the host and needed no validation because no stored value was used.
+func TestCleanupNMConnectionsRefusesAMalformedStoredTapName(t *testing.T) {
+	for _, tap := range []string{attackNMProfileName, attackPathTraversal, attackPlanRowInjection} {
+		t.Run(fmt.Sprintf("%q", tap), func(t *testing.T) {
+			h := newFakeHost(t)
+			h.conns[DefaultBridgeName] = true
+			h.links[tap] = true
+
+			err := cleanupNMConnections(DefaultBridgeName, tap)
+			if err == nil {
+				t.Fatal("cleanupNMConnections accepted a malformed stored tap name")
+			}
+			if len(h.commands) != 0 {
+				t.Errorf("rejected input still reached root:\n  %s", strings.Join(h.lines(), "\n  "))
+			}
+			if !strings.Contains(err.Error(), "tap name") {
+				t.Errorf("error %q does not name the field it came from", err)
+			}
+		})
+	}
+
+	// An empty tap name is not malformed: it is a state file written before
+	// the tap was ever created, and it means the default.
+	t.Run("empty means the default", func(t *testing.T) {
+		h := newFakeHost(t)
+		h.conns[DefaultBridgeName] = true
+		h.links[DefaultTapName] = true
+
+		if err := cleanupNMConnections(DefaultBridgeName, ""); err != nil {
+			t.Fatalf("cleanupNMConnections with no stored tap name = %v, want nil", err)
+		}
+		assertSequence(t, h.lines(), []string{
+			"nmcli connection delete kairoslab0",
+			"ip link delete kairoslab-tap0",
+		})
+	})
+
+	// And a configured one is the tap that gets deleted, which is the point of
+	// threading it in at all.
+	t.Run("a configured tap is the one deleted", func(t *testing.T) {
+		h := newFakeHost(t)
+		h.conns[DefaultBridgeName] = true
+		h.links["kltap0"] = true
+
+		if err := cleanupNMConnections(DefaultBridgeName, "kltap0"); err != nil {
+			t.Fatalf("cleanupNMConnections = %v, want nil", err)
+		}
+		assertSequence(t, h.lines(), []string{
+			"nmcli connection delete kairoslab0",
+			"ip link delete kltap0",
+		})
 	})
 }

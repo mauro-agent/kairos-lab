@@ -6,9 +6,9 @@ import (
 	"strings"
 )
 
-// The path building in this file is deliberately kept apart from the exec
-// calls in network_linux.go so it can be exercised on any host, not only on
-// Linux. network_linux.go carries no build tag of its own: it compiles only on
+// The path building and the output parsing in this file are deliberately kept
+// apart from the exec calls in network_linux.go so they can be exercised on
+// any host, not only on Linux. network_linux.go carries no build tag of its own: it compiles only on
 // Linux by virtue of its _linux.go filename, and a test placed beside it would
 // inherit that constraint.
 
@@ -72,11 +72,19 @@ const maxInterfaceNameLen = 15
 // downstream of a call to this function. The cleanup plan does not. It is
 // printed before anything validates -- `reset` and `cleanup` build and print
 // their plan straight from store.Load(), and only reach the check inside
-// cleanupNMConnections after the user has already answered the prompt. So the
-// third vector is closed at the print boundary instead: every state-derived
-// name is rendered with %q, in internal/app where the plan rows are built and
-// in the errors below, which are printed to the same terminal. Two mechanisms
-// and not one; dropping either reopens its own half.
+// cleanupNMConnections after the user has already answered the prompt.
+//
+// So the third vector is closed at the print boundary instead, by a different
+// mechanism than this one. internal/app runs every plan row through its
+// planValue helper, which returns a value unchanged when all of its runes are
+// printable and hands it to strconv.Quote when any is not -- so a row carrying
+// a newline, a CSI sequence or an invalid UTF-8 byte arrives as one escaped
+// line, whatever this validator would have made of it. That covers the rows
+// these two names appear in and every sibling row beside them: stored paths,
+// disk names and dependency names, none of which pass through here at all. The
+// errors below quote with %q for the same reason, since they are printed to
+// the same terminal and one of them carries the rejected value back to it.
+// Two mechanisms and not one; dropping either reopens its own half.
 //
 // The rule is also deliberately stricter than the kernel, which is what makes
 // it usable as an argv and path guard. dev_valid_name() rejects only an empty
@@ -113,4 +121,39 @@ func validateStoredInterfaceName(field, name string) error {
 		return fmt.Errorf("invalid %s %q in stored configuration: an interface name may contain only letters, digits, '_' and '-'", field, name)
 	}
 	return nil
+}
+
+// parseBridgeSlave returns the first interface in `ip -o link show master
+// <bridge>` output that is not the tap, or "" when the output names none.
+// network_linux.go owns the exec that produces out; this half is the part
+// worth testing, and it needs no Linux and no bridge to test.
+//
+// The filter is the whole point of the function. What it returns is the
+// interface the teardown hands to `nmcli device connect` -- the one command in
+// a teardown that puts the host's own NIC back after the bridge it was
+// enslaved to is deleted. Return the tap and the teardown reconnects a device
+// nobody enslaved and leaves the real NIC with no active connection; return ""
+// when there was a physical slave and the host is left off the network with
+// nothing said.
+//
+// tap is matched by name. The old filter skipped any interface whose name
+// merely CONTAINED "tap", so a host NIC called "captap0" or "tap-lan" was
+// silently never reconnected. DefaultTapName is skipped alongside the
+// configured name so that a tap name edited in state.json after the tap was
+// created cannot make the old tap look like a physical slave; for the default
+// configuration the two are the same string and the behaviour is unchanged.
+func parseBridgeSlave(out, tap string) string {
+	for _, line := range strings.Split(out, "\n") {
+		fields := strings.Fields(line)
+		if len(fields) < 2 {
+			continue
+		}
+		// Format: "3: enp0s31f6: <BROADCAST,MULTICAST,UP,LOWER_UP> mtu 1500 ..."
+		iface := strings.TrimSuffix(fields[1], ":")
+		if iface == "" || iface == tap || iface == DefaultTapName {
+			continue
+		}
+		return iface
+	}
+	return ""
 }
