@@ -2,7 +2,10 @@
 
 package vm
 
-import "context"
+import (
+	"context"
+	"time"
+)
 
 // Neither host source exists off macOS and Linux: there is no lease file this
 // package knows the shape of, and no ARP command whose output it can parse.
@@ -16,6 +19,9 @@ import "context"
 
 func defaultLeaseFile(_ string) string { return "" }
 
-func leaseLookup(_, _ string) string { return "" }
+func leaseLookup(_, _ string, _ time.Time) string { return "" }
 
-func arpLookup(_ context.Context, _ string) string { return "" }
+// arpInterfaceName has no ARP source to name an interface for.
+func arpInterfaceName(_, _ string) string { return "" }
+
+func arpLookup(_ context.Context, _, _ string) string { return "" }

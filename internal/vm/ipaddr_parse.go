@@ -2,7 +2,9 @@ package vm
 
 import (
 	"net"
+	"strconv"
 	"strings"
+	"time"
 )
 
 // The parsing in this file is deliberately kept apart from the exec calls and
@@ -35,6 +37,26 @@ import (
 //
 // None of them may panic on ragged input. A lease file is read while its
 // writer is appending to it, and an ARP table is whatever the host prints.
+//
+// Two further rules were added after the first version of this file, and both
+// exist because a source that is merely OLD answers exactly like a source that
+// is right:
+//
+//   - The two lease parsers take a now and honour the expiry their format
+//     records. Neither DHCP server deletes an expired record: dnsmasq keeps
+//     the line until the address is handed to somebody else, and bootpd keeps
+//     the group until the entry is reused, so a file that names this MAC is
+//     not on its own evidence that the address is still this guest's. The
+//     clock is a PARAMETER and never time.Now(): everything in this file is a
+//     pure function of its arguments, which is what lets both platforms'
+//     formats be tested on either CI leg.
+//   - The two ARP parsers take an iface and PREFER an entry on it. The
+//     neighbour tables carry one entry per (address, interface) pair, so the
+//     same MAC can legitimately appear twice -- once on the bridge this VM is
+//     on and once, left over from an earlier run in another mode, on the
+//     host's uplink -- and the order the kernel prints them in is a hash
+//     order, not a recency order. The preference is soft on purpose; see
+//     parseDarwinARP for why a hard filter would be worse than no filter.
 
 // usableIPv4 returns the dotted-quad form of s when s is an IPv4 address a
 // guest could actually be reached at, and "" for everything else.
@@ -120,17 +142,25 @@ func ethernetHWAddress(value string) string {
 //     while bootpd is writing it. A record cut off that way still counts if
 //     both fields we need arrived, which is why the match is attempted once
 //     more after the loop rather than only on "}".
-func parseDarwinLeases(content, mac string) string {
+//
+// lease= is read for its expiry and is the fourth property that shapes this.
+// bootpd rewrites the whole cache rather than deleting single groups, so a
+// client that went away months ago is still in the file with its old address;
+// see bootpdLeaseExpired for what an absent or unreadable value means.
+func parseDarwinLeases(content, mac string, now time.Time) string {
 	needle, ok := NormalizeMAC(mac)
 	if !ok {
 		return ""
 	}
-	var ip, hw string
+	var ip, hw, lease string
 	match := func() string {
 		// sameMAC is the only guard needed: it rejects "" -- a record with no
 		// hw_address line, or one whose type was not Ethernet -- exactly as
 		// it rejects any other value NormalizeMAC will not take.
 		if !sameMAC(needle, hw) {
+			return ""
+		}
+		if bootpdLeaseExpired(lease, now) {
 			return ""
 		}
 		return usableIPv4(ip)
@@ -139,13 +169,13 @@ func parseDarwinLeases(content, mac string) string {
 		line := strings.TrimSpace(raw)
 		switch line {
 		case "{":
-			ip, hw = "", ""
+			ip, hw, lease = "", "", ""
 			continue
 		case "}":
 			if got := match(); got != "" {
 				return got
 			}
-			ip, hw = "", ""
+			ip, hw, lease = "", "", ""
 			continue
 		}
 		key, value, found := strings.Cut(line, "=")
@@ -158,6 +188,8 @@ func parseDarwinLeases(content, mac string) string {
 		case "hw_address":
 			// "" for a DHCPv6 DUID record, which then matches nothing.
 			hw = ethernetHWAddress(strings.TrimSpace(value))
+		case "lease":
+			lease = strings.TrimSpace(value)
 		}
 	}
 	return match()
@@ -184,7 +216,16 @@ func parseDarwinLeases(content, mac string) string {
 // The length guard is therefore about indexing and nothing else: three is the
 // number of fields this function READS, and it keeps the duid line from
 // panicking a parser that reaches for fields[2].
-func parseDnsmasqLeases(content, mac string) string {
+//
+// Field 0 is the expiry and it is honoured. dnsmasq's lease_update_file
+// rewrites the file from its in-memory list, and a lease that ran out is
+// removed from that list only when the address is given to somebody else or
+// the server restarts, so an address a guest gave up weeks ago is still on
+// disk under its MAC. Since MACForDisk derives the MAC from the disk name,
+// the SAME disk started again matches its own stale line, and reporting that
+// address as the running guest's is the failure this check exists for. See
+// dnsmasqLeaseExpired for the two values that are not a time in the past.
+func parseDnsmasqLeases(content, mac string, now time.Time) string {
 	needle, ok := NormalizeMAC(mac)
 	if !ok {
 		return ""
@@ -197,6 +238,9 @@ func parseDnsmasqLeases(content, mac string) string {
 		if !sameMAC(needle, fields[1]) {
 			continue
 		}
+		if dnsmasqLeaseExpired(fields[0], now) {
+			continue
+		}
 		if got := usableIPv4(fields[2]); got != "" {
 			return got
 		}
@@ -204,7 +248,92 @@ func parseDnsmasqLeases(content, mac string) string {
 	return ""
 }
 
-// parseDarwinARP finds the IPv4 address `arp -an` reports for mac, or "".
+// dnsmasqLeaseExpired reports whether a dnsmasq lease whose expiry field is
+// value had already run out at now.
+//
+// Three values are deliberately NOT expired:
+//
+//   - a zero now, which means "the caller has no clock to offer, do not check
+//     the expiry at all". Every parser here is pure, and this is how a caller
+//     that only wants the format parsed says so.
+//   - an expiry of 0, which is dnsmasq's spelling of an INFINITE lease
+//     (--dhcp-range ...,infinite writes 0 here, and lease_update_file writes
+//     the same 0 for a lease with no expiry). Read as an epoch it is 1970 and
+//     every such lease would be discarded, which is the opposite of what the
+//     file says.
+//   - anything that is not a decimal integer. The field is then not an expiry
+//     this function understands, and a filter that cannot read a record's age
+//     must not be the thing that discards it -- the MAC and IPv4 checks
+//     remain what decides such a line, exactly as before this check existed.
+func dnsmasqLeaseExpired(value string, now time.Time) bool {
+	if now.IsZero() {
+		return false
+	}
+	secs, err := strconv.ParseInt(value, 10, 64)
+	if err != nil || secs == 0 {
+		return false
+	}
+	return time.Unix(secs, 0).Before(now)
+}
+
+// bootpdLeaseExpired reports whether a bootpd lease record whose lease= value
+// is value had already run out at now.
+//
+// The value is hex seconds since the epoch, written by bootplib as "0x%x"
+// (dhcpd.c stores the lease expiration through PLCache; NICache.c prints it),
+// so the 0x prefix is part of the real output and is trimmed here. A leading
+// "0X" and a bare hex string are accepted too, because nothing downstream
+// gains from being strict about a prefix.
+//
+// An absent lease= line means the check is SKIPPED and the record is kept, not
+// that the record is dropped. The key is not guaranteed present -- a record
+// bootpd wrote for a static entry has none, and a group being read while it is
+// written may not have reached that line yet -- and dropping a record whose
+// age is simply unknown would turn a lookup that works today into a silent
+// empty answer. An unparseable or absurdly large value is treated the same
+// way, for the reason given in dnsmasqLeaseExpired.
+//
+// Unlike dnsmasq there is no infinite-lease spelling to special-case here:
+// bootpd writes an absolute expiration or no lease= line at all, so a 0 in
+// this field really is 1970 and really is expired.
+func bootpdLeaseExpired(value string, now time.Time) bool {
+	if now.IsZero() || value == "" {
+		return false
+	}
+	hex := value
+	if len(hex) > 2 && hex[0] == '0' && (hex[1] == 'x' || hex[1] == 'X') {
+		hex = hex[2:]
+	}
+	// 63 and not 64: the result is converted to a signed epoch, and a value
+	// that would overflow into a negative time is rejected as unreadable
+	// rather than silently becoming a moment long past.
+	secs, err := strconv.ParseUint(hex, 16, 63)
+	if err != nil {
+		return false
+	}
+	return time.Unix(int64(secs), 0).Before(now)
+}
+
+// tokenValue returns the field that follows the first occurrence of key, or
+// "" when key is absent or is the last field there is.
+//
+// Both ARP formats spell their optional attributes as a keyword followed by a
+// value -- "on <ifname>" on macOS, "dev <ifname>" and "lladdr <mac>" on Linux
+// -- and every one of them is omitted on some entries, so a field INDEX is
+// wrong for the next line whatever it is right for. Reading by keyword is the
+// only form that survives that, and it is the same rule parseLinuxNeigh
+// already used for lladdr.
+func tokenValue(fields []string, key string) string {
+	for i := 0; i+1 < len(fields); i++ {
+		if fields[i] == key {
+			return fields[i+1]
+		}
+	}
+	return ""
+}
+
+// parseDarwinARP finds the IPv4 address `arp -an` reports for mac, preferring
+// an entry on iface, or "".
 //
 // The layout is network_cmds' arp.c print_entry:
 //
@@ -219,11 +348,24 @@ func parseDnsmasqLeases(content, mac string) string {
 // The address is the last token before " at ", parenthesised by arp itself.
 // Leading zeroes are stripped here too -- print_lladdr formats with %x -- so
 // the same normalisation that covers the lease file covers this.
-func parseDarwinARP(out, mac string) string {
+//
+// iface is a PREFERENCE and not a filter, and the difference is the whole
+// design of it. An entry on iface wins outright, wherever in the output it
+// sits; an entry on any other interface, or on none, is remembered and
+// returned only if iface named nothing. That covers the case this exists for
+// -- the same MAC cached on the host's uplink from an earlier run in another
+// mode, which `arp -an` may print before the bridge's entry because the order
+// is the kernel's and not a recency -- without turning a working lookup into
+// silence when the interface token is simply absent (the "on <ifname>" part
+// is genuinely optional in this format, and the caller does not always know a
+// name worth preferring). An empty iface therefore behaves exactly as this
+// function did before the parameter existed: first usable match wins.
+func parseDarwinARP(out, mac, iface string) string {
 	needle, ok := NormalizeMAC(mac)
 	if !ok {
 		return ""
 	}
+	var elsewhere string
 	for _, line := range strings.Split(out, "\n") {
 		head, tail, found := strings.Cut(line, " at ")
 		if !found {
@@ -237,11 +379,18 @@ func parseDarwinARP(out, mac string) string {
 		if len(addr) == 0 {
 			continue
 		}
-		if got := usableIPv4(strings.Trim(addr[len(addr)-1], "()")); got != "" {
+		got := usableIPv4(strings.Trim(addr[len(addr)-1], "()"))
+		if got == "" {
+			continue
+		}
+		if iface != "" && tokenValue(lladdr, "on") == iface {
 			return got
 		}
+		if elsewhere == "" {
+			elsewhere = got
+		}
 	}
-	return ""
+	return elsewhere
 }
 
 // parseLinuxNeigh finds the IPv4 address `ip neigh` reports for mac, or "".
@@ -263,29 +412,40 @@ func parseDarwinARP(out, mac string) string {
 // is the very MAC being searched for, since a guest's fe80:: address is
 // derived from that MAC. usableIPv4 is what keeps such an entry from being
 // returned as the VM's address.
-func parseLinuxNeigh(out, mac string) string {
+//
+// dev is read for the same reason, and with the same softness, as "on" in
+// parseDarwinARP: an entry on iface wins outright, an entry anywhere else is
+// the fallback, and an empty iface leaves the original "first match wins"
+// behaviour untouched. The token is absent from every line of a
+// device-filtered `ip neigh show dev <x>`, which is exactly the shape where
+// filtering hard would discard every candidate there is.
+func parseLinuxNeigh(out, mac, iface string) string {
 	needle, ok := NormalizeMAC(mac)
 	if !ok {
 		return ""
 	}
+	var elsewhere string
 	for _, line := range strings.Split(out, "\n") {
 		fields := strings.Fields(line)
 		if len(fields) < 2 {
 			continue
 		}
-		for i := 1; i < len(fields)-1; i++ {
-			if fields[i] != "lladdr" {
-				continue
-			}
-			if sameMAC(needle, fields[i+1]) {
-				if got := usableIPv4(fields[0]); got != "" {
-					return got
-				}
-			}
-			// One lladdr per entry: whether it matched or not, this line is
-			// finished.
-			break
+		// From fields[1]: field 0 is the address, and only the attributes
+		// after it are keyword/value pairs. One lladdr per entry, so the first
+		// is the only one -- whether it matched or not, the line is finished.
+		if !sameMAC(needle, tokenValue(fields[1:], "lladdr")) {
+			continue
+		}
+		got := usableIPv4(fields[0])
+		if got == "" {
+			continue
+		}
+		if iface != "" && tokenValue(fields[1:], "dev") == iface {
+			return got
+		}
+		if elsewhere == "" {
+			elsewhere = got
 		}
 	}
-	return ""
+	return elsewhere
 }
