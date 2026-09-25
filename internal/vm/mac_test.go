@@ -61,37 +61,81 @@ func TestMACForDiskIsDistinctPerDisk(t *testing.T) {
 
 func TestNormalizeMAC(t *testing.T) {
 	for _, tc := range []struct {
-		name string
-		in   string
-		want string
+		name   string
+		in     string
+		want   string
+		wantOK bool
 	}{
-		{"linux zero-padded form", "52:54:00:12:34:56", "52:54:0:12:34:56"},
-		{"macos stripped form", "52:54:0:12:34:56", "52:54:0:12:34:56"},
-		{"all-zero octet keeps one digit", "0:0:0:0:0:0", "0:0:0:0:0:0"},
-		{"padded all-zero octet", "00:00:00:00:00:00", "0:0:0:0:0:0"},
-		{"leading zero stripped", "52:54:00:0a:04:0f", "52:54:0:a:4:f"},
-		{"uppercase lowercased", "52:54:00:AB:CD:EF", "52:54:0:ab:cd:ef"},
-		{"surrounding whitespace trimmed", "  52:54:00:12:34:56\n", "52:54:0:12:34:56"},
-		{"empty string", "", ""},
-		{"not a mac", "not-a-mac", ""},
-		{"five octets", "52:54:00:12:34", ""},
-		{"seven octets", "52:54:00:12:34:56:78", ""},
-		{"three-digit octet", "52:54:000:12:34:56", ""},
-		{"empty octet", "52:54::12:34:56", ""},
-		{"non-hex octet", "52:54:00:12:34:zz", ""},
-		{"dash separated", "52-54-00-12-34-56", ""},
+		{"linux zero-padded form", "52:54:00:12:34:56", "52:54:0:12:34:56", true},
+		{"macos stripped form", "52:54:0:12:34:56", "52:54:0:12:34:56", true},
+		{"all-zero octet keeps one digit", "0:0:0:0:0:0", "0:0:0:0:0:0", true},
+		{"padded all-zero octet", "00:00:00:00:00:00", "0:0:0:0:0:0", true},
+		{"leading zero stripped", "52:54:00:0a:04:0f", "52:54:0:a:4:f", true},
+		{"uppercase lowercased", "52:54:00:AB:CD:EF", "52:54:0:ab:cd:ef", true},
+		{"surrounding whitespace trimmed", "  52:54:00:12:34:56\n", "52:54:0:12:34:56", true},
+		// Not a sensible NIC address, but a valid MAC shape: the normaliser
+		// validates the shape and must not pass judgement on the value.
+		{"broadcast address", "ff:ff:ff:ff:ff:ff", "ff:ff:ff:ff:ff:ff", true},
+		{"empty string", "", "", false},
+		{"not a mac", "not-a-mac", "", false},
+		{"five octets", "52:54:00:12:34", "", false},
+		{"seven octets", "52:54:00:12:34:56:78", "", false},
+		{"three-digit octet", "52:54:000:12:34:56", "", false},
+		{"empty octet", "52:54::12:34:56", "", false},
+		{"non-hex octet", "52:54:00:12:34:zz", "", false},
+		{"dash separated", "52-54-00-12-34-56", "", false},
+		// A trailing colon splits into a seventh, empty octet.
+		{"trailing colon", "52:54:00:12:34:56:", "", false},
+		// "0x52" is four characters, so it is rejected on length before the
+		// hex check ever sees the "x".
+		{"0x-prefixed octet", "0x52:54:0:12:34:56", "", false},
 	} {
-		if got := NormalizeMAC(tc.in); got != tc.want {
-			t.Errorf("%s: NormalizeMAC(%q) = %q, want %q", tc.name, tc.in, got, tc.want)
+		got, ok := NormalizeMAC(tc.in)
+		if got != tc.want || ok != tc.wantOK {
+			t.Errorf("%s: NormalizeMAC(%q) = (%q, %t), want (%q, %t)",
+				tc.name, tc.in, got, ok, tc.want, tc.wantOK)
 		}
+	}
+}
+
+// TestNormalizeMACRejectedValuesAreIndistinguishable pins the hazard the bool
+// exists for: an unset Disk.MAC and an unparseable lease MAC normalise to the
+// SAME string, so a caller comparing values alone would attribute a DHCP lease
+// to the wrong VM. Only the ok flag separates them.
+func TestNormalizeMACRejectedValuesAreIndistinguishable(t *testing.T) {
+	const garbage = "not-a-mac"
+	emptyNorm, emptyOK := NormalizeMAC("")
+	garbageNorm, garbageOK := NormalizeMAC(garbage)
+
+	// Assert the trap first, so the ok assertions below cannot pass for the
+	// wrong reason: if the rejected values ever stopped colliding, this test
+	// would be guarding a hazard that no longer exists and must be rewritten
+	// rather than quietly continuing to pass.
+	if emptyNorm != garbageNorm {
+		t.Fatalf("rejected inputs should be indistinguishable by value: "+
+			"NormalizeMAC(%q) = %q but NormalizeMAC(%q) = %q", "", emptyNorm, garbage, garbageNorm)
+	}
+	if emptyOK {
+		t.Errorf("NormalizeMAC(%q) = (%q, true), want ok=false for an unset MAC", "", emptyNorm)
+	}
+	if garbageOK {
+		t.Errorf("NormalizeMAC(%q) = (%q, true), want ok=false for a malformed MAC", garbage, garbageNorm)
+	}
+	// The comparison a caller must never make, spelled out: equal values, and
+	// the only thing that stops it being a match is that neither is usable.
+	if emptyNorm == garbageNorm && emptyOK && garbageOK {
+		t.Fatal("an unset MAC and a garbage MAC compared equal AND both reported usable")
 	}
 }
 
 func TestNormalizeMACPaddedAndStrippedAgree(t *testing.T) {
 	// The whole point of the normaliser: a lease file written by macOS and a
 	// MAC written by us must compare equal.
-	padded := NormalizeMAC("52:54:00:12:34:56")
-	stripped := NormalizeMAC("52:54:0:12:34:56")
+	padded, paddedOK := NormalizeMAC("52:54:00:12:34:56")
+	stripped, strippedOK := NormalizeMAC("52:54:0:12:34:56")
+	if !paddedOK || !strippedOK {
+		t.Fatalf("both forms should be usable: padded ok=%t, stripped ok=%t", paddedOK, strippedOK)
+	}
 	if padded == "" {
 		t.Fatal("padded form should normalise to a non-empty value")
 	}
@@ -102,7 +146,11 @@ func TestNormalizeMACPaddedAndStrippedAgree(t *testing.T) {
 
 func TestNormalizeMACRoundTripsGeneratedMAC(t *testing.T) {
 	mac := MACForDisk("kairos-core-20250101-120000")
-	if got := NormalizeMAC(mac); got == "" {
+	got, ok := NormalizeMAC(mac)
+	if !ok {
 		t.Fatalf("generated MAC %q should normalise", mac)
+	}
+	if got == "" {
+		t.Fatalf("generated MAC %q normalised to an empty value", mac)
 	}
 }

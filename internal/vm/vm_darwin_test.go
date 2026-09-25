@@ -67,3 +67,99 @@ func TestBuildMacOSUserModeNeedsNoBridgeIface(t *testing.T) {
 		t.Fatalf("expected the user-mode port forwards: %v", args)
 	}
 }
+
+func TestBuildMacOSSharedModeUsesVmnetShared(t *testing.T) {
+	if runtime.GOARCH != "arm64" {
+		t.Skip("macOS support is Apple Silicon only")
+	}
+	cfg := macOSBridgeConfig("")
+	cfg.NetworkMode = "shared"
+	cfg.MACAddress = testMACAddress
+	_, args, err := buildMacOS(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := argAfter(t, args, "-netdev"); got != "vmnet-shared,id=net0" {
+		t.Errorf("-netdev = %q, want vmnet-shared,id=net0", got)
+	}
+	wantDevice := "virtio-net-pci,netdev=net0,mac=" + testMACAddress
+	if got := nicDeviceArg(t, args); got != wantDevice {
+		t.Errorf("NIC device = %q, want %q", got, wantDevice)
+	}
+}
+
+// vmnet-shared attaches to no host interface: NetdevVmnetSharedOptions has no
+// ifname member, and QEMU's opts visitor rejects a leftover key with "Invalid
+// parameter", so an ifname here aborts the VM at startup rather than being
+// ignored. The assertion is deliberately over the whole command line.
+func TestBuildMacOSSharedModePassesNoIfname(t *testing.T) {
+	if runtime.GOARCH != "arm64" {
+		t.Skip("macOS support is Apple Silicon only")
+	}
+	cfg := macOSBridgeConfig("en1")
+	cfg.NetworkMode = "shared"
+	_, args, err := buildMacOS(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	joined := strings.Join(args, " ")
+	if strings.Contains(joined, "ifname=") {
+		t.Fatalf("shared mode must pass no ifname: QEMU has no ifname option for "+
+			"vmnet-shared and aborts at startup on the unknown key, args: %s", joined)
+	}
+}
+
+// The bridged-only guard must not catch the modes that need no interface.
+func TestBuildMacOSSharedAndUserNeedNoBridgeIface(t *testing.T) {
+	if runtime.GOARCH != "arm64" {
+		t.Skip("macOS support is Apple Silicon only")
+	}
+	for _, mode := range []string{"shared", "user"} {
+		cfg := macOSBridgeConfig("")
+		cfg.NetworkMode = mode
+		if _, _, err := buildMacOS(cfg); err != nil {
+			t.Errorf("%s mode should not need a bridge interface: %v", mode, err)
+		}
+	}
+}
+
+func TestBuildMacOSBridgedCarriesMAC(t *testing.T) {
+	if runtime.GOARCH != "arm64" {
+		t.Skip("macOS support is Apple Silicon only")
+	}
+	cfg := macOSBridgeConfig("en1")
+	cfg.MACAddress = testMACAddress
+	_, args, err := buildMacOS(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := argAfter(t, args, "-netdev"); got != "vmnet-bridged,id=net0,ifname=en1" {
+		t.Errorf("-netdev = %q, want vmnet-bridged,id=net0,ifname=en1", got)
+	}
+	wantDevice := "virtio-net-pci,netdev=net0,mac=" + testMACAddress
+	if got := nicDeviceArg(t, args); got != wantDevice {
+		t.Errorf("NIC device = %q, want %q", got, wantDevice)
+	}
+}
+
+// Without the guest-agent socket the IP resolver loses its QGA source on
+// macOS entirely, so this has to match what buildLinux emits.
+func TestBuildMacOSIncludesGuestAgent(t *testing.T) {
+	if runtime.GOARCH != "arm64" {
+		t.Skip("macOS support is Apple Silicon only")
+	}
+	_, args, err := buildMacOS(macOSBridgeConfig("en1"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	joined := strings.Join(args, " ")
+	for _, want := range []string{
+		"socket,path=/tmp/kairos.sock,server=on,wait=off,id=qga0",
+		"virtio-serial",
+		"virtserialport,chardev=qga0,name=org.qemu.guest_agent.0",
+	} {
+		if !strings.Contains(joined, want) {
+			t.Errorf("expected %q in args: %s", want, joined)
+		}
+	}
+}

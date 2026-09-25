@@ -48,8 +48,9 @@ type Disk struct {
 	MemoryGB  int    `json:"memory_gb,omitempty"`
 	CPUs      int    `json:"cpus,omitempty"`
 	// MAC is the per-disk QEMU NIC address. It is additive and omitempty, so a
-	// disk recorded before this field existed loads with an empty MAC and gets
-	// one filled in on its next start; no state migration is needed.
+	// disk recorded before this field existed loads with an empty MAC; the
+	// start path will fill one in once it is wired up to do so. No state
+	// migration is needed either way.
 	MAC string `json:"mac,omitempty"`
 }
 

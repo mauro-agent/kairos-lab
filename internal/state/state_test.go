@@ -3,6 +3,7 @@ package state
 import (
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -88,8 +89,9 @@ func TestSaveLoadRoundTripKeepsMACAndIP(t *testing.T) {
 
 func TestLoadStateWrittenBeforeMACField(t *testing.T) {
 	// A disk recorded before the mac field existed has no such key at all. It
-	// must load without error and simply arrive with an empty MAC, which a
-	// later start fills in; there is no migration and no schema bump.
+	// must load without error and simply arrive with an empty MAC, which the
+	// start path will fill in once it is wired up to do so; there is no
+	// migration and no schema bump.
 	t.Setenv("KAIROS_LAB_CONFIG_DIR", t.TempDir())
 	t.Setenv("KAIROS_LAB_CACHE_DIR", t.TempDir())
 	store, err := DefaultStore()
@@ -116,5 +118,55 @@ func TestLoadStateWrittenBeforeMACField(t *testing.T) {
 	}
 	if st.VM.IPAddress != "" {
 		t.Errorf("vm IP address = %q, want empty for a pre-MAC state file", st.VM.IPAddress)
+	}
+}
+
+// TestStateJSONKeysForMACAndIP pins the on-disk JSON contract for the two
+// fields added with the per-VM MAC work: the key names themselves, and the
+// omitempty that keeps them out of a file where they carry no value. Renaming
+// either key, or dropping omitempty from either, leaves every round-trip test
+// green because those only ever go through this package's own structs -- so
+// this test reads the raw bytes instead.
+func TestStateJSONKeysForMACAndIP(t *testing.T) {
+	t.Setenv("KAIROS_LAB_CONFIG_DIR", t.TempDir())
+	t.Setenv("KAIROS_LAB_CACHE_DIR", t.TempDir())
+	store, err := DefaultStore()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	st := NewState(store)
+	AddDisk(st, Disk{
+		Name:      "kairos-core-20250101-120000",
+		Path:      "/tmp/kairos.qcow2",
+		CreatedAt: "2025-01-01T12:00:00Z",
+		Size:      "60G",
+	})
+	if err := store.Save(st); err != nil {
+		t.Fatal(err)
+	}
+	raw, err := os.ReadFile(store.StatePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, key := range []string{`"mac"`, `"ip_address"`} {
+		if strings.Contains(string(raw), key) {
+			t.Errorf("state.json should omit %s when the value is empty, got:\n%s", key, raw)
+		}
+	}
+
+	st.Disks[0].MAC = "52:54:00:ab:cd:ef"
+	st.VM.IPAddress = "192.168.64.7"
+	if err := store.Save(st); err != nil {
+		t.Fatal(err)
+	}
+	raw, err = os.ReadFile(store.StatePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, key := range []string{`"mac"`, `"ip_address"`} {
+		if !strings.Contains(string(raw), key) {
+			t.Errorf("state.json should carry the %s key once it has a value, got:\n%s", key, raw)
+		}
 	}
 }

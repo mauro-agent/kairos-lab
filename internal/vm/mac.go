@@ -24,9 +24,20 @@ func MACForDisk(diskName string) string {
 }
 
 // NormalizeMAC reduces a MAC to one comparable form: lowercase, colon
-// separated, with leading zeroes stripped from each octet. It returns "" for
-// anything that is not six colon-separated hex octets, which callers read as
-// "no match possible".
+// separated, with leading zeroes stripped from each octet. It returns the
+// normalised address and true on success, and ("", false) for every rejected
+// input -- including the empty string -- where "rejected" means anything that
+// is not six colon-separated hex octets.
+//
+// Callers MUST check the bool before comparing. The normalised value alone
+// cannot tell "no MAC" from "unparseable MAC": both are "", so an unchecked
+//
+//	NormalizeMAC(disk.MAC) == NormalizeMAC(leaseMAC)
+//
+// is true when disk.MAC is unset (legitimate for a disk recorded before the
+// field existed) and leaseMAC is garbage, which silently attributes a DHCP
+// lease to the wrong VM. The bool is the "this is a usable MAC" signal; two
+// invalid MACs always compare equal.
 //
 // Both sides of every comparison have to go through this, because the hosts
 // disagree on padding. macOS strips leading zeroes per octet -- bootplib's
@@ -34,18 +45,18 @@ func MACForDisk(diskName string) string {
 // /var/db/dhcpd_leases as 52:54:0:12:34:56, and network_cmds' arp.c prints the
 // same way. Linux dnsmasq and `ip neigh` zero-pad with %.2x. Comparing the two
 // raw would silently never match.
-func NormalizeMAC(s string) string {
+func NormalizeMAC(s string) (string, bool) {
 	parts := strings.Split(strings.ToLower(strings.TrimSpace(s)), ":")
 	if len(parts) != 6 {
-		return ""
+		return "", false
 	}
 	for i, part := range parts {
 		if len(part) < 1 || len(part) > 2 {
-			return ""
+			return "", false
 		}
 		for _, c := range part {
 			if (c < '0' || c > '9') && (c < 'a' || c > 'f') {
-				return ""
+				return "", false
 			}
 		}
 		// Strip the leading zero, but keep a lone "0": "0a" -> "a", "00" -> "0".
@@ -54,5 +65,5 @@ func NormalizeMAC(s string) string {
 			parts[i] = "0"
 		}
 	}
-	return strings.Join(parts, ":")
+	return strings.Join(parts, ":"), true
 }

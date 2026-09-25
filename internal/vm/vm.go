@@ -22,10 +22,28 @@ type StartConfig struct {
 	MemoryMB      int
 	NetworkMode   string
 	DisplayMode   string
-	BridgeIface   string
-	LinuxTapName  string
+	// BridgeIface is the host interface to bridge onto. It is meaningful only
+	// for "bridged" mode; "shared" attaches to no host interface and "user"
+	// needs none, so both must leave it empty.
+	BridgeIface  string
+	LinuxTapName string
+	// MACAddress is the guest NIC address. An empty value leaves it off the
+	// command line entirely, so QEMU falls back to its own default.
+	MACAddress    string
 	MacOSBiosPath string
 	Detached      bool
+}
+
+// netDeviceArg builds the -device value for the guest NIC, appending the MAC
+// only when one was supplied. Emitting a bare "mac=" for an empty address
+// would be a command line QEMU rejects, so a caller that forgets the field
+// degrades to QEMU's default address instead of failing to start.
+func netDeviceArg(mac string) string {
+	const device = "virtio-net-pci,netdev=net0"
+	if mac == "" {
+		return device
+	}
+	return device + ",mac=" + mac
 }
 
 type Process struct {
@@ -163,18 +181,23 @@ func buildLinux(cfg StartConfig) (string, []string, error) {
 		"-device", "virtio-serial",
 		"-device", "virtserialport,chardev=qga0,name=org.qemu.guest_agent.0",
 	)
-	if cfg.NetworkMode == "bridged" {
+	switch cfg.NetworkMode {
+	case "shared", "bridged":
+		// On Linux both modes present the guest a tap device on a
+		// NetworkManager bridge; only the bridge's own IPv4 method differs
+		// (shared NATs, bridged takes a lease off the LAN), and that is
+		// configured when the bridge is created, not here.
 		if cfg.LinuxTapName == "" {
-			return "", nil, fmt.Errorf("bridged linux mode requires tap name")
+			return "", nil, fmt.Errorf("%s linux mode requires tap name", cfg.NetworkMode)
 		}
 		args = append(args,
 			"-netdev", "tap,id=net0,ifname="+cfg.LinuxTapName+",script=no,downscript=no",
-			"-device", "virtio-net-pci,netdev=net0",
+			"-device", netDeviceArg(cfg.MACAddress),
 		)
-	} else {
+	default:
 		args = append(args,
 			"-netdev", "user,id=net0,hostfwd=tcp::2222-:22,hostfwd=tcp::8080-:8080",
-			"-device", "virtio-net-pci,netdev=net0",
+			"-device", netDeviceArg(cfg.MACAddress),
 		)
 	}
 	args = append(args,
@@ -214,6 +237,13 @@ func buildMacOS(cfg StartConfig) (string, []string, error) {
 		"-smp", strconv.Itoa(cfg.CPUs),
 		"-m", strconv.Itoa(cfg.MemoryMB),
 		"-bios", cfg.MacOSBiosPath,
+		// Same guest-agent trio as buildLinux: the IP resolver reads this
+		// socket, so without it that discovery source does not exist on macOS.
+		// "virtio-serial" is an alias that qdev resolves to virtio-serial-pci
+		// on QEMU_ARCH_ARM, so it is valid on the aarch64 virt machine.
+		"-chardev", "socket,path=" + cfg.QGASocketPath + ",server=on,wait=off,id=qga0",
+		"-device", "virtio-serial",
+		"-device", "virtserialport,chardev=qga0,name=org.qemu.guest_agent.0",
 	}
 	switch cfg.DisplayMode {
 	case "serial":
@@ -230,14 +260,24 @@ func buildMacOS(cfg StartConfig) (string, []string, error) {
 	default:
 		return "", nil, fmt.Errorf("invalid display mode: %s", cfg.DisplayMode)
 	}
-	if cfg.NetworkMode == "bridged" {
+	switch cfg.NetworkMode {
+	case "shared":
+		// No ifname here, ever: vmnet-shared attaches to no host interface by
+		// design, NetdevVmnetSharedOptions has no ifname member, and the opts
+		// visitor fails a leftover key with "Invalid parameter '%s'" -- so
+		// passing one is a hard QEMU startup abort, not an ignored option.
 		args = append(args,
-			"-device", "virtio-net-pci,netdev=net0",
+			"-device", netDeviceArg(cfg.MACAddress),
+			"-netdev", "vmnet-shared,id=net0",
+		)
+	case "bridged":
+		args = append(args,
+			"-device", netDeviceArg(cfg.MACAddress),
 			"-netdev", "vmnet-bridged,id=net0,ifname="+cfg.BridgeIface,
 		)
-	} else {
+	default:
 		args = append(args,
-			"-device", "virtio-net-pci,netdev=net0",
+			"-device", netDeviceArg(cfg.MACAddress),
 			"-netdev", "user,id=net0,hostfwd=tcp::2222-:22,hostfwd=tcp::8080-:8080",
 		)
 	}
