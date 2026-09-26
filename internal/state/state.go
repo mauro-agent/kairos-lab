@@ -162,18 +162,27 @@ func (s *Store) Save(st *State) error {
 	// it. A rename swaps the name onto already-complete contents in one step,
 	// so every reader sees either the whole old file or the whole new one and
 	// never something in between. That is also why the temporary file is
-	// created in ConfigDir rather than the system temp dir: rename is only
-	// atomic within a single filesystem, and /tmp is routinely a different one.
-	tmp, err := os.CreateTemp(s.ConfigDir, "state.json.tmp-*")
+	// created in the state file's own directory rather than the system temp
+	// dir: rename only works within a single filesystem -- across two it fails
+	// outright with EXDEV rather than degrading to a copy -- and /tmp is
+	// routinely a different one. The directory that has to match is the one
+	// holding StatePath, not ConfigDir: Store is exported with exported fields
+	// and nothing makes the two agree, so the only safe answer is the one the
+	// rename will actually land in.
+	tmp, err := os.CreateTemp(filepath.Dir(s.StatePath), "state.json.tmp-*")
 	if err != nil {
 		return fmt.Errorf("create temporary state file: %w", err)
 	}
 	tmpPath := tmp.Name()
 	closed := false
 	renamed := false
-	// Any failure below must leave no trace: the previous state.json is still
-	// the live one, and a half-written temporary file next to it would be
-	// nothing but litter in the user's config dir.
+	// Any error return below must leave no trace: the previous state.json is
+	// still the live one, and a half-written temporary file next to it would be
+	// nothing but litter in the user's config dir. It is the error returns that
+	// are covered, and only those: anything that ends the process without
+	// unwinding this frame -- a SIGKILL, an os.Exit, a panic on some other
+	// goroutine -- between the create and the rename leaves a state.json.tmp-*
+	// behind, because the file is already on disk and this defer never runs.
 	defer func() {
 		if !closed {
 			_ = tmp.Close()
@@ -190,16 +199,28 @@ func (s *Store) Save(st *State) error {
 	if err := tmp.Sync(); err != nil {
 		return fmt.Errorf("sync state file: %w", err)
 	}
-	// os.CreateTemp makes the file 0600, but state.json has always been 0644
-	// and is read by the user outside this tool; the mode is part of the
-	// existing behaviour, so restore it rather than quietly tightening it.
-	if err := tmp.Chmod(0o644); err != nil {
-		return fmt.Errorf("set state file mode: %w", err)
+	// The mode of an existing state.json has to be carried across the
+	// replacement by hand. Writing in place left whatever mode the file already
+	// had alone -- an open with O_CREATE|O_TRUNC ignores its mode argument for a
+	// file that exists -- whereas a rename publishes the temporary file's mode
+	// instead, so a user who ran `chmod 600` on their state.json would find it
+	// widened again by the next save. Stat failing is not an error here: the
+	// ordinary reason for it is that there is no state.json yet, and a file
+	// being created for the first time simply keeps the 0600 os.CreateTemp
+	// gives it, which is private to the user the tool runs as.
+	if fi, err := os.Stat(s.StatePath); err == nil {
+		if err := tmp.Chmod(fi.Mode().Perm()); err != nil {
+			return fmt.Errorf("set state file mode: %w", err)
+		}
 	}
-	if err := tmp.Close(); err != nil {
-		return fmt.Errorf("close state file: %w", err)
-	}
+	// closed is set before the error is examined, not after: a Close that
+	// reports an error has still given the descriptor back, so leaving the flag
+	// false would have the deferred cleanup close the same file a second time.
+	cerr := tmp.Close()
 	closed = true
+	if cerr != nil {
+		return fmt.Errorf("close state file: %w", cerr)
+	}
 	if err := os.Rename(tmpPath, s.StatePath); err != nil {
 		return fmt.Errorf("replace state file: %w", err)
 	}

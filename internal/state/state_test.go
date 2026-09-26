@@ -1,6 +1,7 @@
 package state
 
 import (
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -186,11 +187,37 @@ func blockedStore(t *testing.T, cfg *Store) *Store {
 	return &Store{ConfigDir: cfg.ConfigDir, CacheDir: cfg.CacheDir, StatePath: blocked}
 }
 
+// sealDir makes dir unwritable for the rest of the test, so that anything
+// trying to create a new entry in it -- the temporary file Save opens, in
+// particular -- fails with EACCES before it has touched a single existing
+// file. The restore is registered before the chmod rather than after, because
+// t.TempDir's own cleanup cannot remove a tree it is not allowed to write to
+// and would fail the test on the way out.
+func sealDir(t *testing.T, dir string) {
+	t.Helper()
+	t.Cleanup(func() { _ = os.Chmod(dir, 0o755) })
+	if err := os.Chmod(dir, 0o500); err != nil {
+		t.Fatal(err)
+	}
+}
+
 // TestSaveFailureLeavesPreviousStateIntact is the whole point of writing
 // through a rename: a save that cannot complete must leave the file that was
 // already on disk byte-for-byte as it was, still parseable by the next reader,
 // rather than the truncated stump a failed in-place write would leave behind.
+//
+// The failure is induced by sealing the directory the state file lives in,
+// which is what makes this test discriminate rather than decorate. An in-place
+// os.WriteFile does not need write permission on the directory to reopen a
+// file that already exists and is writable by its owner -- it would truncate
+// the live state.json and then succeed -- whereas os.CreateTemp has to add an
+// entry to the directory and fails before writing anything. Pointing the
+// failure at some other path than the one the assertions read would let the
+// old implementation pass this test unchanged.
 func TestSaveFailureLeavesPreviousStateIntact(t *testing.T) {
+	if os.Geteuid() == 0 {
+		t.Skip("root ignores directory write permission, so the save under test would succeed")
+	}
 	t.Setenv("KAIROS_LAB_CONFIG_DIR", t.TempDir())
 	t.Setenv("KAIROS_LAB_CACHE_DIR", t.TempDir())
 	store, err := DefaultStore()
@@ -208,10 +235,11 @@ func TestSaveFailureLeavesPreviousStateIntact(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	doomed := blockedStore(t, store)
+	sealDir(t, filepath.Dir(store.StatePath))
 	st.Platform.OS = "darwin"
-	if err := doomed.Save(st); err == nil {
-		t.Fatal("saving onto a directory should fail")
+	st.VM.IPAddress = "10.0.0.1"
+	if err := store.Save(st); err == nil {
+		t.Fatal("saving into a directory that cannot be written should fail")
 	}
 
 	after, err := os.ReadFile(store.StatePath)
@@ -231,9 +259,12 @@ func TestSaveFailureLeavesPreviousStateIntact(t *testing.T) {
 }
 
 // TestSaveFailureLeavesNoTemporaryFile pins the cleanup half of the rename
-// dance. The temporary file is created in the config dir, so forgetting to
-// remove it on failure would slowly fill a directory the user actually looks
-// at with state.json.tmp-* debris.
+// dance. The temporary file is created beside the state file -- the config dir,
+// for the store this test builds -- so forgetting to remove it on failure would
+// slowly fill a directory the user actually looks at with state.json.tmp-*
+// debris. Three failing saves rather than one, so a leak shows up as debris
+// accumulating rather than a single file that could be mistaken for the real
+// one.
 func TestSaveFailureLeavesNoTemporaryFile(t *testing.T) {
 	t.Setenv("KAIROS_LAB_CONFIG_DIR", t.TempDir())
 	t.Setenv("KAIROS_LAB_CACHE_DIR", t.TempDir())
@@ -266,10 +297,15 @@ func TestSaveFailureLeavesNoTemporaryFile(t *testing.T) {
 	}
 }
 
-// TestSaveLoadRoundTripKeepsFileMode guards the mode the rename path has to
-// restore by hand: os.CreateTemp makes a 0600 file, while state.json has
-// always been 0644.
-func TestSaveLoadRoundTripKeepsFileMode(t *testing.T) {
+// TestSaveCreatesStateFilePrivate pins the mode a state.json gets when there
+// is none yet: os.CreateTemp makes a 0600 file, there is no older mode to carry
+// over, and nothing in the save path widens it, so the file arrives readable
+// and writable by the user who ran the tool and by nobody else. That is the
+// right default -- every consumer of state.json in this repository runs as that
+// same user, and the file records disk paths, PIDs and the VM's address. The
+// ambient umask can only narrow this further, never widen it, so 0600 is the
+// most permissive outcome a save can produce here.
+func TestSaveCreatesStateFilePrivate(t *testing.T) {
 	t.Setenv("KAIROS_LAB_CONFIG_DIR", t.TempDir())
 	t.Setenv("KAIROS_LAB_CACHE_DIR", t.TempDir())
 	store, err := DefaultStore()
@@ -292,20 +328,60 @@ func TestSaveLoadRoundTripKeepsFileMode(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if perm := info.Mode().Perm(); perm != 0o644 {
-		t.Errorf("state file mode = %04o, want 0644", perm)
+	if perm := info.Mode().Perm(); perm != 0o600 {
+		t.Errorf("mode of a freshly created state file = %04o, want 0600", perm)
 	}
-	// A second save renames a fresh temporary file over the first one, so the
-	// mode has to survive the replacement too, not just the initial create.
-	if err := store.Save(st); err != nil {
-		t.Fatal(err)
-	}
-	info, err = os.Stat(store.StatePath)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if perm := info.Mode().Perm(); perm != 0o644 {
-		t.Errorf("state file mode after re-save = %04o, want 0644", perm)
+}
+
+// TestSavePreservesExistingStateFileMode is the mode half of writing through a
+// rename. An in-place write left the mode of an existing file untouched --
+// O_CREATE|O_TRUNC ignores its mode argument once the file exists -- so a user
+// who tightened state.json by hand kept it tightened across every later save.
+// A rename publishes the temporary file's own mode instead, which would undo
+// that silently on the next save, so Save has to copy the old mode onto the
+// replacement. The 0644 case is here because carrying the mode across has to
+// mean carrying it, not clamping it: a state.json that is already group- and
+// world-readable stays exactly that.
+func TestSavePreservesExistingStateFileMode(t *testing.T) {
+	for _, mode := range []os.FileMode{0o600, 0o640, 0o644} {
+		t.Run(fmt.Sprintf("%04o", mode), func(t *testing.T) {
+			t.Setenv("KAIROS_LAB_CONFIG_DIR", t.TempDir())
+			t.Setenv("KAIROS_LAB_CACHE_DIR", t.TempDir())
+			store, err := DefaultStore()
+			if err != nil {
+				t.Fatal(err)
+			}
+			st := NewState(store)
+			st.Platform.Arch = "arm64"
+			if err := store.Save(st); err != nil {
+				t.Fatal(err)
+			}
+			// chmod rather than a mode argument, because os.WriteFile and friends
+			// run their mode through the umask and would not reliably produce the
+			// mode this case is about.
+			if err := os.Chmod(store.StatePath, mode); err != nil {
+				t.Fatal(err)
+			}
+
+			st.VM.IPAddress = "192.168.64.7"
+			if err := store.Save(st); err != nil {
+				t.Fatal(err)
+			}
+			info, err := os.Stat(store.StatePath)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if perm := info.Mode().Perm(); perm != mode {
+				t.Errorf("state file mode after a save = %04o, want %04o", perm, mode)
+			}
+			loaded, err := store.Load()
+			if err != nil {
+				t.Fatal(err)
+			}
+			if loaded.VM.IPAddress != "192.168.64.7" {
+				t.Errorf("vm IP address = %q, want 192.168.64.7", loaded.VM.IPAddress)
+			}
+		})
 	}
 }
 
@@ -328,8 +404,10 @@ func TestConcurrentSaveAndLoad(t *testing.T) {
 
 	const saves = 50
 	const loads = 200
-	saveErrs := make(chan error, saves)
-	loadErrs := make(chan error, loads)
+	// One slot each: both goroutines return after their first send, so a
+	// capacity matching the loop count would only ever hold one value anyway.
+	saveErrs := make(chan error, 1)
+	loadErrs := make(chan error, 1)
 
 	var wg sync.WaitGroup
 	wg.Add(2)
