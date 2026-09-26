@@ -2,10 +2,12 @@ package app
 
 import (
 	"bufio"
+	"context"
 	"errors"
 	"flag"
 	"fmt"
 	"io"
+	"net"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -14,6 +16,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 	"unicode"
 	"unicode/utf8"
@@ -792,6 +795,12 @@ func runStart(args []string, stdin io.Reader, stdout, stderr io.Writer, store *s
 	st.VM.RuntimeDir = runtimeDir
 	st.VM.QGASockPath = qgaSock
 	st.VM.LastError = ""
+	// The address recorded here belongs to the run being recorded, and this
+	// run has not got one yet: the poll that finds it starts once QEMU is
+	// running. Carrying the previous run's address over would have `status`
+	// report a stale address as this VM's for as long as the poll takes, and
+	// for good if it never answers.
+	st.VM.IPAddress = ""
 	state.AddManagedFile(st, logPath)
 	state.AddManagedFile(st, qgaSock)
 	if err := store.Save(st); err != nil {
@@ -801,7 +810,16 @@ func runStart(args []string, stdin io.Reader, stdout, stderr io.Writer, store *s
 	writeLine(stdout, "[3/3] Starting VM")
 	writef(stdout, "Running: %s\n", renderCommand(cmdName, cmdArgs))
 	if *network == "user" {
-		writeLine(stdout, "user mode forwards: ssh localhost:2222, http localhost:8080")
+		// Said now rather than polled for. vm.IPLookup.Resolve documents
+		// why: user mode is QEMU's own SLIRP stack, so its DHCP server runs
+		// inside the QEMU process and writes no lease file the host can
+		// read, and no frame from the guest reaches the host's neighbour
+		// table, so no ARP entry exists either. Both host sources are out,
+		// and the third -- the guest agent, if the image ships one --
+		// reports the guest's own view of itself, 10.0.2.15 behind the NAT,
+		// which is not an address anything on this host can connect to. The
+		// way in is the forwarded ports named here.
+		writeLine(stdout, userModeBlock())
 	}
 
 	logFile, err := os.OpenFile(logPath, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o644)
@@ -812,6 +830,19 @@ func runStart(args []string, stdin io.Reader, stdout, stderr io.Writer, store *s
 		_ = logFile.Close()
 	}()
 
+	// While the VM runs, two things write to these streams at once: os/exec's
+	// copier goroutines, carrying the guest's console, and the address poller
+	// started below. io.Writer promises nothing about concurrent use -- an
+	// *os.File survives it, the buffers the tests pass do not -- so both go
+	// through one lock.
+	//
+	// The lock orders whole Write calls and nothing more. A block is written
+	// with one of them, so it arrives whole; the console is copied in
+	// whatever chunks the pipe delivers, so a block can still land between
+	// two of those and split a console line in half.
+	vmOut := &syncWriter{w: stdout}
+	vmErr := &syncWriter{w: stderr}
+
 	command := exec.Command(cmdName, cmdArgs...)
 	if sf, ok := stdin.(*os.File); ok {
 		command.Stdin = sf
@@ -821,11 +852,16 @@ func runStart(args []string, stdin io.Reader, stdout, stderr io.Writer, store *s
 	if cmdName == "sudo" {
 		// sudo on macOS may fail with "unable to allocate pty" when stdio is
 		// proxied through pipes. Keep stdio attached directly to the terminal.
+		//
+		// The lock is not shared with the child here, and for this caller it
+		// does not need to be: os/exec hands an *os.File to the child as a
+		// descriptor instead of copying through a Go writer, and an *os.File
+		// is what main passes and what this branch exists to preserve.
 		command.Stdout = stdout
 		command.Stderr = stderr
 	} else {
-		command.Stdout = io.MultiWriter(stdout, logFile)
-		command.Stderr = io.MultiWriter(stderr, logFile)
+		command.Stdout = io.MultiWriter(vmOut, logFile)
+		command.Stderr = io.MultiWriter(vmErr, logFile)
 	}
 	if err := command.Start(); err != nil {
 		st.VM.LastError = err.Error()
@@ -838,7 +874,64 @@ func runStart(args []string, stdin io.Reader, stdout, stderr io.Writer, store *s
 		return err
 	}
 
+	// The guest has no address until it has booted and asked for one, and
+	// command.Wait below blocks for the whole life of the VM -- so "after
+	// boot" is a goroutine running BESIDE the VM and not code placed after
+	// that call.
+	//
+	// The goroutine never touches st. It records what it finds through its
+	// own store.Load/store.Save, which is what lets a `status` in another
+	// terminal see the address while the VM is still running, and it is the
+	// only writer of state.json for that whole window: between the save just
+	// above and the one after Wait, no other line of runStart writes st or
+	// calls store.Save. The join below sits ahead of that later save, and the
+	// address is put back on st there so the save does not blank the field
+	// the goroutine had written.
+	ipCtx, cancelIPPoll := context.WithCancel(context.Background())
+	ipDone := make(chan struct{})
+	ipResolved := make(chan vm.IPResult, 1)
+	if *network == "user" {
+		// No poller at all for the mode with no host source to poll; the
+		// block a few lines up has already said where this VM is reached.
+		close(ipDone)
+	} else {
+		poll := vmIPPoll{
+			Lookup: vm.IPLookup{
+				MAC:           macAddress,
+				Mode:          *network,
+				LeaseFile:     st.Network.DHCPLeaseFile,
+				BridgeName:    st.Network.BridgeName,
+				QGASocketPath: qgaSock,
+			},
+			Uplink:   st.Network.BridgeInterface,
+			Timeout:  vm.DefaultIPPollTimeout,
+			Interval: vm.DefaultIPPollInterval,
+			GOOS:     runtime.GOOS,
+			Stdout:   vmOut,
+			Stderr:   vmErr,
+			Store:    store,
+		}
+		go func() {
+			defer close(ipDone)
+			if res, ok := poll.run(ipCtx); ok {
+				ipResolved <- res
+			}
+		}()
+	}
+
 	waitErr := command.Wait()
+	// QEMU has exited, so the poll is cancelled and joined before anything
+	// else writes state. vm.IPLookup.Poll's doc calls this exact usage out --
+	// "the caller cancels this the moment QEMU exits" -- and the join is what
+	// keeps the single-writer property above true: a poller still running
+	// here would write state.json after this function had finished with it.
+	cancelIPPoll()
+	<-ipDone
+	select {
+	case res := <-ipResolved:
+		st.VM.IPAddress = res.IP
+	default:
+	}
 	st.VM.PID = 0
 	st.VM.StoppedAt = state.NowRFC3339()
 	if waitErr != nil {
@@ -852,6 +945,363 @@ func runStart(args []string, stdin io.Reader, stdout, stderr io.Writer, store *s
 	}
 	writeLine(stdout, "vm exited")
 	return nil
+}
+
+// --- the address the guest ends up on --------------------------------------
+
+// webUIPort is the port the Kairos WebUI is served on inside the guest, and
+// userModeSSHPort is the host port user mode forwards to the guest's sshd.
+//
+// They are literals here because they are literals in internal/vm too: both
+// builders there carry a hostfwd list written out by hand -- tcp::2222-:22
+// and tcp::8080-:8080 -- and nothing in that package exports the numbers. A
+// shared constant would have to be declared there, which this change does not
+// touch, so what keeps the two in step instead is a test that builds a
+// user-mode QEMU command and looks for these ports in it.
+const (
+	webUIPort       = "8080"
+	userModeSSHPort = "2222"
+)
+
+// vmUpBlock is what a start prints once the guest's address is known.
+//
+// The first three lines are the block the issue specifies, character for
+// character, down to the column the values line up on.
+//
+// The fourth is the source, which internal/vm asks its caller to print:
+// vm.IPResult's own doc says "192.168.64.12 (from the ARP cache)" and the
+// same address from the DHCP lease "deserve different amounts of trust from a
+// human". An ARP entry is evidence the host exchanged frames with that MAC
+// and can be left over from a previous boot; a line in our own DHCP server's
+// lease file is that server saying what it handed this guest.
+//
+// It renders the usable case only. An address in 169.254.0.0/16 arrives
+// here as an ordinary answer -- vm's usableIPv4 lets link-local through on
+// purpose, because "a 169.254 address is what a guest that failed to get a
+// lease genuinely has, and reporting it is more use than reporting nothing"
+// -- and three lines that read as success are the wrong frame for one.
+// vmLinkLocalBlock below is what the poll prints instead.
+//
+// Both values go through planValue although neither can carry anything a
+// terminal acts on today: the address has been through vm's usableIPv4, which
+// is net.ParseIP plus To4, so it is a dotted quad, and the source is one of
+// three constants in that package. It is the same reason renderCommand sends
+// its words through -- this is the boundary where a value this package did
+// not choose becomes a line on a terminal, and the guard lives at the
+// boundary rather than in each call site's memory.
+func vmUpBlock(res vm.IPResult) string {
+	ip := planValue(res.IP)
+	return strings.Join([]string{
+		"VM is up.",
+		"  WebUI:  http://" + ip + ":" + webUIPort,
+		"  SSH:    ssh kairos@" + ip,
+		"  Source: " + planValue(res.Source),
+	}, "\n")
+}
+
+// userModeBlock is the same shape for the one mode that has no address to
+// look up.
+//
+// It is printed before QEMU is started, so it says where the VM will be
+// reached and never that the VM is up: nothing here has observed a booted
+// guest. What it can say without observing anything is where SLIRP forwards
+// to, because those ports are on the command line about to be run.
+//
+// The note is the limitation checkDarwinPrivilege already spells out where it
+// offers this mode as the fallback for a host that cannot get root. It is
+// repeated here because a user who chose user mode directly never sees that
+// error, and the difference -- no address on your network, so no second VM
+// can reach this one -- is the whole reason the other two modes exist.
+func userModeBlock() string {
+	return strings.Join([]string{
+		"user mode: the guest sits behind QEMU's user-mode NAT.",
+		"  WebUI:  http://localhost:" + webUIPort,
+		"  SSH:    ssh -p " + userModeSSHPort + " kairos@localhost",
+		"  Note:   those two forwarded ports are the only way in. The guest",
+		"          has no address on your network, so this mode supports a",
+		"          single VM and cannot form a cluster.",
+	}, "\n")
+}
+
+// ipPollFacts is everything the diagnostic below is allowed to say: the mode
+// the run settled on, the address it asked about, the two interface names the
+// two modes are diagnosed by, the platform, and the budget that elapsed.
+//
+// GOOS is a field rather than runtime.GOOS read inside the renderer for the
+// reason noBridgeUplinkError gives for taking one as a parameter: a
+// GOOS-gated sentence is a sentence only one CI leg can pin.
+type ipPollFacts struct {
+	Mode    string
+	MAC     string
+	Bridge  string
+	Uplink  string
+	GOOS    string
+	Timeout time.Duration
+}
+
+// vmIPTimeoutNotice is what a start prints when the poll spent its whole
+// budget without an answer.
+//
+// Never exiting silently is the requirement: a user left with no address has
+// a VM that is running and unreachable, and the most likely reason -- the
+// guest never got a lease -- is invisible from the host. So the notice names
+// the mode and the MAC it asked about (which is what a lease file or an ARP
+// table has to be searched for by hand), how long it waited, what usually
+// causes this, and where the recorded answer lives.
+//
+// It says the run has stopped looking because it has: the poll is over when
+// this prints, so no later `status` will fill the address in by itself.
+func vmIPTimeoutNotice(f ipPollFacts) string {
+	lines := []string{
+		fmt.Sprintf("No address for the VM after %s. This run has stopped looking.", f.Timeout),
+		"  Mode:   " + planValue(f.Mode),
+		"  MAC:    " + planValue(f.MAC),
+		"  Cause:  the guest may still be booting, or it never got a lease.",
+	}
+	lines = append(lines, ipPollCheckLines(f)...)
+	lines = append(lines, "  Then:   kairos-lab status, for what this run recorded.")
+	return strings.Join(lines, "\n")
+}
+
+// ipPollCheckLines is the part of the notice that differs per mode, because
+// the two modes fail in different places: shared depends on a bridge and a
+// DHCP server this tool started, bridged on a physical link and a DHCP server
+// on the LAN that it did not.
+//
+// The names are the ones state recorded for this run, and they go through
+// planValue because that is where they came from -- state.json, a file the
+// reset and cleanup plans already treat as untrusted text.
+func ipPollCheckLines(f ipPollFacts) []string {
+	switch f.Mode {
+	case "shared":
+		// The bridge name is empty on macOS, where vmnet builds the
+		// interface inside QEMU and nothing records what it called it.
+		bridge := "the NAT bridge"
+		if f.Bridge != "" {
+			bridge = "the bridge " + planValue(f.Bridge)
+		}
+		return []string{"  Check:  " + bridge + " is up and the DHCP server behind it is running."}
+	case "bridged":
+		iface := "the bridged interface"
+		if f.Uplink != "" {
+			iface = planValue(f.Uplink)
+		}
+		lines := []string{"  Check:  " + iface + " has a link and a DHCP server on that network answered."}
+		if f.GOOS == "darwin" {
+			// On macOS a bridged guest has no lease file this tool can read
+			// -- /var/db/dhcpd_leases is vmnet SHARED's database, which is
+			// why Resolve's mode gate keeps a bridged run out of it -- so the
+			// ARP cache is the host source left to answer, and it holds an
+			// entry only for a MAC this host has exchanged frames with.
+			lines = append(lines,
+				"          On macOS this is answered from the host ARP cache, which",
+				"          holds no entry until this host and the guest have",
+				"          exchanged frames.")
+		}
+		return lines
+	default:
+		// Not reachable from runStart: -network and the reviewer accept only
+		// the three modes in networkModes, and user mode starts no poll. It
+		// is here so the renderer is total rather than silently dropping the
+		// one line that says what to look at.
+		return []string{"  Check:  the guest reached the network and a DHCP server answered."}
+	}
+}
+
+// vmLinkLocalBlock is what a start prints when the poll resolved an address
+// and that address is in 169.254.0.0/16.
+//
+// This is the requirement's failure mode -- "never exit silently leaving the
+// user with only a link-local address" -- arriving through the success path
+// rather than the timeout one, so the answer has to arrive there too. The
+// address is printed rather than withheld, because it is still what the host
+// found for this guest and the user may want it; what changes is the frame
+// around it, so that the two URLs are not read as somewhere to go.
+//
+// The advice is ipPollCheckLines, the same list the timeout notice gives.
+// 169.254.0.0/16 is the range RFC 3927 has a host fall back to when DHCP
+// does not answer it, which is the cause that notice already names, so the
+// thing to look at -- the DHCP server for this mode -- is the same thing.
+//
+// There is no "Then: kairos-lab status" row as the timeout notice has. That
+// row exists because a timed-out run has an answer on record the terminal
+// never showed; here the address is on the screen, and the status row adds
+// only the same caveat these lines already carry (see linkLocalAddressNote).
+func vmLinkLocalBlock(res vm.IPResult, f ipPollFacts) string {
+	ip := planValue(res.IP)
+	lines := []string{
+		"The VM is up, but the address found for it is link-local.",
+		"  WebUI:  http://" + ip + ":" + webUIPort,
+		"  SSH:    ssh kairos@" + ip,
+		"  Source: " + planValue(res.Source),
+		"  Cause:  169.254.0.0/16 is what a guest assigns itself when no DHCP",
+		"          server answers it. It is not routed, so the two URLs above",
+		"          will not reach the VM.",
+	}
+	return strings.Join(append(lines, ipPollCheckLines(f)...), "\n")
+}
+
+// isLinkLocalIPv4 answers whether an address this tool is about to show a
+// user is one of the self-assigned ones.
+//
+// net.ParseIP answers a nil IP for anything that is not an address, and To4
+// a nil IP for an address that is not IPv4. net.IP is a slice and both To4
+// and IsLinkLocalUnicast read a nil receiver as a length, so the chain
+// answers false for junk rather than panicking on it -- which the `status`
+// caller needs, because state.json is a 0644 file any process running as
+// the user can write and the field is whatever it found there. The poll's
+// own values have been through vm's usableIPv4, which opens with the same
+// two calls.
+func isLinkLocalIPv4(ip string) bool {
+	v4 := net.ParseIP(ip).To4()
+	return v4 != nil && v4.IsLinkLocalUnicast()
+}
+
+// linkLocalAddressNote annotates the address row in `status` the way
+// bridgeIfaceLinkNote annotates the bridge interface, and for the same
+// reason: the row is a value with a consequence a user cannot see in it.
+//
+// A user reading the row has less context than one watching a start -- the
+// block that explained the address has scrolled away, or belongs to a
+// terminal they never had -- so the row carries the short form itself rather
+// than leaving 169.254.x.x to look like any other address.
+func linkLocalAddressNote(ip string) string {
+	if !isLinkLocalIPv4(ip) {
+		return ""
+	}
+	// No interpolation, so nothing here needs escaping: the caller prints
+	// the address itself through emptyAsNone.
+	return " (link-local - self-assigned because no DHCP server answered; not reachable)"
+}
+
+// pollVMIP is vm.IPLookup.Poll behind a package-level var, the seam idiom
+// this file already uses for host-touching calls (see prepareLinuxBridge).
+//
+// The real Poll runs the three sources for real, once a second for 45
+// seconds: a subprocess against the host's neighbour table and a read on a
+// guest-agent socket. What a test driving it would observe is whatever the
+// machine running the suite has in its ARP cache -- and an address against a
+// 52:54:00 MAC really can be in there, since that is QEMU's own prefix -- so
+// what the poller prints, records and stays silent about is pinned through
+// this instead. Nothing in production assigns it; the tests restore it with
+// t.Cleanup.
+var pollVMIP = func(ctx context.Context, lookup vm.IPLookup, timeout, interval time.Duration) (vm.IPResult, bool) {
+	return lookup.Poll(ctx, timeout, interval)
+}
+
+// vmIPPoll is the address lookup that runs beside a started VM: what to ask
+// about, how long to ask for, where to print the answer and where to record
+// it.
+type vmIPPoll struct {
+	Lookup   vm.IPLookup
+	Uplink   string
+	Timeout  time.Duration
+	Interval time.Duration
+	GOOS     string
+	Stdout   io.Writer
+	Stderr   io.Writer
+	Store    *state.Store
+}
+
+// run performs the poll and says what it found, or why it found nothing. A
+// poll that finds nothing does not fail the start: the VM is running either
+// way and this is diagnostic output.
+//
+// Which kind of "nothing" it was decides whether anything is printed at all.
+// Poll answers a cancelled context and an elapsed budget with the same false,
+// and the two mean opposite things to the user: a VM quit ten seconds in must
+// not be reported as a network that never came up. So a cancelled context --
+// which from runStart means QEMU has exited -- prints nothing.
+//
+// The budget is checked as well as the context, because Poll has a third way
+// of returning false: a MAC it cannot parse, answered immediately. The notice
+// says how long was spent looking, and after that false no time has been
+// spent at all. runStart cannot reach it (vm.BuildQEMUCommand has already
+// rejected an unparseable stored MAC by name, and a blank one was replaced by
+// a derived address well above), but the gate is what makes the sentence true
+// of every caller rather than of this one.
+func (p vmIPPoll) run(ctx context.Context) (vm.IPResult, bool) {
+	started := time.Now()
+	res, ok := pollVMIP(ctx, p.Lookup, p.Timeout, p.Interval)
+	if ok {
+		// An address that was found is not the same as an address that
+		// works. A guest whose DHCP request went unanswered gives itself a
+		// 169.254 address, the host's ARP cache picks it up like any other,
+		// and vm's usableIPv4 hands it back as an answer -- so the block
+		// that says a VM is reachable is chosen here, not by the lookup.
+		if isLinkLocalIPv4(res.IP) {
+			writeLine(p.Stdout, vmLinkLocalBlock(res, p.facts()))
+		} else {
+			writeLine(p.Stdout, vmUpBlock(res))
+		}
+		// Printed first and recorded second, and the recording is the half
+		// that lasts: -serial mon:stdio is on all four display branches in
+		// internal/vm, so the block above goes to a terminal the guest's own
+		// boot console is scrolling past on and can be gone before it is
+		// read. state.json is the durable copy and `status` is where a user
+		// reads it back. A link-local address is recorded like any other,
+		// and `status` qualifies it there the same way this block does.
+		if err := recordVMIP(p.Store, res.IP); err != nil {
+			writef(p.Stderr, "warning: the VM address was not recorded, so `kairos-lab status` will not show it: %s\n", planValue(err.Error()))
+		}
+		return res, true
+	}
+	if ctx.Err() != nil {
+		return vm.IPResult{}, false
+	}
+	if p.Timeout > 0 && time.Since(started) >= p.Timeout {
+		writeLine(p.Stdout, vmIPTimeoutNotice(p.facts()))
+	}
+	return vm.IPResult{}, false
+}
+
+// facts is what this poll knows about the run it belongs to, in the shape
+// the two diagnostics take.
+//
+// Both of them are reached from run and both end in ipPollCheckLines, so
+// building the set once is what keeps a user who got a self-assigned address
+// and a user who got no address at all pointed at the same thing -- which is
+// right, because neither guest has a lease.
+func (p vmIPPoll) facts() ipPollFacts {
+	return ipPollFacts{
+		Mode:    p.Lookup.Mode,
+		MAC:     p.Lookup.MAC,
+		Bridge:  p.Lookup.BridgeName,
+		Uplink:  p.Uplink,
+		GOOS:    p.GOOS,
+		Timeout: p.Timeout,
+	}
+}
+
+// syncWriter serialises writes to one io.Writer, so that the guest's console
+// and the address poller can share a stream without tearing each other's
+// output or racing on the writer's own state.
+type syncWriter struct {
+	mu sync.Mutex
+	w  io.Writer
+}
+
+func (s *syncWriter) Write(p []byte) (int, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.w.Write(p)
+}
+
+// recordVMIP puts the address in state.json through a load of its own.
+//
+// It deliberately does not take the caller's *state.State: runStart is
+// blocked in command.Wait() with a copy of the state it loaded before the VM
+// started, and saving that copy from here would undo every field written
+// since. Loading, setting the one field and saving is also what makes the
+// address visible to a `status` run from another terminal while this VM is
+// still running.
+func recordVMIP(store *state.Store, ip string) error {
+	st, err := store.Load()
+	if err != nil {
+		return err
+	}
+	st.VM.IPAddress = ip
+	return store.Save(st)
 }
 
 func runStatus(stdout io.Writer, store *state.Store) error {
@@ -876,8 +1326,21 @@ func runStatus(stdout io.Writer, store *state.Store) error {
 		pm = p.PackageManager + " (detected)"
 	}
 
-	writef(stdout, "platform: %s\n", platformLabel)
-	writef(stdout, "package manager: %s\n", pm)
+	// Every row below carries a value out of state.json, which is a 0644
+	// file any process running as the user can write, to a terminal -- the
+	// same untrusted path the reset and cleanup plans take, and the reason
+	// planValue exists. These rows used to print theirs with a bare %s. A
+	// stored bridge interface of "eth0" followed by CSI 2K (erase this
+	// line), CSI 1G (back to column one) and a newline printed a forged "vm
+	// running: true" row and erased the row the payload had arrived on,
+	// leaving the forgery standing above the real "vm running: false" with
+	// nothing to show where it came from.
+	//
+	// So the guard is applied here the way it is in the plans: emptyAsNone
+	// and joinOrNone escape what they return, and the rows that format a
+	// value some other way call planValue themselves.
+	writef(stdout, "platform: %s\n", planValue(platformLabel))
+	writef(stdout, "package manager: %s\n", planValue(pm))
 	writef(stdout, "dependencies present now: %s\n", joinOrNone(present))
 	writef(stdout, "dependencies pre-existing: %s\n", joinOrNone(st.Setup.PreExistingDeps))
 	writef(stdout, "dependencies installed by kairos-lab: %s\n", joinOrNone(st.Setup.InstalledByKairosLab))
@@ -887,16 +1350,38 @@ func runStatus(stdout io.Writer, store *state.Store) error {
 	writef(stdout, "iso path: %s\n", emptyAsNone(st.VM.ISOLocal))
 	writef(stdout, "disk path: %s\n", emptyAsNone(st.VM.DiskPath))
 	writef(stdout, "network mode: %s\n", emptyAsNone(st.Network.Mode))
+	// The uplink stays a bridged-only row: shared clears the field on
+	// purpose, because the bridge it builds has the tap as its only port and
+	// attaches to no host interface.
 	if st.Network.Mode == "bridged" {
 		writef(stdout, "bridge iface: %s%s\n", emptyAsNone(st.Network.BridgeInterface), bridgeIfaceLinkNote(st.Network.BridgeInterface))
+	}
+	// The bridge and the tap are not bridged's alone. vm.PrepareLinuxShared
+	// records BridgeName and TapName exactly as the bridged path does, and
+	// both are what a user needs to name when a shared VM cannot be reached
+	// -- which is the default mode, so this row used to be missing from the
+	// status of nearly every run.
+	if st.Network.Mode == "bridged" || st.Network.Mode == "shared" {
 		writef(stdout, "bridge resources: bridge=%s tap=%s\n", emptyAsNone(st.Network.BridgeName), emptyAsNone(st.Network.TapName))
+	}
+	// Always printed, in every mode. This is the durable channel for the
+	// address: the block a start prints when it resolves one goes to the
+	// same terminal the guest's boot console is on and can scroll past
+	// unread, and this row is where it can be read back afterwards.
+	writef(stdout, "vm ip address: %s%s\n", emptyAsNone(st.VM.IPAddress), linkLocalAddressNote(st.VM.IPAddress))
+	if st.Network.Mode == "user" {
+		// Without this row user mode reports an address of none and nothing
+		// else, which reads like a failure rather than like the mode working
+		// as designed: a SLIRP guest has no address on the host's network
+		// and is reached on the two forwarded ports instead.
+		writef(stdout, "user mode forwards: ssh localhost:%s, http localhost:%s\n", userModeSSHPort, webUIPort)
 	}
 	writef(stdout, "vm running: %t\n", running)
 	if running {
 		writef(stdout, "vm pid: %d\n", st.VM.PID)
 	}
 	if st.VM.LastError != "" {
-		writef(stdout, "last vm error: %s\n", st.VM.LastError)
+		writef(stdout, "last vm error: %s\n", planValue(st.VM.LastError))
 	}
 	return nil
 }
@@ -1629,7 +2114,12 @@ func bridgeIfaceLinkNote(iface string) string {
 	case "active":
 		return " (link active)"
 	default:
-		return fmt.Sprintf(" (link %s - the VM will not get an address over this interface)", status)
+		// The interface name is not interpolated here -- only the status is,
+		// and the caller has already escaped the name it prints beside this.
+		// The status word is whatever followed "status:" in this host's
+		// ifconfig output, so it is escaped for the same reason the rest of
+		// the row is: it is text this package did not choose.
+		return fmt.Sprintf(" (link %s - the VM will not get an address over this interface)", planValue(status))
 	}
 }
 
@@ -2007,18 +2497,34 @@ func printListWithReasons(w io.Writer, title string, values map[string]string) {
 	}
 }
 
+// joinOrNone and emptyAsNone are `status`'s two row renderers, and they
+// escape what they return.
+//
+// Every value they are handed comes out of state.json, which is the same
+// untrusted 0644 file the reset and cleanup plans read, and `status` prints
+// it to a terminal with no prompt in the way. Escaping inside them rather
+// than at each call site is the rule planValue's own doc sets out: the last
+// fix at this boundary escaped two rows and the same attack then walked
+// through their siblings.
+//
+// planValue returns an all-printable value unchanged, so an ordinary status
+// still reads "disk path: /home/u/.cache/kairos-lab/vm/k.qcow2".
 func joinOrNone(values []string) string {
 	if len(values) == 0 {
 		return "none"
 	}
-	return strings.Join(values, ", ")
+	escaped := make([]string, 0, len(values))
+	for _, v := range values {
+		escaped = append(escaped, planValue(v))
+	}
+	return strings.Join(escaped, ", ")
 }
 
 func emptyAsNone(v string) string {
 	if v == "" {
 		return "none"
 	}
-	return v
+	return planValue(v)
 }
 
 func nonEmpty(v, fallback string) string {
