@@ -83,7 +83,9 @@ This will:
 - Boot the VM with the ISO attached
 - Use shared networking (VM gets a real address on a NAT subnet you can SSH to)
 - Open a graphical window
-- Print the VM's address, with a WebUI URL and an SSH command, once it's up
+- Poll for the VM's address for up to 45s, printing a WebUI URL and an SSH
+  command if a usable one turns up - otherwise it says it has stopped looking
+  and moves on; the VM keeps running either way
 
 **Exit the VM with `Ctrl-a x`**
 
@@ -121,15 +123,14 @@ Flags:
 - `-display serial|window` - Display mode (default: window)
 - `-network shared|bridged|user` - Network mode (default: shared)
 - `-disk-size 60G` - Disk size for new disks
-- `-memory 4096` / `-cpus 2` - VM resources
+- `-memory 4` / `-cpus 2` - VM resources (memory is in GB, not MB)
 - `-yes` - Auto-confirm prompts
 
 ### `status`
 
 Shows current state:
 - Platform and dependencies
-- Downloaded ISOs
-- Disks and their associated ISOs
+- The ISO and disk path in use
 - Network configuration, including the bridge/tap for `shared` and `bridged`
 - The VM's address, once one has been found
 - Running VM info
@@ -137,7 +138,7 @@ Shows current state:
 ### `reset`
 
 Removes VM artifacts:
-- Disks (all or specific with `--disk <name>`)
+- Disks (all or specific with `-disk <name>`)
 - Network configuration
 - Keeps downloaded ISOs and setup
 
@@ -156,8 +157,8 @@ Three modes, picked with `-network`:
 - **shared** (the default) attaches no physical interface at all - it puts the
   VM on a private NAT subnet instead. That's also why it works over Wi-Fi,
   where `bridged` often can't: no guest frame leaves the host with a MAC the
-  access point never saw associate. The VM still gets a real address, so
-  several VMs can reach each other and form a cluster.
+  access point never saw associate. The VM still gets a real address on that
+  subnet, not just forwarded ports.
 - **bridged** puts the VM on your LAN with a real LAN address, at the cost of
   enslaving a physical interface to the bridge.
 - **user** is QEMU's own NAT with ports forwarded to localhost. It needs no
@@ -169,8 +170,9 @@ Three modes, picked with `-network`:
 Both `shared` and `bridged` use QEMU's vmnet backend and need sudo: Apple
 gates the vmnet entitlement to virtualization vendors, so a Homebrew QEMU can
 reach it only when it's launched as root. `start` checks for that up front,
-before creating anything, and refuses if you can't get it (not in the admin
-or wheel group, and no sudo binary) rather than fail midway through.
+before anything is built (no disk image, no bridge, no tap), and refuses if
+you can't get it - not in the admin or wheel group, or no sudo binary at all -
+rather than fail midway through.
 
 `bridged`'s interface defaults to the one holding the host's default route.
 `start` refuses to run when that interface has no link, because vmnet builds
@@ -185,14 +187,18 @@ since it attaches to no interface at all.
 
 ### Linux
 
-Both `shared` and `bridged` require **NetworkManager**. Both build a bridge
-(`kairoslab0`) and a tap device for the VM; they differ only in what else sits
-on the bridge:
+Both `shared` and `bridged` require **NetworkManager**, and both build a
+bridge (`kairoslab0`) and a tap device for the VM:
 - **shared** attaches nothing but the tap. NetworkManager runs a DHCP server
   and NAT on the bridge, so the VM gets an address on a private subnet with no
-  physical interface touched.
+  physical interface touched. Its connections are created with autoconnect
+  off, so `systemctl restart NetworkManager` while a shared VM is running
+  takes the bridge and tap down with it, and they only come back on the next
+  `start` - the trade for not running a DHCP server, DNS forwarder and NAT
+  rule on every boot of a host that has no VM up at all.
 - **bridged** also enslaves your physical interface to the bridge, so the VM
-  takes its lease from your LAN instead.
+  takes its lease from your LAN instead. Its connections autoconnect, so a
+  NetworkManager restart brings the bridge back on its own.
 
 If NetworkManager is not available, use `-network user` for port-forwarded access (SSH via `localhost:2222`).
 
@@ -210,5 +216,5 @@ Override with environment variables:
 
 - Cleanup only removes what the tool created
 - Dependencies that existed before setup are never removed
-- Network cleanup restores your original interface connection after `bridged`; `shared` enslaves no interface, so there's nothing to restore
+- Network cleanup reconnects your physical interface after `bridged` on a best-effort basis (NetworkManager may pick a different profile than your original one); `shared` enslaves no interface, so there's nothing to reconnect
 - Destructive operations require confirmation (use `-yes` to skip)

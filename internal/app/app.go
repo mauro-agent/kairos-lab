@@ -316,6 +316,19 @@ var requireNetworkPrivilege = vm.RequireNetworkPrivilege
 // observe what runStart does with the answer it gives back.
 var prepareLinuxBridge = vm.PrepareLinuxBridge
 
+// prepareLinuxShared is vm.PrepareLinuxShared behind the same kind of seam,
+// and it is here for the plainest reason of the three: without it no test
+// reached the call at all. Replacing the call below with a comment left go
+// build, go vet and the whole of go test ./... green -- the run that got
+// nearest answered "n" at the sudo prompt just above it and stopped there --
+// so the line that gives a Linux guest its network was pinned by nothing,
+// while the bridged twin in the branch below it was pinned through a seam of
+// its own. The real function needs an active NetworkManager and
+// issues sudo nmcli commands, so a test that let it run would either fail on
+// the CI host or leave a NAT bridge, a tap, a DHCP server and a masquerade
+// rule behind on it. Standing in for it is the way to reach the call at all.
+var prepareLinuxShared = vm.PrepareLinuxShared
+
 func runStart(args []string, stdin io.Reader, stdout, stderr io.Writer, store *state.Store) error {
 	fs := flag.NewFlagSet("start", flag.ContinueOnError)
 	isoPath := fs.String("iso", "", "path to ISO file")
@@ -325,8 +338,8 @@ func runStart(args []string, stdin io.Reader, stdout, stderr io.Writer, store *s
 	noISO := fs.Bool("no-iso", false, "boot without ISO (for installed systems)")
 	memory := fs.Int("memory", defaultMemoryMB()/1024, "memory in GB")
 	cpus := fs.Int("cpus", 2, "number of vCPUs")
-	network := fs.String("network", defaultNetworkMode, "network mode: shared|bridged|user")
-	display := fs.String("display", "window", "display mode: window|serial")
+	network := fs.String("network", defaultNetworkMode, "network mode: "+strings.Join(networkModes, "|"))
+	display := fs.String("display", defaultDisplayMode, "display mode: "+strings.Join(displayModes, "|"))
 	bridgeIface := fs.String("bridge-if", defaultBridgeIface(), "bridge interface (macOS vmnet or Linux uplink iface)")
 	autoYes := fs.Bool("yes", false, "auto-confirm sudo operations")
 	if err := fs.Parse(args); err != nil {
@@ -338,7 +351,7 @@ func runStart(args []string, stdin io.Reader, stdout, stderr io.Writer, store *s
 	if !networkModeValid(*network) {
 		return fmt.Errorf("invalid network mode: %s", *network)
 	}
-	if *display != "serial" && *display != "window" {
+	if !displayModeValid(*display) {
 		return fmt.Errorf("invalid display mode: %s", *display)
 	}
 
@@ -656,7 +669,7 @@ func runStart(args []string, stdin io.Reader, stdout, stderr io.Writer, store *s
 		if !ok {
 			return fmt.Errorf("sudo permission denied")
 		}
-		if err := vm.PrepareLinuxShared(st, runtimeDir); err != nil {
+		if err := prepareLinuxShared(st, runtimeDir); err != nil {
 			return err
 		}
 	}
@@ -1758,15 +1771,31 @@ func printUsage(w io.Writer) {
 	// its placeholder. "-network shared|bridged|user" does not fit in that,
 	// so the modes are spelled out in the description instead of the value,
 	// and the column stays where every other row in this usage has it.
+	//
+	// The two mode rows are built from the declarations rather than written
+	// out beside them. Both used to be hand-copied, and a hand-copied row is
+	// a row that goes stale silently: -network was missing from this block
+	// for the whole life of the flag, and flipping the -display default from
+	// window to serial left this row still saying window with nothing red.
 	writeLine(w, "Start flags:")
 	writeLine(w, "  -name <name>         Use/create disk with this name")
 	writeLine(w, "  -new                 Create new disk (even if others exist)")
 	writeLine(w, "  -no-iso              Boot without ISO (installed system)")
 	writeLine(w, "  -iso <path>          Use specific ISO file")
-	writeLine(w, "  -network <mode>      Network mode: shared|bridged|user (default shared)")
-	writeLine(w, "  -display <mode>      Display mode: window|serial (default window)")
+	writef(w, "  -network <mode>      %s\n", modeUsageDescription("Network mode", networkModes, defaultNetworkMode))
+	writef(w, "  -display <mode>      %s\n", modeUsageDescription("Display mode", displayModes, defaultDisplayMode))
 	writeLine(w, "")
 	writeLine(w, "Exit VM with Ctrl-a x (QEMU serial console quit)")
+}
+
+// modeUsageDescription renders the description half of one of the usage
+// block's enumerated-mode rows: the set of modes the flag accepts and the one
+// it falls back to, both read from the same declarations the flag and the
+// validation read. The flag package prints the default in its own format for
+// `start -h` ((default "shared")); this is the plainer form the usage block
+// has always used.
+func modeUsageDescription(label string, modes []string, defaultMode string) string {
+	return label + ": " + strings.Join(modes, "|") + " (default " + defaultMode + ")"
 }
 
 func writeLine(w io.Writer, a ...any) {
@@ -2042,7 +2071,7 @@ func reviewVMConfig(cfg *vmStartConfig, stdin io.Reader, stdout io.Writer) (*vmS
 			if err != nil {
 				return nil, err
 			}
-			if val == "window" || val == "serial" {
+			if displayModeValid(val) {
 				cfg.Display = val
 			} else if val != "" {
 				writeLine(stdout, "Invalid display mode, use 'window' or 'serial'")
@@ -2310,11 +2339,58 @@ var networkModes = []string{"shared", "bridged", "user"}
 // shared because that is the mode that works on the most hosts with the
 // fewest surprises: it needs no uplink interface, so it runs on a Wi-Fi-only
 // laptop where bridged cannot (no guest frame leaves the host with a MAC the
-// access point never saw associate), and unlike user mode it gives each guest
-// a real address on a NAT subnet, so several VMs can see each other and form
-// a cluster. bridged is still one flag away for anyone who needs the VM on
-// the LAN itself.
+// access point never saw associate), and unlike user mode it puts the guest
+// on a NAT subnet of its own -- an address the host can route to, where a
+// user-mode guest has none and is reached only on the two ports SLIRP
+// forwards to localhost. bridged is still one flag away for anyone who needs
+// the VM on the LAN itself.
+//
+// What is deliberately not claimed here is a cluster. That subnet could
+// carry more than one guest, but nothing in this CLI asks for a second VM,
+// and neither way around that is supported: runStart refuses outright while
+// this config dir's VM is running, and a second run pointed at another
+// config dir resolves the same bridge and tap names, since no flag sets
+// them -- which on Linux is what the pre-flight in internal/vm calls stale
+// and removes, taking the running VM's network with it.
 const defaultNetworkMode = "shared"
+
+// displayModes is the whole set of display modes the CLI accepts, kept the
+// way networkModes is and for the reason that set gives: a mode spelled out
+// inline at each place it is decided drifts from the copies of itself. The
+// display mode had one at every such place -- the flag's default, the flag's
+// usage string, the check in runStart, the reviewer's prompt 9 and the usage
+// block printed with no arguments -- and nothing derived any of them from
+// anything. Flipping the flag's declared default from window to serial left
+// go build, go vet and the whole of go test ./... green while both usage
+// listings still said window. (The reviewer's question and its rejection
+// line name the modes too; those are sentences addressed to a user rather
+// than a set the code matches against, and they stay written out.)
+//
+// The order is the order the user is shown: the flag's usage string and the
+// usage block are both built from this slice, so "window|serial" is one
+// decision rather than a listing to keep in step by hand.
+//
+// Matching is exact here too. internal/vm's two QEMU builders switch on the
+// mode and return "invalid display mode" for anything that is neither of
+// these two (bar the empty string, which they read as serial), so a folded
+// near-miss like "Window" would not start a VM either way -- it would fail
+// later, inside the command builder, instead of at the flag the user typed.
+var displayModes = []string{"window", "serial"}
+
+// defaultDisplayMode is what the -display flag falls back to. window is what
+// internal/vm turns into QEMU's -display default, a graphical window for
+// someone sitting at the machine; serial is the mode to pass over a remote
+// shell, where there is no display to open one on.
+const defaultDisplayMode = "window"
+
+// displayModeValid reports whether mode is one the CLI accepts. As with
+// networkModeValid the empty string is not one of them, and the reviewer
+// relies on that: an empty answer at prompt 9 means "leave it alone", so it
+// has to fail this check and then be filtered out ahead of the rejection
+// message rather than being accepted as a mode.
+func displayModeValid(mode string) bool {
+	return slices.Contains(displayModes, mode)
+}
 
 // networkModeValid reports whether mode is one the CLI accepts. The empty
 // string is not one of them, which the reviewer relies on: an empty answer at
