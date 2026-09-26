@@ -17,6 +17,7 @@ import (
 	"unicode/utf8"
 
 	"github.com/kairos-io/kairos-lab/internal/state"
+	"github.com/kairos-io/kairos-lab/internal/vm"
 )
 
 // Every kairos-lab option is a flag, so a positional argument is always a
@@ -106,6 +107,11 @@ const (
 	// state.disks[].name, printed by reset's own loop rather than by
 	// printList.
 	injectedDiskName = "disk1\n  - every other disk too\x1b[2K\r"
+	// state.network.mode, which both teardown messages name. Unlike the rows
+	// above, this one is never quoted and never escaped: the messages print a
+	// stored mode only when it is one of the three the CLI accepts, so a
+	// payload here has to vanish rather than arrive safely.
+	injectedNetworkMode = "bridged\n  - kairoslab9 (will be KEPT)\x1b[2K\r"
 )
 
 // forgedRows is what each of those values prints if it reaches the terminal
@@ -121,6 +127,7 @@ var forgedRows = []string{
 	"\n  - /etc/hosts (will be REMOVED)",
 	"\n  - /usr (will be REMOVED)",
 	"\n  - every other disk too",
+	"\n  - kairoslab9 (will be KEPT)",
 }
 
 // seedInjectedState writes a completed-setup state.json, the way anything
@@ -234,7 +241,10 @@ func TestResetPlanIsInertThroughTheFullFlow(t *testing.T) {
 	// business. This one is only about the bytes printed on the way there.
 	_ = Run([]string{"reset"}, strings.NewReader("y\n"), &stdout, &stderr, "test")
 	assertPlanIsInert(t, stdout.String())
-	if !strings.Contains(stdout.String(), "Cleaning up bridged network") {
+	// "shared", because that is the mode seedInjectedState records. The
+	// teardown is not bridged-only and the message no longer says it is;
+	// TestTeardownMessagesNameTheRecordedMode owns that wording.
+	if !strings.Contains(stdout.String(), "Cleaning up shared network") {
 		t.Fatalf("the flow stopped before the plan was acted on, so nothing was really exercised:\n%s", stdout.String())
 	}
 }
@@ -423,7 +433,10 @@ func TestPlanIsInertThroughTheFullFlowForSiblingRows(t *testing.T) {
 			// there, and the answer given to the prompt is a real one.
 			_ = Run([]string{tt.verb}, strings.NewReader("y\n"), &stdout, &stderr, "test")
 			assertPlanIsInert(t, stdout.String())
-			if !strings.Contains(stdout.String(), "Cleaning up bridged network") {
+			// "shared", the mode seedInjectedState records: the teardown
+			// message names it now instead of saying bridged for every
+			// network kairos-lab built.
+			if !strings.Contains(stdout.String(), "Cleaning up shared network") {
 				t.Fatalf("the flow stopped before the plan was acted on, so nothing was really exercised:\n%s", stdout.String())
 			}
 		})
@@ -679,35 +692,39 @@ func TestNetworkModesAreExactlyTheDocumentedModes(t *testing.T) {
 // it, on the config review's Network row, after a `start` that passed no
 // -network at all.
 //
-// The mode is bridged and not shared on purpose. shared is accepted by the
-// flag everywhere, but nothing in this package prepares its host side yet --
-// vm.PrepareLinuxShared has no call site here -- so on Linux the mode is
-// refused at both places it can be chosen, the -network flag and the config
-// review's prompt 7, rather than let a start reuse the tap a previous bridged
-// run left in state.json and put the guest on the LAN. The milestone that
-// wires the preparation drops that refusal and flips the flag to shared, and
-// this test is what will catch the flip: wantMode below is meant to be
-// retargeted in that same commit, not deleted.
+// The mode is shared, which is what this milestone moved it to: the host side
+// of shared is prepared on both platforms now (vm.PrepareLinuxShared on
+// Linux, vmnet-shared on macOS), and it is the mode that asks least of the
+// host -- no uplink interface, so it works on a Wi-Fi-only laptop where
+// bridged cannot, while still giving each guest its own address so two VMs
+// can form a cluster.
 //
 // -bridge-if is passed for one reason, and it is not the interface. It keeps
 // the test off the host: networkIface in runStart starts out as this flag's
 // value, and both interface-detection blocks only run when it is empty, so a
 // non-empty one skips vm.DetectUplinkCandidates on Linux and
-// vm.DetectBridgeIfaceCandidates on macOS. Without it the test shells out to
-// `ip route show default` or `ifconfig` and fails wherever the answer is
-// unhelpful -- a container whose only default-route device is one of the
-// filtered virtual ones (docker*, br-*, veth*, virbr*, cni*, podman*), or a
-// macOS runner with no interface reporting an active link. runStart then
-// returns "no suitable uplink interface found for bridged networking" before
-// the config review is ever printed, which looks exactly like the default
-// having moved. The value itself is never used: the run is cancelled at the
-// Enter prompt, long before networking is prepared.
+// vm.DetectBridgeIfaceCandidates on macOS. Without it a run in bridged mode
+// shells out to `ip route show default` or `ifconfig` and fails wherever the
+// answer is unhelpful -- a container whose only default-route device is one
+// of the filtered virtual ones (docker*, br-*, veth*, virbr*, cni*, podman*),
+// or a macOS runner with no interface reporting an active link -- and
+// runStart returns "no suitable uplink interface found for bridged
+// networking" before the config review is ever printed, which looks exactly
+// like the default having moved.
+//
+// Under the shared default those blocks are gated out (both ask for bridged),
+// so the flag is redundant today and is kept anyway: it costs nothing, the
+// value is never used -- the run is cancelled at the Enter prompt, long
+// before networking is prepared -- and it is what stops this test from
+// becoming host-dependent the moment the default moves back or that gate
+// widens. A redundant flag is the cheaper of the two mistakes. That shared
+// ignores it is asserted directly, by the "(n/a)" on row 8.
 func TestStartWithNoNetworkFlagUsesTheDefaultMode(t *testing.T) {
 	t.Setenv("KAIROS_LAB_CONFIG_DIR", t.TempDir())
 	t.Setenv("KAIROS_LAB_CACHE_DIR", t.TempDir())
 	seedStartableState(t, "kairos-disk0")
 
-	const wantMode = "bridged"
+	const wantMode = "shared"
 
 	var stdout, stderr bytes.Buffer
 	// -no-iso and an existing disk keep this out of the ISO resolver, and the
@@ -722,6 +739,12 @@ func TestStartWithNoNetworkFlagUsesTheDefaultMode(t *testing.T) {
 	want := fmt.Sprintf("  7) Network:      %s\n", wantMode)
 	if !strings.Contains(stdout.String(), want) {
 		t.Fatalf("the config review does not show %q: either the -network flag no longer defaults to %q, or the run ended before the review printed. Run returned %v.\nstdout:\n%s\nstderr:\n%s", want, wantMode, err, stdout.String(), stderr.String())
+	}
+	// The -bridge-if above is not this run's interface under the default
+	// mode, and the review says so rather than echoing a value shared never
+	// uses.
+	if !strings.Contains(stdout.String(), "  8) Net interface: (n/a)") {
+		t.Errorf("row 8 offers an interface under %s, which attaches to none:\n%s", wantMode, stdout.String())
 	}
 }
 
@@ -739,7 +762,9 @@ func TestStartWithNoNetworkFlagUsesTheDefaultMode(t *testing.T) {
 // The registered default is asserted from the same line, since flag prints it
 // as part of the entry. That is a second and more direct witness than
 // TestStartWithNoNetworkFlagUsesTheDefaultMode's trip through the config
-// review, and it is the other half of what the next milestone flips.
+// review, and the two are deliberately kept in step: this milestone moved the
+// default to shared, and a change that reaches only one of them is a default
+// the -h output and the review disagree about.
 func TestStartUsageListsEveryNetworkModeAndItsDefault(t *testing.T) {
 	t.Setenv("KAIROS_LAB_CONFIG_DIR", t.TempDir())
 	t.Setenv("KAIROS_LAB_CACHE_DIR", t.TempDir())
@@ -753,7 +778,7 @@ func TestStartUsageListsEveryNetworkModeAndItsDefault(t *testing.T) {
 	if !errors.Is(err, flag.ErrHelp) {
 		t.Fatalf("start -h returned %v, want flag.ErrHelp; captured:\n%s", err, usage)
 	}
-	want := `network mode: shared|bridged|user (default "bridged")`
+	want := `network mode: shared|bridged|user (default "shared")`
 	if !strings.Contains(usage, want) {
 		t.Fatalf("start -h does not print %q, so either a mode is undocumented or the default moved; got:\n%s", want, usage)
 	}
@@ -811,12 +836,11 @@ func captureOSStderr(t *testing.T, fn func() error) (string, error) {
 // they cleared the mode check without a VM, a disk or a host network being
 // touched.
 //
-// shared on Linux is the one exception, and only to how far it gets: the
-// temporary refusal in runStart sits between the mode check and requireSetup,
-// so it stops one seam earlier. What this test is about still holds there --
-// the mode cleared validation, since an unaccepted one is rejected before the
-// refusal can fire -- so the assertion is made against that error instead.
-// TestStartRefusesSharedNetworkModeOnLinux owns the refusal itself.
+// All three modes, on every GOOS, reach exactly that seam. shared used to be
+// the exception on Linux, where a temporary refusal sat between the mode
+// check and requireSetup because nothing prepared its host side; runStart now
+// calls vm.PrepareLinuxShared, so there is no mode the CLI documents and then
+// turns away.
 func TestStartAcceptsEveryDocumentedNetworkMode(t *testing.T) {
 	for _, mode := range []string{"shared", "bridged", "user"} {
 		t.Run(mode, func(t *testing.T) {
@@ -825,80 +849,8 @@ func TestStartAcceptsEveryDocumentedNetworkMode(t *testing.T) {
 
 			var stdout, stderr bytes.Buffer
 			err := Run([]string{"start", "-network", mode, "-iso", "/tmp/kairos.iso"}, strings.NewReader(""), &stdout, &stderr, "test")
-			if mode == "shared" && runtime.GOOS == "linux" {
-				if err == nil || strings.Contains(err.Error(), "invalid network mode") {
-					t.Fatalf("-network shared: got %v, want the temporary Linux refusal rather than a validation failure", err)
-				}
-				return
-			}
 			if !errors.Is(err, errSetupRequired) {
 				t.Fatalf("-network %s: got %v, want %v", mode, err, errSetupRequired)
-			}
-		})
-	}
-}
-
-// The temporary refusal of -network shared on Linux, pinned so that it cannot
-// be dropped quietly and so that it stays a refusal the user can act on.
-//
-// Until something calls vm.PrepareLinuxShared, a shared start on Linux has
-// two outcomes and no third: on a host that never ran bridged it dies inside
-// internal/vm's buildLinux with "shared linux mode requires tap name", and on
-// a host that did it is handed the tap that run left in state.json -- a tap
-// on a bridge with the physical NIC enslaved -- and the guest lands on the
-// LAN with state.json recording "mode": "shared" and no sudo prompt shown.
-// The refusal is what stands between a user typing -network shared and that
-// second outcome, so its removal has to be deliberate: it goes in the commit
-// that adds the vm.PrepareLinuxShared call, which is also the commit that
-// makes this test wrong on purpose.
-//
-// bridged and user are exercised alongside it because the refusal is a single
-// condition inside networkModeUnavailable, and a condition widened by one word
-// would take the working modes down with it -- here and, since both call it,
-// at the config review's prompt 7 as well.
-//
-// This test owns the flag path only. The reviewer path is the other writer of
-// the mode and has its own, in
-// TestReviewVMConfigRefusesSharedNetworkModeOnLinux.
-func TestStartRefusesSharedNetworkModeOnLinux(t *testing.T) {
-	if runtime.GOOS != "linux" {
-		t.Skipf("the refusal is Linux-only on purpose: on %s shared means -netdev vmnet-shared, which fails visibly for want of root, and the privilege pre-flight is where that is handled", runtime.GOOS)
-	}
-
-	t.Run("shared", func(t *testing.T) {
-		t.Setenv("KAIROS_LAB_CONFIG_DIR", t.TempDir())
-		t.Setenv("KAIROS_LAB_CACHE_DIR", t.TempDir())
-
-		var stdout, stderr bytes.Buffer
-		err := Run([]string{"start", "-network", "shared", "-iso", "/tmp/kairos.iso"}, strings.NewReader(""), &stdout, &stderr, "test")
-		if err == nil {
-			t.Fatalf("-network shared was accepted on linux, where nothing prepares its host side; stdout:\n%s", stdout.String())
-		}
-		// Ahead of requireSetup, which is where every other mode stops on a
-		// fresh config dir. The refusal has to come before anything reads
-		// state.json, because the stale tap it protects against is read from
-		// there.
-		if errors.Is(err, errSetupRequired) {
-			t.Fatalf("-network shared reached requireSetup (%v), so the refusal is not where it belongs -- in runStart's flag-checking block, before the state is loaded", err)
-		}
-		// A refusal that only says "unimplemented" leaves the user stuck, so
-		// the two modes that do work today have to be named in it.
-		for _, want := range []string{"-network bridged", "-network user"} {
-			if !strings.Contains(err.Error(), want) {
-				t.Errorf("the refusal %q does not point the user at %s", err, want)
-			}
-		}
-	})
-
-	for _, mode := range []string{"bridged", "user"} {
-		t.Run(mode, func(t *testing.T) {
-			t.Setenv("KAIROS_LAB_CONFIG_DIR", t.TempDir())
-			t.Setenv("KAIROS_LAB_CACHE_DIR", t.TempDir())
-
-			var stdout, stderr bytes.Buffer
-			err := Run([]string{"start", "-network", mode, "-iso", "/tmp/kairos.iso"}, strings.NewReader(""), &stdout, &stderr, "test")
-			if !errors.Is(err, errSetupRequired) {
-				t.Fatalf("-network %s: got %v, want %v -- the refusal is meant to catch shared and nothing else", mode, err, errSetupRequired)
 			}
 		})
 	}
@@ -933,19 +885,12 @@ func TestStartRejectsAnUnknownNetworkMode(t *testing.T) {
 // three by name, since a prompt that still reads "(bridged or user)" is how a
 // user learns the set.
 //
-// Linux is skipped, and only because shared cannot be run there yet: the
-// reviewer asks networkModeUnavailable and turns the answer away, which
-// TestReviewVMConfigRefusesSharedNetworkModeOnLinux owns. That leaves the
-// flag and the reviewer agreeing about shared on every host, which is what
-// this test is really about -- they simply agree to refuse it on one of them.
-// The skip is keyed on the GOOS rather than on the refusal existing, so the
-// commit that adds the vm.PrepareLinuxShared call has to drop it; the
-// networkModeUnavailable comment says so.
+// There is no GOOS skip here, and that is the assertion: the reviewer used to
+// refuse shared on Linux while the flag accepted it, because nothing prepared
+// the mode's host side there. runStart calls vm.PrepareLinuxShared now, so the
+// flag and the reviewer accept the same three modes on every host -- which is
+// what this test is really about, the two writers of the mode agreeing.
 func TestReviewVMConfigAcceptsSharedNetworkMode(t *testing.T) {
-	if runtime.GOOS == "linux" {
-		t.Skip("shared is refused by the reviewer on Linux until vm.PrepareLinuxShared has a call site; TestReviewVMConfigRefusesSharedNetworkModeOnLinux covers it there")
-	}
-
 	cfg := reviewableConfig(t)
 	cfg.NetworkMode = "bridged"
 
@@ -969,67 +914,6 @@ func TestReviewVMConfigAcceptsSharedNetworkMode(t *testing.T) {
 // three modes: the message is the only place a user who typed a typo is told
 // what the alternatives are.
 const invalidNetworkModeMessage = "Invalid network mode, use 'shared', 'bridged' or 'user'"
-
-// unavailableNetworkModeMessage is the reviewer's other refusal: the mode is
-// spelled correctly and is a member of networkModes, but this host cannot run
-// it yet. Pinned whole, because it is the only thing a user who picked shared
-// at prompt 7 is told, and half of it -- the two modes that do work -- is the
-// only part they can act on.
-const unavailableNetworkModeMessage = "Network mode unavailable: shared networking is not wired up on Linux yet, use 'bridged' or 'user'"
-
-// The refusal of shared reached the other way. runStart has two writers of
-// the network mode and the -network flag is only one of them: a user who
-// passes no -network at all takes the default, opens the config review and
-// answers 7 with "shared", and reviewVMConfig hands that back to runStart,
-// which assigns it over the flag's value 160-odd lines after the flag was
-// checked. While only the flag was guarded that path reproduced the leak in
-// full -- a -netdev tap QEMU command built against the tap a previous bridged
-// run left in state.json, "mode": "shared" written back, and no sudo
-// confirmation shown -- which is why the availability question now lives in
-// networkModeUnavailable and is asked at both writers rather than inline at
-// one.
-//
-// The refusal is a reviewer message and not an error on purpose: the user is
-// nine menu entries into editing a configuration, so the mode is left as it
-// was and the menu comes round again, the same way a typo at this prompt is
-// handled.
-func TestReviewVMConfigRefusesSharedNetworkModeOnLinux(t *testing.T) {
-	if runtime.GOOS != "linux" {
-		t.Skipf("the refusal is Linux-only on purpose: on %s shared means -netdev vmnet-shared, which fails visibly for want of root, and the privilege pre-flight is where that is handled", runtime.GOOS)
-	}
-
-	cfg := reviewableConfig(t)
-	cfg.NetworkMode = "bridged"
-
-	var stdout bytes.Buffer
-	got, err := reviewVMConfig(cfg, scriptedInput("7\nshared\n\n\n"), &stdout)
-	if err != nil {
-		t.Fatalf("reviewVMConfig: %v", err)
-	}
-	// This is the value runStart assigns over the flag's and then writes to
-	// state.json as the run's mode, so "shared" here is the leak: the guest
-	// would be handed the tap a previous bridged run left behind. A refused
-	// answer leaves the configuration the user already had, exactly as a
-	// rejected typo does.
-	if got.NetworkMode != "bridged" {
-		t.Errorf("NetworkMode = %q after answering shared on linux, want it left at %q; stdout:\n%s", got.NetworkMode, "bridged", stdout.String())
-	}
-	if !strings.Contains(stdout.String(), unavailableNetworkModeMessage) {
-		t.Errorf("the refusal is not printed, so the user is not told why their answer did not take; want %q, got:\n%s", unavailableNetworkModeMessage, stdout.String())
-	}
-	// Not the typo message: shared IS a documented mode, and telling the user
-	// to "use 'shared'" for an answer of shared is the drift this milestone
-	// exists to remove.
-	if strings.Contains(stdout.String(), invalidNetworkModeMessage) {
-		t.Errorf("shared was refused as if it were an unknown mode:\n%s", stdout.String())
-	}
-	// Membership is still membership: the prompt names shared because the
-	// mode exists and macOS can use it, and the refusal is what says this
-	// host cannot.
-	if !strings.Contains(stdout.String(), "Enter network mode (shared, bridged or user)") {
-		t.Errorf("the prompt no longer offers shared:\n%s", stdout.String())
-	}
-}
 
 func TestReviewVMConfigRejectsAnUnknownNetworkMode(t *testing.T) {
 	cfg := reviewableConfig(t)
@@ -1114,6 +998,499 @@ func TestBridgedIfaceSelectableOnlyForBridged(t *testing.T) {
 	wantBridged := runtime.GOOS == "linux" || runtime.GOOS == "darwin"
 	if got := bridgedIfaceSelectable("bridged"); got != wantBridged {
 		t.Errorf("bridgedIfaceSelectable(%q) = %v, want %v on %s", "bridged", got, wantBridged, runtime.GOOS)
+	}
+}
+
+// --- shared networking wiring ---------------------------------------------
+
+// stubNetworkPrivilege puts a recording function in the requireNetworkPrivilege
+// seam for the duration of one test and returns the modes it was asked about,
+// in order.
+//
+// The seam is what makes the pre-flight observable at all on this CI leg. The
+// real vm.RequireNetworkPrivilege is a no-op everywhere except darwin, so a
+// Linux run cannot tell a wired call from a missing one, and every assertion
+// below -- which mode is asked about, and what a refusal stops -- would pass
+// against a tree that never called it. The restore is a t.Cleanup rather than
+// a defer because these tests drive Run rather than the function itself, and
+// the package var is shared with every test that follows.
+func stubNetworkPrivilege(t *testing.T, answer func(mode string) error) *[]string {
+	t.Helper()
+	saved := requireNetworkPrivilege
+	t.Cleanup(func() { requireNetworkPrivilege = saved })
+	calls := &[]string{}
+	requireNetworkPrivilege = func(mode string) error {
+		*calls = append(*calls, mode)
+		return answer(mode)
+	}
+	return calls
+}
+
+// isolateFromHostBinaries points PATH at a directory that does not exist, so
+// every exec.Command a run makes fails to find its binary.
+//
+// That is what keeps the starts below both host-independent and harmless. A
+// machine with qemu-img installed would have the disk tests write a real
+// image; a machine with qemu-system-* installed would have runStart launch an
+// actual VM and then sit in command.Wait() until something killed it. Neither
+// outcome is about the code under test. The lookups that fail because of this
+// are all ones the code already treats as "no answer" -- df in freeSpaceGB, ip
+// in the uplink detection -- and the tests here never take a path that needs
+// one.
+func isolateFromHostBinaries(t *testing.T) {
+	t.Helper()
+	t.Setenv("PATH", filepath.Join(t.TempDir(), "no-binaries-here"))
+}
+
+// localISO writes a file that `start -iso` accepts. The resolver checks the
+// extension and stats the path; the contents are never read.
+func localISO(t *testing.T) string {
+	t.Helper()
+	path := filepath.Join(t.TempDir(), "kairos.iso")
+	if err := os.WriteFile(path, []byte("not an iso, never read\n"), 0o644); err != nil {
+		t.Fatalf("write iso: %v", err)
+	}
+	return path
+}
+
+// loadStoredState reads back the state.json a run under test wrote.
+func loadStoredState(t *testing.T) *state.State {
+	t.Helper()
+	store, err := state.DefaultStore()
+	if err != nil {
+		t.Fatalf("DefaultStore: %v", err)
+	}
+	st, err := store.Load()
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	return st
+}
+
+// The privilege pre-flight is asked about the run's mode, and its refusal ends
+// the run before anything has been built.
+//
+// "Before anything" is the whole point of where the call sits, and it is what
+// is asserted here: the disk is materialized a few lines further down, so a
+// refusal arriving any later would have created the image -- 60 GB by default
+// -- for a VM that was never going to start, and on macOS the user would first
+// have answered a sudo password prompt that QEMU was going to reject anyway.
+//
+// All three modes are driven through it because which of them needs root is
+// vm.RequireNetworkPrivilege's decision and not this package's: it is
+// darwin-only and covers exactly shared and bridged. runStart asks about
+// whatever mode the run settled on and does not second-guess the answer, so a
+// mode gate added here -- "only ask for shared and bridged" -- would be a
+// second copy of that decision, free to drift from the real one.
+func TestStartRefusesAModeThisHostCannotPrivilege(t *testing.T) {
+	for _, mode := range []string{"shared", "bridged", "user"} {
+		t.Run(mode, func(t *testing.T) {
+			cacheDir := t.TempDir()
+			t.Setenv("KAIROS_LAB_CONFIG_DIR", t.TempDir())
+			t.Setenv("KAIROS_LAB_CACHE_DIR", cacheDir)
+			isolateFromHostBinaries(t)
+			seedStartableState(t, "kairos-disk0")
+
+			refused := errors.New("this host cannot privilege " + mode)
+			calls := stubNetworkPrivilege(t, func(string) error { return refused })
+
+			// A disk name that does not exist yet, so the run is one that
+			// WOULD create an image. -bridge-if keeps the bridged row off
+			// the host's routing table, the way
+			// TestStartWithNoNetworkFlagUsesTheDefaultMode does.
+			var stdout, stderr bytes.Buffer
+			err := Run([]string{
+				"start", "-name", "kairos-fresh-disk", "-iso", localISO(t),
+				"-network", mode, "-bridge-if", "kairos-test-uplink0", "-yes",
+			}, strings.NewReader(""), &stdout, &stderr, "test")
+
+			if !errors.Is(err, refused) {
+				t.Fatalf("start returned %v, want the pre-flight's own refusal; stdout:\n%s", err, stdout.String())
+			}
+			if want := []string{mode}; !slices.Equal(*calls, want) {
+				t.Errorf("the pre-flight was asked %q, want exactly %q -- once, about the mode this run chose", *calls, want)
+			}
+			if strings.Contains(stdout.String(), "Creating disk:") {
+				t.Errorf("the run announced a disk before the privilege check refused it:\n%s", stdout.String())
+			}
+			diskPath := filepath.Join(cacheDir, "vm", "kairos-fresh-disk.qcow2")
+			if _, statErr := os.Stat(diskPath); !errors.Is(statErr, os.ErrNotExist) {
+				t.Errorf("os.Stat(%q) = %v, want the image never to have been created", diskPath, statErr)
+			}
+		})
+	}
+}
+
+// The other half of the test above, and the reason it means anything: with the
+// pre-flight satisfied the very next thing the run does is create the disk. So
+// the image missing up there is the refusal stopping it, not the run having
+// died of something else before it ever got near.
+func TestStartCreatesTheDiskOnceThePrivilegeCheckHasPassed(t *testing.T) {
+	t.Setenv("KAIROS_LAB_CONFIG_DIR", t.TempDir())
+	t.Setenv("KAIROS_LAB_CACHE_DIR", t.TempDir())
+	isolateFromHostBinaries(t)
+	seedStartableState(t, "kairos-disk0")
+
+	calls := stubNetworkPrivilege(t, func(string) error { return nil })
+
+	var stdout, stderr bytes.Buffer
+	err := Run([]string{
+		"start", "-name", "kairos-fresh-disk", "-iso", localISO(t),
+		"-network", "shared", "-yes",
+	}, strings.NewReader(""), &stdout, &stderr, "test")
+
+	// qemu-img is where this run stops, because PATH has nothing on it. That
+	// is one step past the assertion: the announcement below is printed
+	// immediately before vm.EnsureDisk is called.
+	if err == nil || !strings.Contains(err.Error(), "create disk image") {
+		t.Fatalf("start returned %v, want it to have reached vm.EnsureDisk; stdout:\n%s", err, stdout.String())
+	}
+	if !strings.Contains(stdout.String(), "Creating disk: kairos-fresh-disk") {
+		t.Errorf("the run never reached disk creation, so the refusal test proves nothing:\n%s", stdout.String())
+	}
+	if want := []string{"shared"}; !slices.Equal(*calls, want) {
+		t.Errorf("the pre-flight was asked %q, want %q", *calls, want)
+	}
+}
+
+// The mode the pre-flight is asked about is the one the config review settled
+// on, not the one the flag carried in.
+//
+// This is why the call cannot live next to the -network validation: the review
+// is the second writer of the mode, so a user who passed a mode needing no
+// privilege and then chose shared at prompt 7 would never be asked about
+// shared at all, and would meet the problem as a sudo prompt in the middle of
+// a start. Asking in both places is the other wrong answer -- the same refusal
+// printed twice -- which is what the call count pins.
+func TestStartPrivilegeCheckUsesTheModeTheReviewSettledOn(t *testing.T) {
+	t.Setenv("KAIROS_LAB_CONFIG_DIR", t.TempDir())
+	t.Setenv("KAIROS_LAB_CACHE_DIR", t.TempDir())
+	isolateFromHostBinaries(t)
+	seedStartableState(t, "kairos-disk0")
+
+	refused := errors.New("this host cannot privilege the mode")
+	calls := stubNetworkPrivilege(t, func(string) error { return refused })
+
+	// -network user needs no privilege on any host; "shared" is typed at the
+	// review's prompt 7, and the trailing empty line leaves the menu.
+	var stdout, stderr bytes.Buffer
+	err := Run([]string{"start", "-name", "kairos-disk0", "-no-iso", "-network", "user"},
+		scriptedInput("7\nshared\n\n"), &stdout, &stderr, "test")
+
+	if !errors.Is(err, refused) {
+		t.Fatalf("start returned %v, want the pre-flight's own refusal; stdout:\n%s", err, stdout.String())
+	}
+	if want := []string{"shared"}; !slices.Equal(*calls, want) {
+		t.Fatalf("the pre-flight was asked %q, want %q -- either the flag's value was checked instead of the review's, or the check runs at both", *calls, want)
+	}
+}
+
+// Preparing the host side of Linux networking needs sudo in both modes that
+// have one, and the consent prompt has to describe the mode it is actually
+// about.
+//
+// shared's prompt names neither an uplink nor an interface, and that is a
+// requirement rather than a wording preference: vm.PrepareLinuxShared builds a
+// bridge whose only port is the tap and clears st.Network.BridgeInterface on
+// purpose, so a prompt naming eth0 would be asking the user to agree to
+// something the mode never does -- and the name it borrowed would come from
+// -bridge-if, which is passed here for exactly that trap.
+//
+// Answering no is the whole run: nothing is prepared, nothing is recorded, and
+// no nmcli or ip or sudo is invoked, which is what keeps this test off the
+// host.
+func TestStartAsksForSudoBeforePreparingLinuxNetworking(t *testing.T) {
+	if runtime.GOOS != "linux" {
+		t.Skipf("the bridge and tap are prepared by NetworkManager, which is Linux-only; on %s the vmnet modes ask for sudo at the QEMU launch instead", runtime.GOOS)
+	}
+	tests := []struct {
+		name       string
+		mode       string
+		wantPrompt string
+		unwanted   []string
+	}{
+		{
+			name:       "shared names the NAT bridge and no uplink",
+			mode:       "shared",
+			wantPrompt: "shared networking needs sudo to prepare a NAT bridge/tap (no uplink interface is used)",
+			// Not the word, anywhere: the -bridge-if value below is the one
+			// thing that could put an interface in this prompt.
+			unwanted: []string{"uplink:", "kairos-test-uplink0"},
+		},
+		{
+			name:       "bridged still names the uplink it enslaves",
+			mode:       "bridged",
+			wantPrompt: "bridged networking needs sudo to prepare bridge/tap (uplink: kairos-test-uplink0)",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Setenv("KAIROS_LAB_CONFIG_DIR", t.TempDir())
+			t.Setenv("KAIROS_LAB_CACHE_DIR", t.TempDir())
+			isolateFromHostBinaries(t)
+			seedStartableState(t, "kairos-disk0")
+			// This test is about the sudo prompt and not the pre-flight, so
+			// the pre-flight is made to say yes rather than left to whatever
+			// the host would answer.
+			stubNetworkPrivilege(t, func(string) error { return nil })
+
+			// Enter at the config review, Enter at "press Enter to start",
+			// then no at the sudo prompt.
+			var stdout, stderr bytes.Buffer
+			err := Run([]string{"start", "-name", "kairos-disk0", "-no-iso", "-network", tt.mode, "-bridge-if", "kairos-test-uplink0"},
+				scriptedInput("\n\nn\n"), &stdout, &stderr, "test")
+
+			if err == nil || err.Error() != "sudo permission denied" {
+				t.Fatalf("start returned %v, want %q; stdout:\n%s", err, "sudo permission denied", stdout.String())
+			}
+			if !strings.Contains(stdout.String(), tt.wantPrompt) {
+				t.Errorf("the sudo prompt is not %q; got:\n%s", tt.wantPrompt, stdout.String())
+			}
+			for _, unwanted := range tt.unwanted {
+				if strings.Contains(stdout.String(), unwanted) {
+					t.Errorf("the %s run mentions %q, which it never uses:\n%s", tt.mode, unwanted, stdout.String())
+				}
+			}
+			// A refused prompt means a refused run: nothing was prepared, so
+			// nothing may have been recorded about it either.
+			if strings.Contains(stdout.String(), "[2/3] Recording VM state") {
+				t.Errorf("the run carried on past the refused sudo prompt:\n%s", stdout.String())
+			}
+		})
+	}
+}
+
+// bridgeInterfaceForMode is the single answer to "what host interface does
+// this run attach to", and both places runStart records one ask it: the
+// st.Network.BridgeInterface field that `status` prints and the teardown
+// reads, and vm.StartConfig.BridgeIface, whose own doc says it "is meaningful
+// only for bridged mode".
+//
+// Only bridged attaches to an interface. -bridge-if is accepted by the flag
+// set whatever the mode, so `start -network shared -bridge-if eth0` has to
+// drop the value rather than record an uplink this VM never used and that
+// nothing later can tell apart from a real one.
+func TestBridgeInterfaceForModeAnswersOnlyForBridged(t *testing.T) {
+	cases := []struct {
+		mode  string
+		iface string
+		want  string
+	}{
+		{"bridged", "eth0", "eth0"},
+		{"shared", "eth0", ""},
+		{"user", "eth0", ""},
+		{"", "eth0", ""},
+		{"nonsense", "eth0", ""},
+		{"bridged", "", ""},
+	}
+	for _, tc := range cases {
+		t.Run(tc.mode+"/"+tc.iface, func(t *testing.T) {
+			if got := bridgeInterfaceForMode(tc.mode, tc.iface); got != tc.want {
+				t.Errorf("bridgeInterfaceForMode(%q, %q) = %q, want %q", tc.mode, tc.iface, got, tc.want)
+			}
+		})
+	}
+}
+
+// The same decision reached through a whole start, so that the helper above is
+// pinned at the call sites and not only on its own.
+//
+// user mode is what this drives because it is the only one of the three that
+// reaches the state save without touching the host: the shared and bridged
+// arms both prepare a NetworkManager bridge through sudo first. What holds for
+// user holds for shared by construction -- one function answers for both, and
+// the table above covers the other rows.
+func TestStartRecordsNoUplinkForAModeThatAttachesToNone(t *testing.T) {
+	t.Setenv("KAIROS_LAB_CONFIG_DIR", t.TempDir())
+	t.Setenv("KAIROS_LAB_CACHE_DIR", t.TempDir())
+	isolateFromHostBinaries(t)
+	seedStartableState(t, "kairos-disk0")
+
+	var stdout, stderr bytes.Buffer
+	err := Run([]string{"start", "-name", "kairos-disk0", "-no-iso", "-network", "user", "-bridge-if", "kairos-test-uplink0", "-yes"},
+		strings.NewReader(""), &stdout, &stderr, "test")
+	// The state is written at "[2/3] Recording VM state", one step before the
+	// launch that PATH isolation makes fail.
+	if err == nil || !strings.Contains(err.Error(), "start qemu") {
+		t.Fatalf("start returned %v, want it to have recorded the VM and then failed to launch it; stdout:\n%s", err, stdout.String())
+	}
+
+	st := loadStoredState(t)
+	if st.Network.Mode != "user" {
+		t.Fatalf("state records mode %q, want %q", st.Network.Mode, "user")
+	}
+	if st.Network.BridgeInterface != "" {
+		t.Errorf("state records an uplink of %q for a run that attached to none; `status` would report it as this VM's interface", st.Network.BridgeInterface)
+	}
+	for _, arg := range st.VM.QemuArgs {
+		if strings.Contains(arg, "kairos-test-uplink0") {
+			t.Errorf("the qemu command line carries the interface: %q", arg)
+		}
+	}
+}
+
+// Every disk gets its own guest NIC address, and keeps it.
+//
+// QEMU seeds every process with the same default address, so two VMs on one
+// subnet collide and a DHCP lease cannot be attributed to either. vm.MACForDisk
+// hashes the disk name, which gives each VM its own address AND the same
+// address on every restart -- the second half is what keeps a recorded lease
+// from going stale under the VM that holds it.
+//
+// A disk that already carries an address keeps it untouched. That is what
+// makes the field sticky rather than derived: a user who edited it, or a
+// future version that assigns addresses some other way, is not overwritten on
+// the next start, and a disk recorded before the field existed simply gets one
+// filled in.
+func TestStartGivesEachDiskItsOwnStickyMAC(t *testing.T) {
+	const diskName = "kairos-disk0"
+	const storedMAC = "52:54:00:ab:cd:ef"
+	tests := []struct {
+		name    string
+		seedMAC string
+		want    string
+	}{
+		{"derived when the disk carries none", "", vm.MACForDisk(diskName)},
+		{"kept when the disk already carries one", storedMAC, storedMAC},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Setenv("KAIROS_LAB_CONFIG_DIR", t.TempDir())
+			t.Setenv("KAIROS_LAB_CACHE_DIR", t.TempDir())
+			isolateFromHostBinaries(t)
+			seedStartableState(t, diskName)
+			if tt.seedMAC != "" {
+				store, err := state.DefaultStore()
+				if err != nil {
+					t.Fatalf("DefaultStore: %v", err)
+				}
+				st, err := store.Load()
+				if err != nil {
+					t.Fatalf("Load: %v", err)
+				}
+				state.FindDiskByName(st, diskName).MAC = tt.seedMAC
+				if err := store.Save(st); err != nil {
+					t.Fatalf("Save: %v", err)
+				}
+			}
+
+			// user mode, because it is the one that reaches the QEMU command
+			// line without preparing anything on the host. The address is
+			// attached to the NIC device, which is built once for all three
+			// modes in internal/vm.
+			var stdout, stderr bytes.Buffer
+			err := Run([]string{"start", "-name", diskName, "-no-iso", "-network", "user", "-yes"},
+				strings.NewReader(""), &stdout, &stderr, "test")
+			if err == nil || !strings.Contains(err.Error(), "start qemu") {
+				t.Fatalf("start returned %v, want it to have recorded the VM and then failed to launch it; stdout:\n%s", err, stdout.String())
+			}
+
+			st := loadStoredState(t)
+			disk := state.FindDiskByName(st, diskName)
+			if disk == nil {
+				t.Fatalf("the disk is gone from state:\n%+v", st.Disks)
+			}
+			if disk.MAC != tt.want {
+				t.Errorf("state records MAC %q for %s, want %q", disk.MAC, diskName, tt.want)
+			}
+			// Persisting it and using it are different failures: a MAC
+			// written to state but not handed to QEMU leaves every VM on the
+			// colliding default address while state.json claims otherwise.
+			wantArg := "virtio-net-pci,netdev=net0,mac=" + tt.want
+			if !slices.Contains(st.VM.QemuArgs, wantArg) {
+				t.Errorf("the recorded qemu command line has no %q:\n%q", wantArg, st.VM.QemuArgs)
+			}
+			if !strings.Contains(stdout.String(), wantArg) {
+				t.Errorf("the command printed to the user has no %q:\n%s", wantArg, stdout.String())
+			}
+		})
+	}
+}
+
+// A derived address is not the same address for two disks, which is the reason
+// the field exists at all. vm.MACForDisk owns the derivation and is tested
+// there; this is about the wiring handing it the disk's own name.
+func TestStartDerivesADifferentMACForADifferentDisk(t *testing.T) {
+	if vm.MACForDisk("kairos-disk0") == vm.MACForDisk("kairos-disk1") {
+		t.Fatal("two disk names derive the same address, so per-disk addressing buys nothing")
+	}
+}
+
+// teardownNetworkLabel names what reset and cleanup are about to tear down.
+//
+// It reads the recorded mode because the teardown is not bridged-only:
+// vm.PrepareLinuxShared sets CreatedByKairosLab exactly as
+// vm.PrepareLinuxBridge does, and both commands gate on that flag rather than
+// on the mode, so a user who ran shared used to be told their shared bridge
+// was a bridged one.
+//
+// An unrecognised stored value is dropped rather than echoed. state.json is
+// the tool's own 0644 file and these lines go straight to a terminal, so a
+// mode of "bridged\n  - /etc/hosts (will be REMOVED)" would forge a row in the
+// plan printed above them, which is the attack the planValue escaping exists
+// for. Nothing real is lost: every mode that can legitimately be recorded is
+// one of the three.
+func TestTeardownNetworkLabelOnlyEchoesAKnownMode(t *testing.T) {
+	cases := []struct {
+		mode string
+		want string
+	}{
+		{"shared", "shared network"},
+		{"bridged", "bridged network"},
+		{"user", "user network"},
+		{"", "network"},
+		{"nonsense", "network"},
+		{injectedNetworkMode, "network"},
+	}
+	for _, tc := range cases {
+		t.Run("mode="+strconv.Quote(tc.mode), func(t *testing.T) {
+			if got := teardownNetworkLabel(tc.mode); got != tc.want {
+				t.Errorf("teardownNetworkLabel(%q) = %q, want %q", tc.mode, got, tc.want)
+			}
+		})
+	}
+}
+
+// The same thing through both commands, because the message is what the user
+// reads while their network is being taken apart.
+//
+// The malformed bridge name makes the cleanup refuse before it probes or
+// touches anything, exactly as the tests above it do, so what is asserted is
+// the line printed on the way there and nothing on the host is involved.
+func TestTeardownMessagesNameTheRecordedMode(t *testing.T) {
+	if runtime.GOOS != "linux" {
+		t.Skip("the network teardown only runs on linux")
+	}
+	modes := []struct {
+		name string
+		mode string
+		want string
+	}{
+		{"shared", "shared", "Cleaning up shared network..."},
+		{"bridged", "bridged", "Cleaning up bridged network..."},
+		{"a stored mode no version of this CLI accepts", injectedNetworkMode, "Cleaning up network..."},
+	}
+	for _, verb := range []string{"reset", "cleanup"} {
+		for _, tc := range modes {
+			t.Run(verb+"/"+tc.name, func(t *testing.T) {
+				t.Setenv("KAIROS_LAB_CONFIG_DIR", t.TempDir())
+				t.Setenv("KAIROS_LAB_CACHE_DIR", t.TempDir())
+				seedInjectedState(t, func(st *state.State) {
+					withNetworkNames(injectedBridgeName, "")(st)
+					st.Network.Mode = tc.mode
+				})
+
+				var stdout, stderr bytes.Buffer
+				// The refusal the malformed name produces is the business of
+				// TestResetReportsAFailedNetworkCleanup and its cleanup
+				// sibling; this one is about the line above it.
+				_ = Run([]string{verb, "-yes"}, strings.NewReader(""), &stdout, &stderr, "test")
+				if !strings.Contains(stdout.String(), tc.want) {
+					t.Errorf("%s does not announce %q; got:\n%s", verb, tc.want, stdout.String())
+				}
+				assertPlanIsInert(t, stdout.String())
+			})
+		}
 	}
 }
 

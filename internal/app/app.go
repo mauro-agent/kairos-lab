@@ -291,6 +291,18 @@ func selectOrCreateDisk(st *state.State, vmDir, downloadsDir, diskSize string, s
 	return &st.Disks[idx-1], "", false, nil
 }
 
+// requireNetworkPrivilege is vm.RequireNetworkPrivilege behind a package-level
+// var so that a test can put its own function in its place. It is the seam
+// idiom this repo already uses for host-touching calls (see the note on
+// IsLinuxBridge in internal/vm/network_stub.go), and it is needed here for a
+// specific reason: the real function is a no-op everywhere except darwin, so
+// on the Linux CI leg a direct call would return nil whether the wiring below
+// existed or not. Every assertion about where the pre-flight sits -- that the
+// mode it is asked about is the one the config review settled on, and that a
+// refusal stops the run before a disk image is created -- would pass on a
+// tree that had never called it at all.
+var requireNetworkPrivilege = vm.RequireNetworkPrivilege
+
 func runStart(args []string, stdin io.Reader, stdout, stderr io.Writer, store *state.Store) error {
 	fs := flag.NewFlagSet("start", flag.ContinueOnError)
 	isoPath := fs.String("iso", "", "path to ISO file")
@@ -300,7 +312,7 @@ func runStart(args []string, stdin io.Reader, stdout, stderr io.Writer, store *s
 	noISO := fs.Bool("no-iso", false, "boot without ISO (for installed systems)")
 	memory := fs.Int("memory", defaultMemoryMB()/1024, "memory in GB")
 	cpus := fs.Int("cpus", 2, "number of vCPUs")
-	network := fs.String("network", "bridged", "network mode: shared|bridged|user")
+	network := fs.String("network", defaultNetworkMode, "network mode: shared|bridged|user")
 	display := fs.String("display", "window", "display mode: window|serial")
 	bridgeIface := fs.String("bridge-if", defaultBridgeIface(), "bridge interface (macOS vmnet or Linux uplink iface)")
 	autoYes := fs.Bool("yes", false, "auto-confirm sudo operations")
@@ -312,15 +324,6 @@ func runStart(args []string, stdin io.Reader, stdout, stderr io.Writer, store *s
 	}
 	if !networkModeValid(*network) {
 		return fmt.Errorf("invalid network mode: %s", *network)
-	}
-	// Membership is not availability: networkModeValid above accepts shared on
-	// every host, and this is where a mode that cannot be run on this one is
-	// turned away -- before the state is loaded, so the run ends before it can
-	// read the tap name a previous bridged run left behind. The reason, the
-	// other call site and what deletes both are written out on
-	// networkModeUnavailable.
-	if err := networkModeUnavailable(*network); err != nil {
-		return fmt.Errorf("%w: use -network bridged to put the VM on your LAN (needs sudo), or -network user for port-forwarded access", err)
 	}
 	if *display != "serial" && *display != "window" {
 		return fmt.Errorf("invalid display mode: %s", *display)
@@ -490,6 +493,19 @@ func runStart(args []string, stdin io.Reader, stdout, stderr io.Writer, store *s
 		isoLocal = vmConfig.ISOPath
 	}
 
+	// Refuse a mode this host cannot give the privilege for, here and nowhere
+	// else. Here, because the review above is the last writer of the mode --
+	// a user who passed -network user and then answered "shared" at prompt 7
+	// has to be told about shared -- and because nothing has been built yet:
+	// no disk image, no bridge, no tap. Later would mean saying the run
+	// cannot work after a 60 GB image exists, and the failure would arrive as
+	// an opaque sudo password prompt followed by a vmnet error out of QEMU.
+	// Nowhere else, because a second call at flag-parse time would print the
+	// same refusal twice.
+	if err := requireNetworkPrivilege(*network); err != nil {
+		return err
+	}
+
 	// Materialize disk — done after review so the config is final.
 	if isNewDisk {
 		// Validate the final disk path stays within vmDir before touching the filesystem.
@@ -576,6 +592,26 @@ func runStart(args []string, stdin io.Reader, stdout, stderr io.Writer, store *s
 			writeLine(stdout, vm.WiFiBridgeWarning(networkIface))
 		}
 	}
+	if *network == "shared" && runtime.GOOS == "linux" {
+		// No uplink is named in this prompt and none is recorded on the
+		// state, because shared enslaves no physical interface: the bridge
+		// vm.PrepareLinuxShared builds carries ipv4.method shared and has the
+		// tap as its only port, and that call clears
+		// st.Network.BridgeInterface for the same reason. A prompt naming an
+		// interface would be asking the user to consent to something this
+		// mode never does, and `status` would then report a stale uplink as
+		// this VM's.
+		ok, err := confirm(stdin, stdout, *autoYes, "shared networking needs sudo to prepare a NAT bridge/tap (no uplink interface is used)")
+		if err != nil {
+			return err
+		}
+		if !ok {
+			return fmt.Errorf("sudo permission denied")
+		}
+		if err := vm.PrepareLinuxShared(st, runtimeDir); err != nil {
+			return err
+		}
+	}
 	if *network == "bridged" && runtime.GOOS == "linux" {
 		st.Network.BridgeInterface = networkIface
 		ok, err := confirm(stdin, stdout, *autoYes, fmt.Sprintf("bridged networking needs sudo to prepare bridge/tap (uplink: %s)", st.Network.BridgeInterface))
@@ -588,6 +624,23 @@ func runStart(args []string, stdin io.Reader, stdout, stderr io.Writer, store *s
 		if err := vm.PrepareLinuxBridge(st, runtimeDir); err != nil {
 			return err
 		}
+	}
+
+	// The guest NIC address is per-disk and sticky. A disk that already
+	// carries one keeps it; one recorded before the field existed -- or one
+	// created a moment ago -- gets a derived address filled in here and
+	// persisted below. vm.MACForDisk hashes the disk name, so the address is
+	// the same on every restart, which is what keeps a DHCP lease
+	// attributable to this VM rather than to whichever guest last took
+	// QEMU's single default address.
+	//
+	// A stored value is deliberately not validated here. netDeviceArg rejects
+	// a corrupt one by name, which is an error the user can act on; quietly
+	// replacing it with a derived address would start the VM on an address
+	// state.json does not record.
+	macAddress := disk.MAC
+	if macAddress == "" {
+		macAddress = vm.MACForDisk(disk.Name)
 	}
 
 	biosPath := ""
@@ -608,8 +661,9 @@ func runStart(args []string, stdin io.Reader, stdout, stderr io.Writer, store *s
 		MemoryMB:      *memory * 1024,
 		NetworkMode:   *network,
 		DisplayMode:   *display,
-		BridgeIface:   networkIface,
+		BridgeIface:   bridgeInterfaceForMode(*network, networkIface),
 		LinuxTapName:  st.Network.TapName,
+		MACAddress:    macAddress,
 		MacOSBiosPath: biosPath,
 	})
 	if err != nil {
@@ -618,8 +672,13 @@ func runStart(args []string, stdin io.Reader, stdout, stderr io.Writer, store *s
 
 	cmdName := binary
 	cmdArgs := qemuArgs
-	if runtime.GOOS == "darwin" && *network == "bridged" {
-		ok, err := confirm(stdin, stdout, *autoYes, "bridged vmnet mode runs qemu with sudo")
+	// Both vmnet modes, not just bridged: shared is -netdev vmnet-shared and
+	// needs root exactly as vmnet-bridged does (vm.RequireNetworkPrivilege's
+	// darwinRootModes is the same pair). Launched unprivileged, QEMU exits
+	// non-zero with a vmnet error and no VM. The prompt names the mode the
+	// user actually chose, so consent is asked for the run they asked for.
+	if runtime.GOOS == "darwin" && (*network == "bridged" || *network == "shared") {
+		ok, err := confirm(stdin, stdout, *autoYes, fmt.Sprintf("%s vmnet mode runs qemu with sudo", *network))
 		if err != nil {
 			return err
 		}
@@ -642,9 +701,10 @@ func runStart(args []string, stdin io.Reader, stdout, stderr io.Writer, store *s
 		if vmConfig.CPUs > 0 {
 			stateDisk.CPUs = vmConfig.CPUs
 		}
+		stateDisk.MAC = macAddress
 	}
 	st.Network.Mode = *network
-	st.Network.BridgeInterface = networkIface
+	st.Network.BridgeInterface = bridgeInterfaceForMode(*network, networkIface)
 	st.VM.ISOLocal = isoLocal
 	st.VM.DiskPath = disk.Path
 	st.VM.DiskName = disk.Name
@@ -884,13 +944,13 @@ func runReset(args []string, stdin io.Reader, stdout io.Writer, store *state.Sto
 	// happened by carrying this error into it.
 	var networkCleanupErr error
 	if runtime.GOOS == "linux" && st.Network.CreatedByKairosLab {
-		writeLine(stdout, "Cleaning up bridged network...")
+		writef(stdout, "Cleaning up %s...\n", teardownNetworkLabel(st.Network.Mode))
 		if err := vm.CleanupLinuxBridge(st); err != nil {
 			writef(stdout, "warning: bridge cleanup failed: %v\n", err)
 			networkCleanupErr = err
 		}
 	} else if hasStaleNetwork {
-		writeLine(stdout, "Cleaning up stale bridged network resources...")
+		writef(stdout, "Cleaning up stale %s resources...\n", teardownNetworkLabel(st.Network.Mode))
 		if err := vm.CleanupStaleNetworkResources(st); err != nil {
 			writef(stdout, "warning: stale network cleanup failed: %v\n", err)
 			networkCleanupErr = err
@@ -1013,13 +1073,13 @@ func runCleanup(args []string, stdin io.Reader, stdout io.Writer, store *state.S
 	// happened by carrying this error into it.
 	var networkCleanupErr error
 	if runtime.GOOS == "linux" && st.Network.CreatedByKairosLab {
-		writeLine(stdout, "Cleaning up bridged network...")
+		writef(stdout, "Cleaning up %s...\n", teardownNetworkLabel(st.Network.Mode))
 		if err := vm.CleanupLinuxBridge(st); err != nil {
 			writef(stdout, "warning: bridge cleanup failed: %v\n", err)
 			networkCleanupErr = err
 		}
 	} else if hasStaleNetwork {
-		writeLine(stdout, "Cleaning up stale bridged network resources...")
+		writef(stdout, "Cleaning up stale %s resources...\n", teardownNetworkLabel(st.Network.Mode))
 		if err := vm.CleanupStaleNetworkResources(st); err != nil {
 			writef(stdout, "warning: stale network cleanup failed: %v\n", err)
 			networkCleanupErr = err
@@ -1307,23 +1367,17 @@ func reviewVMConfig(cfg *vmStartConfig, stdin io.Reader, stdout io.Writer) (*vmS
 			if err != nil {
 				return nil, err
 			}
-			// Three outcomes, not two. An answer can be no mode at all, a
-			// mode this host cannot run, or a mode it can; only the last
-			// writes cfg.NetworkMode. The middle one prints why and falls
-			// through to the menu, exactly as a typo does, so the user
-			// answers again inside the review instead of losing it to a
-			// hard error -- the review is where the rest of the config
-			// they just edited lives.
-			unavailable := networkModeUnavailable(val)
+			// An empty answer is "leave it alone" and stays silent: Enter
+			// is the way out of this sub-prompt, not a mistake. Anything
+			// else that is not a mode prints the rejection and falls
+			// through to the menu, so the user answers again inside the
+			// review instead of losing the rest of the configuration they
+			// just edited to a hard error.
 			switch {
-			case !networkModeValid(val):
-				if val != "" {
-					writeLine(stdout, "Invalid network mode, use 'shared', 'bridged' or 'user'")
-				}
-			case unavailable != nil:
-				writef(stdout, "Network mode unavailable: %v, use 'bridged' or 'user'\n", unavailable)
-			default:
+			case networkModeValid(val):
 				cfg.NetworkMode = val
+			case val != "":
+				writeLine(stdout, "Invalid network mode, use 'shared', 'bridged' or 'user'")
 			}
 		case 8:
 			if bridgedIfaceSelectable(cfg.NetworkMode) {
@@ -1515,19 +1569,15 @@ func bridgeIfaceCandidates() []string {
 // flag's validation, the reviewer's prompt and both rejection messages then
 // agree by construction.
 //
-// Membership is not availability, and the second question has a home of its
-// own: networkModeUnavailable. Which of these the -network flag defaults to is
-// a separate decision, taken at the flag declaration in runStart, and it is
-// still bridged; and shared, though it is a member here, is unavailable on
-// Linux, where that helper refuses it at both places a mode is chosen -- the
-// -network flag and the config review's prompt 7. Both exist for the same
-// missing piece: nothing in this package calls vm.PrepareLinuxShared yet, so a
-// shared start on Linux would prepare no bridge, no tap and no dnsmasq, and
-// BuildQEMUCommand would hand the guest whatever st.Network.TapName still
-// holds -- the bridged tap a previous run left behind, which puts the guest on
-// the LAN under the one mode that exists to keep it off. The refusal goes and
-// the default moves once the preparation is wired; networkModeUnavailable's
-// own comment is where that reasoning is written out.
+// Every mode in this slice is runnable on both supported platforms. There
+// used to be a second question here -- whether a mode the CLI accepts could
+// actually be run on this host -- because nothing prepared the host side of
+// shared on Linux; it was answered by a temporary networkModeUnavailable that
+// refused shared at both places a mode is chosen. runStart now calls
+// vm.PrepareLinuxShared, so the mode has a host side on Linux as well as on
+// macOS and there is no such question left to ask. Which of these the
+// -network flag defaults to is a separate decision, and it is
+// defaultNetworkMode below.
 //
 // Matching is deliberately exact. "Shared", "SHARED" and " shared" are all
 // rejected rather than folded, both because every other enumerated value in
@@ -1539,6 +1589,16 @@ func bridgeIfaceCandidates() []string {
 // that boots, looks healthy, and is on the wrong network.
 var networkModes = []string{"shared", "bridged", "user"}
 
+// defaultNetworkMode is what the -network flag falls back to, and it is
+// shared because that is the mode that works on the most hosts with the
+// fewest surprises: it needs no uplink interface, so it runs on a Wi-Fi-only
+// laptop where bridged cannot (no guest frame leaves the host with a MAC the
+// access point never saw associate), and unlike user mode it gives each guest
+// a real address on a NAT subnet, so several VMs can see each other and form
+// a cluster. bridged is still one flag away for anyone who needs the VM on
+// the LAN itself.
+const defaultNetworkMode = "shared"
+
 // networkModeValid reports whether mode is one the CLI accepts. The empty
 // string is not one of them, which the reviewer relies on: an empty answer at
 // prompt 7 means "leave it alone", so it must fail this check and then be
@@ -1547,66 +1607,46 @@ func networkModeValid(mode string) bool {
 	return slices.Contains(networkModes, mode)
 }
 
-// unavailableSharedOnLinux is the single authoritative statement of why the
-// mode is refused. Both call sites word the advice that follows it
-// differently -- one names flags, the other names what to type at a prompt --
-// but neither gets to invent its own reason.
-const unavailableSharedOnLinux = "shared networking is not wired up on Linux yet"
-
-// networkModeUnavailable returns a non-nil error when mode is one the CLI
-// accepts but this host cannot actually run yet; nil means the mode is ready
-// to use. It single-sources availability the way networkModeValid
-// single-sources membership, and for the same reason: the question is asked
-// at two call sites, and a question spelled out twice drifts.
+// teardownNetworkLabel names the network a teardown is about to remove, for
+// the messages reset and cleanup print before they act.
 //
-// TEMPORARY, and deliberately Linux-only. What deletes this function and both
-// of its call sites is the commit that adds the vm.PrepareLinuxShared call to
-// the "[1/3] Preparing networking" block in runStart; whoever writes that
-// commit should check that the reason below is actually gone rather than drop
-// a refusal whose purpose is no longer visible.
+// The mode is read from state rather than hardcoded because the teardown is
+// not bridged-only: vm.PrepareLinuxShared records CreatedByKairosLab the same
+// way vm.PrepareLinuxBridge does, and the branches in runReset and runCleanup
+// gate on that flag and not on the mode, so "Cleaning up bridged network" was
+// what a user who ran shared was told about their shared bridge.
 //
-// The reason: nothing in this package prepares the host side of shared on
-// Linux yet. There is no vm.PrepareLinuxShared call site, so no bridge, no
-// tap and no dnsmasq are created, st.Network.TapName keeps whatever the
-// previous run left in it, and runStart passes that name straight on as
-// StartConfig.LinuxTapName. internal/vm's buildLinux takes shared and
-// bridged through one arm and accepts any non-empty tap name, so on a host
-// that has ever run bridged the guest is handed the bridged tap -- a bridge
-// with the host's physical NIC enslaved, that is, the LAN -- while state.json
-// records "mode": "shared" and no sudo prompt is shown. Those NetworkManager
-// connections are created with autoconnect on, and only three things delete
-// them: reset, cleanup, and the stale-resource branch of the preflight
-// PrepareLinuxBridge runs -- which recreates them in the same call, so it
-// never leaves the host without them. The stale tap therefore long outlives
-// the run that made it. On a host that has never run bridged the same start instead
-// dies inside buildLinux with "shared linux mode requires tap name", which
-// tells the user nothing they can act on.
-//
-// Both places a mode is chosen ask this, because either one alone leaves the
-// leak open: runStart checks the -network flag, and reviewVMConfig checks the
-// answer to prompt 7, which is the other writer of the mode runStart goes on
-// to start with. While only the flag was guarded, a user who passed no
-// -network at all and answered "shared" at prompt 7 reproduced the silent LAN
-// attach above in full. Refusing the mode at both therefore costs no working
-// behaviour and closes it.
-//
-// The deleting commit has a second thing to remove, and nothing goes red to
-// remind it: TestStartAcceptsEveryDocumentedNetworkMode's shared branch is
-// keyed on the mode and the GOOS rather than on this refusal existing, so
-// left alone it keeps returning early and shared is never again held to
-// errors.Is(err, errSetupRequired) the way bridged and user are. The Linux
-// skip in TestReviewVMConfigAcceptsSharedNetworkMode is keyed the same way
-// and goes with it.
-//
-// macOS is not guarded, on purpose: shared there is -netdev vmnet-shared,
-// which needs root, so QEMU exits non-zero with the reason in its log instead
-// of quietly attaching the guest to anything. That is a privilege problem,
-// and the next milestone's privilege pre-flight is where it belongs.
-func networkModeUnavailable(mode string) error {
-	if mode == "shared" && runtime.GOOS == "linux" {
-		return errors.New(unavailableSharedOnLinux)
+// The stored value is checked against networkModes before it is printed, and
+// an unrecognised one is simply left out. state.json is the tool's own 0644
+// file, so anything in it is a value a process running as the user can
+// choose, and these lines go to a terminal: printing the field raw is how a
+// stored mode of "bridged\n  - /etc/hosts (will be REMOVED)" forges a row in
+// the plan above it. Every mode that can legitimately be recorded here passes
+// the check, so nothing real is lost by dropping the rest.
+func teardownNetworkLabel(mode string) string {
+	if networkModeValid(mode) {
+		return mode + " network"
 	}
-	return nil
+	return "network"
+}
+
+// bridgeInterfaceForMode answers what host interface this run attaches to, and
+// it exists because the answer has to be the same in the two places runStart
+// records it: on st.Network, which is what `status` prints and what the
+// teardown reads, and on vm.StartConfig.BridgeIface, whose own doc says the
+// field "is meaningful only for bridged mode".
+//
+// Only bridged attaches to an interface. shared builds a NAT bridge with no
+// port but the tap -- vm.PrepareLinuxShared clears st.Network.BridgeInterface
+// on purpose, and macOS vmnet-shared takes no ifname at all -- and user mode
+// needs none. So the flag's value is dropped for both rather than carried:
+// `start -network shared -bridge-if eth0` otherwise records an uplink the run
+// never used, which is a lie state.json keeps until the next bridged start.
+func bridgeInterfaceForMode(mode, iface string) string {
+	if mode == "bridged" {
+		return iface
+	}
+	return ""
 }
 
 // bridgedIfaceSelectable reports whether the network interface is the user's
