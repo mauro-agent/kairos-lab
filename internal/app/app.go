@@ -1403,12 +1403,27 @@ func runStatus(stdout io.Writer, store *state.Store) error {
 	if st.Network.Mode == "bridged" {
 		writef(stdout, "bridge iface: %s%s\n", emptyAsNone(st.Network.BridgeInterface), bridgeIfaceLinkNote(st.Network.BridgeInterface))
 	}
-	// The bridge and the tap are not bridged's alone. vm.PrepareLinuxShared
-	// records BridgeName and TapName exactly as the bridged path does, and
-	// both are what a user needs to name when a shared VM cannot be reached
-	// -- which is the default mode, so this row used to be missing from the
-	// status of nearly every run.
-	if st.Network.Mode == "bridged" || st.Network.Mode == "shared" {
+	// The bridge and the tap are not bridged's alone: on Linux
+	// vm.PrepareLinuxShared records BridgeName and TapName exactly as the
+	// bridged path does, and both are what a user needs to name when a shared
+	// VM cannot be reached -- which is the default mode, so this row used to
+	// be missing from the status of nearly every Linux run.
+	//
+	// That is a LINUX sentence, and the row is gated on the two fields for
+	// exactly that reason: PrepareLinuxBridge and PrepareLinuxShared are the
+	// only writers of either. macOS hands the bridging to QEMU's vmnet
+	// backend and records neither in any mode, so a gate on the mode alone
+	// printed "bridge resources: bridge=none tap=none" under every shared and
+	// every bridged run there -- a row that could not say anything, in the
+	// status of the default mode on one of the two supported platforms.
+	//
+	// The mode term stays beside it, and is not the same question. user mode
+	// builds none of this, but the fields are left as an earlier bridged or
+	// shared run wrote them -- a user start clears neither -- so what the row
+	// would show there is the previous run's bridge, under a mode that is not
+	// using it. The reset and cleanup plans are where those leftovers are
+	// named, because they are what removes them.
+	if st.Network.Mode != "user" && (st.Network.BridgeName != "" || st.Network.TapName != "") {
 		writef(stdout, "bridge resources: bridge=%s tap=%s\n", emptyAsNone(st.Network.BridgeName), emptyAsNone(st.Network.TapName))
 	}
 	// Always printed, in every mode. This is the durable channel for the
@@ -1751,7 +1766,7 @@ func printUsage(w io.Writer) {
 	writeLine(w, "  download             Download a Kairos ISO (interactive selection)")
 	writeLine(w, "  start [flags]        Boot VM (select/create disk, optionally attach ISO)")
 	writeLine(w, "  status               Show state and runtime information")
-	writeLine(w, "  reset [--disk name]  Remove disks and network (keep setup/ISOs)")
+	writeLine(w, "  reset [-disk name]   Remove disks and network (keep setup/ISOs)")
 	writeLine(w, "  cleanup              Remove everything created by tool")
 	writeLine(w, "  version              Print CLI version")
 	writeLine(w, "")

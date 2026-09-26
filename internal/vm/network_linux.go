@@ -88,7 +88,8 @@ func linuxNetworkPreflight(st *state.State, runtimeDir, mode string) (bridge, ta
 		// step was reached -- which is not the same as every later step
 		// having run: the two `ip link delete`s are skipped when linkExists
 		// cannot see their interface, and the reconnect when findBridgeSlave
-		// named nobody. Which of them issued anything is not knowable from
+		// named nobody or when the connection that reconnect would replace
+		// was not deleted. Which of them issued anything is not knowable from
 		// the joined error, so the message names the gates instead of
 		// listing the steps as though they had all run.
 		if cleanupErr != nil && mode == "shared" {
@@ -739,8 +740,8 @@ func CleanupStaleNetworkResources(st *state.State) error {
 // tap, the bridge and the reconnect behind it. Reached is not the same as
 // issued, and no caller may say it is: the two `ip link delete`s run only for
 // an interface linkExists can see, and the reconnect only for an interface
-// findBridgeSlave found on the bridge, so a teardown can reach every step and
-// issue one command.
+// findBridgeSlave found on the bridge whose uplink connection this run
+// deleted, so a teardown can reach every step and issue one command.
 func cleanupNMConnections(bridgeConn, tapName string) error {
 	// Every destructive command below is built from these two names, which
 	// come out of state.json -- a 0644 file any process running as the user
@@ -775,12 +776,39 @@ func cleanupNMConnections(bridgeConn, tapName string) error {
 	var failures []error
 
 	// Delete all NM connections - use sudo (not sudoQuiet) so user can see
-	// what's happening and errors are visible
+	// what's happening and errors are visible.
+	//
+	// The gate stays, although revertSharedSetup deletes these same three
+	// names unconditionally and for a stated reason. The two return values
+	// are read differently: revertSharedSetup's is prose inside an error
+	// already being returned, so a delete of a name that is not there costs
+	// it one clause, while this one's is a decision -- a non-nil return is
+	// what `reset` prints in place of "reset complete", and what makes
+	// linuxNetworkPreflight refuse a shared start. `nmcli connection delete`
+	// fails for a name that is not on the host, and after every shared run
+	// <bridge>-uplink is exactly that, since shared creates none. Deleting
+	// unconditionally here therefore reports failure for the ordinary
+	// teardown of the default mode, and refuses a shared start over a
+	// leftover bridge device it has just removed successfully. Neither shows
+	// up against fakeHost, which fails no command it is not told to; both are
+	// what a host with nmcli on it does.
+	//
+	// What the gate costs is that nmConnectionExists reports "does not exist"
+	// for any nmcli exit it dislikes, a restarting NetworkManager included,
+	// so a profile that is really there can survive this loop with nothing
+	// issued for it. That is why the reconnect below asks whether the uplink
+	// connection was deleted instead of assuming these three are gone.
+	uplinkConnDeleted := false
 	for _, conn := range []string{tapConn, uplinkConn, bridgeConn} {
-		if nmConnectionExists(conn) {
-			if err := sudo("nmcli", "connection", "delete", conn); err != nil {
-				failures = append(failures, fmt.Errorf("delete connection %s: %w", conn, err))
-			}
+		if !nmConnectionExists(conn) {
+			continue
+		}
+		if err := sudo("nmcli", "connection", "delete", conn); err != nil {
+			failures = append(failures, fmt.Errorf("delete connection %s: %w", conn, err))
+			continue
+		}
+		if conn == uplinkConn {
+			uplinkConnDeleted = true
 		}
 	}
 
@@ -796,8 +824,33 @@ func cleanupNMConnections(bridgeConn, tapName string) error {
 		}
 	}
 
-	// Reconnect the physical interface (NM connections are gone, so this
-	// will use a fresh/default connection, not the bridge slave profile)
+	// Reconnect the physical interface the bridge had enslaved, which the
+	// deletes above leave with no active connection -- but only when this
+	// teardown is what removed the <bridge>-uplink connection.
+	//
+	// That connection is the profile the bridged path writes, and it carries
+	// `master <bridge> slave-type bridge` with autoconnect on. `nmcli device
+	// connect <iface>` activates whichever profile NetworkManager rates best
+	// for the device, which after a bridged run is routinely that one -- the
+	// two messages this package prints about the command say so, and this is
+	// the only place the tool runs it itself. Issued while that profile is
+	// still on the host, it attaches the interface to the bridge again, and
+	// this teardown then joins no errors and reports success: a cleanup that
+	// put back what it had just removed and called it done.
+	//
+	// Not deleted is not the same as not there. The connection may never have
+	// been on this host, the probe above may have been blind to it, or its
+	// delete may have failed and be among the failures below. Only the first
+	// is safe to reconnect over, and nothing here can tell the three apart,
+	// so the interface is left to NetworkManager's own autoconnect and the
+	// user is told which interface and which connection -- see
+	// reconnectSkippedNotice.
+	//
+	// A shared teardown ordinarily reaches neither branch, because the only
+	// port its own run attaches is the tap and findBridgeSlave never names
+	// that. A host interface on that bridge anyway is the state the
+	// start-time port assertions exist to refuse, and a teardown that finds
+	// one chooses between these two branches the way a bridged one does.
 	//
 	// %q on both, for the reason quoteNames gives: uplinkIface came out of
 	// `ip -o link show master` through findBridgeSlave and passed no
@@ -808,22 +861,48 @@ func cleanupNMConnections(bridgeConn, tapName string) error {
 	// and it goes straight to a terminal, where "\x1b[2K\x1b[1G" erases the
 	// line just written and returns the cursor to column 1.
 	//
-	// Three paths carry this value there, not the two escaped on these
-	// lines. The third is inside the %w: sudoError builds its message from
-	// the same argv this name is a word of, so the wrap below used to print
-	// one escaped copy and one raw copy of it in a single string. That copy
-	// is renderArgv's to escape, and escaping it here would not have
-	// reached it.
+	// Three paths carry this value there on the branch that reconnects, not
+	// the two escaped on these lines. The third is inside the %w: sudoError
+	// builds its message from the same argv this name is a word of, so the
+	// wrap below used to print one escaped copy and one raw copy of it in a
+	// single string. That copy is renderArgv's to escape, and escaping it
+	// here would not have reached it. The other branch has a path of its own,
+	// and reconnectSkippedNotice escapes every copy in it.
 	if uplinkIface != "" {
-		fmt.Printf("Reconnecting %q...\n", uplinkIface)
-		if err := sudo("nmcli", "device", "connect", uplinkIface); err != nil {
-			failures = append(failures, fmt.Errorf("reconnect %q: %w", uplinkIface, err))
+		if uplinkConnDeleted {
+			fmt.Printf("Reconnecting %q...\n", uplinkIface)
+			if err := sudo("nmcli", "device", "connect", uplinkIface); err != nil {
+				failures = append(failures, fmt.Errorf("reconnect %q: %w", uplinkIface, err))
+			}
+		} else {
+			fmt.Println(reconnectSkippedNotice(uplinkIface, uplinkConn))
 		}
 	}
 
 	// nil when failures is empty, which is the whole point: a teardown that
 	// did everything asked of it still reports success.
 	return errors.Join(failures...)
+}
+
+// reconnectSkippedNotice is what a teardown prints instead of running `nmcli
+// device connect <iface>`, when the connection that command could activate
+// was not deleted by this run.
+//
+// It is a plain function for the reason sudoError is: the wording is not the
+// subprocess, and a fake that replaced it would leave the sentence a user
+// actually gets unexercised. Every copy of the interface name in it is
+// escaped, because that name came off the kernel and passed no validator;
+// the comment at the call site says why that matters.
+//
+// It says which connection was not deleted and not why. A delete that was
+// issued and failed is named in the error the teardown returns; one that was
+// never issued has nothing to report but this. Both end with that profile
+// possibly still on the host, which is the fact this sentence is about.
+func reconnectSkippedNotice(iface, uplinkConn string) string {
+	return fmt.Sprintf("Not reconnecting %q: this cleanup did not delete connection %s, so that profile may still be on this host. "+
+		"`nmcli device connect %q` activates whichever profile NetworkManager rates best for the device, routinely that one after a bridged run, which would attach the interface to a bridge again. "+
+		"`nmcli device status` shows whether %q has an active connection, and `sudo nmcli connection up <profile>` puts it on the profile you name.",
+		iface, uplinkConn, iface, iface)
 }
 
 var linkExists = func(name string) bool {

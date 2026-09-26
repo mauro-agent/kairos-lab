@@ -547,9 +547,15 @@ func TestPrepareLinuxSharedRefusalDescribesOnlyWhatItKnows(t *testing.T) {
 	// Every delete succeeded and the host NIC was released; the one step that
 	// failed is the reconnect that was putting it back. Nothing is enslaved
 	// to this bridge -- and the user has a disconnected NIC to hear about.
+	//
+	// The -uplink connection is seeded because the reconnect is only issued
+	// once this teardown has deleted it: the state under test here is a
+	// bridged leftover that came away cleanly, with the reconnect behind it
+	// the single step that failed.
 	t.Run("the failure is the reconnect step", func(t *testing.T) {
 		h := newFakeHost(t)
 		h.conns[DefaultBridgeName] = true
+		h.conns[DefaultBridgeName+"-uplink"] = true
 		h.bridges[DefaultBridgeName] = true
 		h.slaves[DefaultBridgeName] = []string{DefaultTapName, "eth0"}
 		h.failCmd = func(argv []string) error {
@@ -759,13 +765,15 @@ func TestPrepareLinuxSharedRefusesAnInterfaceAlreadyEnslavedBeforeTheBridgeComes
 		t.Errorf("the refusal does not name the interface found on the bridge:\n%v", err)
 	}
 
-	// The teardown the preflight ran could only see eth0 on the bridge, not
-	// the bridge itself, so all it did was hand eth0 to `nmcli device
-	// connect` -- and the bridge is still there with eth0 on it when the
-	// assertion asks.
+	// The teardown the preflight ran could see eth0 on the bridge and nothing
+	// else: not the bridge device, which linkExists is blind to here, and no
+	// connection of ours, since none is seeded. So it issued no command at
+	// all -- in particular not `nmcli device connect eth0`, which would hand
+	// eth0 to whichever profile NetworkManager rates best for it while every
+	// profile this teardown knows about was left untouched. The bridge is
+	// still there with eth0 on it when the assertion asks.
 	uid := testUID(t)
-	want := []string{"nmcli device connect eth0"}
-	want = append(want, sharedSequence(uid)[:4]...)
+	want := append([]string{}, sharedSequence(uid)[:4]...)
 	want = append(want, refusalTail()...)
 	assertSequence(t, h.lines(), want)
 
@@ -1689,6 +1697,7 @@ func TestCleanupNMConnectionsReconnectsAnEnslavedHostNIC(t *testing.T) {
 	t.Run("host NIC whose name contains tap", func(t *testing.T) {
 		h := newFakeHost(t)
 		h.conns[DefaultBridgeName] = true
+		h.conns[DefaultBridgeName+"-uplink"] = true
 		h.bridges[DefaultBridgeName] = true
 		h.slaves[DefaultBridgeName] = []string{DefaultTapName, "captap0"}
 
@@ -1696,10 +1705,222 @@ func TestCleanupNMConnectionsReconnectsAnEnslavedHostNIC(t *testing.T) {
 			t.Fatalf("cleanupNMConnections(%q) = %v, want nil", DefaultBridgeName, err)
 		}
 		assertSequence(t, h.lines(), []string{
+			"nmcli connection delete kairoslab0-uplink",
 			"nmcli connection delete kairoslab0",
 			"ip link delete kairoslab0",
 			"nmcli device connect captap0",
 		})
+	})
+}
+
+// The reconnect may not put back what the teardown has just removed.
+//
+// `nmcli device connect <iface>` activates whichever profile NetworkManager
+// rates best for the device, and after a bridged run that is routinely
+// <bridge>-uplink -- `master <bridge> slave-type bridge`, autoconnect on.
+// Issued while that profile is still on the host it has NetworkManager
+// re-create the bridge deleted a line earlier and re-enslave the interface,
+// and cleanupNMConnections then joins no errors: `reset` prints "reset
+// complete" over a host that has its bridge and its uplink back. This tool
+// warns about exactly that command twice, in the preflight refusal and in
+// refuseForeignBridgePort, and this is the one place it runs it itself.
+//
+// Both states below reach the reconnect with that profile in place, and
+// neither is exotic.
+func TestCleanupNMConnectionsDoesNotReconnectOverASurvivingUplinkProfile(t *testing.T) {
+	// The probe is fail-open: nmConnectionExists reports "does not exist"
+	// for any nmcli exit it dislikes, a restarting NetworkManager included.
+	// Every connection a finished bridged run leaves is really on this host
+	// here and no probe can see one of them, so the gated deletes issue
+	// nothing at all.
+	t.Run("the connection probes are blind to the profiles", func(t *testing.T) {
+		h := newFakeHost(t)
+		h.conns[DefaultBridgeName] = true
+		h.conns[DefaultBridgeName+"-uplink"] = true
+		h.conns[DefaultBridgeName+"-tap"] = true
+		h.bridges[DefaultBridgeName] = true
+		h.links[DefaultTapName] = true
+		h.slaves[DefaultBridgeName] = []string{DefaultTapName, "eth0"}
+		nmConnectionExists = func(string) bool { return false }
+
+		var err error
+		out := captureStdout(t, func() {
+			err = cleanupNMConnections(DefaultBridgeName, DefaultTapName)
+		})
+		if err != nil {
+			t.Fatalf("cleanupNMConnections(%q) = %v, want nil", DefaultBridgeName, err)
+		}
+
+		// The two links are the whole of what this teardown could see to
+		// remove. The reconnect that used to follow them is what had
+		// NetworkManager build the bridge again from the profile that is
+		// still there.
+		assertSequence(t, h.lines(), []string{
+			"ip link delete kairoslab-tap0",
+			"ip link delete kairoslab0",
+		})
+		assertReconnectDeclined(t, out, "eth0")
+		// The fixture, not the code, would be what the assertion above was
+		// measuring if the delete had gone through.
+		if !h.conns[DefaultBridgeName+"-uplink"] {
+			t.Fatal("the uplink profile left the host, so this test proves nothing about a surviving one")
+		}
+	})
+
+	// Nothing is blind here. The profile is visible, the delete of it was
+	// issued and it failed, so what is on the host afterwards is the same
+	// profile -- and the reconnect is the same mistake.
+	t.Run("the uplink delete failed", func(t *testing.T) {
+		h := newFakeHost(t)
+		h.conns[DefaultBridgeName] = true
+		h.conns[DefaultBridgeName+"-uplink"] = true
+		h.bridges[DefaultBridgeName] = true
+		h.slaves[DefaultBridgeName] = []string{DefaultTapName, "eth0"}
+		h.failCmd = func(argv []string) error {
+			if strings.Join(argv, " ") == "nmcli connection delete kairoslab0-uplink" {
+				return fmt.Errorf("exit status 1")
+			}
+			return nil
+		}
+
+		var err error
+		out := captureStdout(t, func() {
+			err = cleanupNMConnections(DefaultBridgeName, DefaultTapName)
+		})
+		if err == nil {
+			t.Fatal("cleanupNMConnections reported success although a delete failed")
+		}
+		if !strings.Contains(err.Error(), "delete connection kairoslab0-uplink") {
+			t.Errorf("the error does not name the delete that failed:\n%v", err)
+		}
+		assertSequence(t, h.lines(), []string{
+			"nmcli connection delete kairoslab0-uplink",
+			"nmcli connection delete kairoslab0",
+			"ip link delete kairoslab0",
+		})
+		assertReconnectDeclined(t, out, "eth0")
+	})
+}
+
+// assertReconnectDeclined reads the notice a teardown prints in place of the
+// reconnect. It is the whole of what such a user is told, so it has to name
+// the interface left alone, the connection that is the reason, and the way to
+// put that interface back that does not pick the profile for them.
+func assertReconnectDeclined(t *testing.T, out, iface string) {
+	t.Helper()
+	for _, want := range []string{
+		"Not reconnecting " + strconv.Quote(iface),
+		DefaultBridgeName + "-uplink",
+		"nmcli device status",
+		"sudo nmcli connection up <profile>",
+	} {
+		if !strings.Contains(out, want) {
+			t.Errorf("the notice does not mention %q:\n%s", want, out)
+		}
+	}
+}
+
+// The notice is printed to a terminal and names an interface that came off
+// the kernel through findBridgeSlave and passed no validator, three times.
+// TestCleanupNMConnectionsQuotesTheInterfaceItReconnects, further down this
+// file, pins the same property for the branch that reconnects; a name is no
+// less hostile on the branch that does not.
+func TestCleanupNMConnectionsQuotesTheInterfaceItDeclinesToReconnect(t *testing.T) {
+	// Assembled from pieces so the literal in this file is not itself a
+	// control byte. 12 bytes, so the kernel would take it.
+	hostile := "eth0" + "\x1b" + "[2K" + "\x1b" + "[1G"
+
+	h := newFakeHost(t)
+	// No connection of ours anywhere, which is the state that declines: the
+	// bridge and its port outlived a NetworkManager restart that took the
+	// keyfiles with it.
+	h.bridges[DefaultBridgeName] = true
+	h.slaves[DefaultBridgeName] = []string{DefaultTapName, hostile}
+
+	var err error
+	out := captureStdout(t, func() {
+		err = cleanupNMConnections(DefaultBridgeName, DefaultTapName)
+	})
+	if err != nil {
+		t.Fatalf("cleanupNMConnections(%q) = %v, want nil", DefaultBridgeName, err)
+	}
+	if !strings.Contains(out, strconv.Quote(hostile)) {
+		t.Errorf("the notice does not quote the interface name: %q", out)
+	}
+	if strings.ContainsRune(out, '\x1b') {
+		t.Errorf("the notice put a raw escape byte on the terminal: %q", out)
+	}
+}
+
+// Why the deletes above stay gated on nmConnectionExists, while
+// revertSharedSetup deletes the same three names unconditionally and says why
+// it does.
+//
+// The two return values are read differently. revertSharedSetup's is prose
+// inside an error already being returned; this one's is a decision -- `reset`
+// prints it in place of "reset complete", and linuxNetworkPreflight refuses a
+// shared start on it. `nmcli connection delete` fails for a name that is not
+// on the host, and <bridge>-uplink is exactly that after every shared run,
+// since shared creates none.
+//
+// So both cases below are ordinary runs that an unconditional delete turns
+// into a failure and a refusal on any host with nmcli on it. Neither shows up
+// against a fake that fails nothing: the failing command here is the fake
+// answering the way nmcli does.
+func TestCleanupNMConnectionsIssuesNoDeleteForAConnectionItCannotSee(t *testing.T) {
+	// failUnknownConnectionDeletes is nmcli's answer for `connection delete
+	// <name>` when no connection of that name is on the host: a non-zero
+	// exit, which sudo hands back as a failed command.
+	failUnknownConnectionDeletes := func(h *fakeHost) func([]string) error {
+		return func(argv []string) error {
+			if len(argv) == 4 && argv[0] == "nmcli" && argv[1] == "connection" && argv[2] == "delete" && !h.conns[argv[3]] {
+				return fmt.Errorf("exit status 10")
+			}
+			return nil
+		}
+	}
+
+	// What a finished shared run leaves, torn down by `reset`.
+	t.Run("an ordinary shared reset", func(t *testing.T) {
+		h := newFakeHost(t)
+		h.conns[DefaultBridgeName] = true
+		h.conns[DefaultBridgeName+"-tap"] = true
+		h.bridges[DefaultBridgeName] = true
+		h.links[DefaultTapName] = true
+		h.slaves[DefaultBridgeName] = []string{DefaultTapName}
+		h.failCmd = failUnknownConnectionDeletes(h)
+
+		st := &state.State{}
+		st.Network.Mode = "shared"
+		st.Network.CreatedByKairosLab = true
+		st.Network.BridgeName = DefaultBridgeName
+		st.Network.TapName = DefaultTapName
+
+		if err := CleanupLinuxBridge(st); err != nil {
+			t.Fatalf("an ordinary shared teardown reported failure: %v", err)
+		}
+		assertSequence(t, h.lines(), []string{
+			"nmcli connection delete kairoslab0-tap",
+			"nmcli connection delete kairoslab0",
+			"ip link delete kairoslab-tap0",
+			"ip link delete kairoslab0",
+		})
+	})
+
+	// A leftover bridge DEVICE and no connections at all, which is what a
+	// NetworkManager restart leaves behind. The preflight tears it down and
+	// the start carries on over it; an unconditional delete would end this
+	// run in a refusal naming three connections that were never there.
+	t.Run("a shared start over a leftover bridge device", func(t *testing.T) {
+		h := newFakeHost(t)
+		h.bridges[DefaultBridgeName] = true
+		h.failCmd = failUnknownConnectionDeletes(h)
+
+		if err := PrepareLinuxShared(&state.State{}, t.TempDir()); err != nil {
+			t.Fatalf("PrepareLinuxShared refused a host whose leftover bridge it removed: %v", err)
+		}
+		want := append([]string{"ip link delete " + DefaultBridgeName}, sharedSequence(testUID(t))...)
+		assertSequence(t, h.lines(), want)
 	})
 }
 
@@ -1725,14 +1946,17 @@ func TestCleanupNMConnectionsReportsEveryFailure(t *testing.T) {
 		}
 
 		// Collecting is not stopping: one resource that will not go must not
-		// strand the ones behind it.
+		// strand the ones behind it. The reconnect is not issued here, and
+		// not because a failure stopped anything -- the delete of
+		// kairoslab0-uplink failed, so that bridge-slave profile is still on
+		// the host and `nmcli device connect eth0` would put eth0 back on a
+		// bridge.
 		assertSequence(t, h.lines(), []string{
 			"nmcli connection delete kairoslab0-tap",
 			"nmcli connection delete kairoslab0-uplink",
 			"nmcli connection delete kairoslab0",
 			"ip link delete kairoslab-tap0",
 			"ip link delete kairoslab0",
-			"nmcli device connect eth0",
 		})
 
 		// And every failure is named, since this error is what the app layer
@@ -1743,11 +1967,14 @@ func TestCleanupNMConnectionsReportsEveryFailure(t *testing.T) {
 			"delete connection kairoslab0",
 			"delete interface kairoslab-tap0",
 			"delete interface kairoslab0",
-			`reconnect "eth0"`,
 		} {
 			if !strings.Contains(err.Error(), want) {
 				t.Errorf("error does not mention %q:\n%v", want, err)
 			}
+		}
+		// A step that was never issued may not appear among the failures.
+		if strings.Contains(err.Error(), "reconnect") {
+			t.Errorf("error names a reconnect that was never attempted:\n%v", err)
 		}
 	})
 
@@ -2197,6 +2424,9 @@ func TestCleanupNMConnectionsQuotesTheInterfaceItReconnects(t *testing.T) {
 
 	h := newFakeHost(t)
 	h.conns[DefaultBridgeName] = true
+	// The reconnect runs for an interface whose uplink connection this
+	// teardown deleted, so that connection is part of the fixture.
+	h.conns[DefaultBridgeName+"-uplink"] = true
 	h.bridges[DefaultBridgeName] = true
 	h.links[DefaultTapName] = true
 	h.slaves[DefaultBridgeName] = []string{DefaultTapName, hostile}

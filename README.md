@@ -83,9 +83,13 @@ This will:
 - Boot the VM with the ISO attached
 - Use shared networking (VM gets a real address on a NAT subnet you can SSH to)
 - Open a graphical window
-- Poll for the VM's address for up to 45s, printing a WebUI URL and an SSH
-  command if a usable one turns up - otherwise it says it has stopped looking
-  and moves on; the VM keeps running either way
+- Poll for the VM's address for up to 45s, which ends one of three ways: a
+  usable address prints a WebUI URL and an SSH command; a link-local one
+  (169.254.x.x, what a guest assigns itself when no DHCP server answers it)
+  prints the same two lines under a heading saying the address is link-local,
+  with what to check, since those URLs will not reach the VM; and a poll that
+  runs out of time says it has stopped looking. The VM keeps running in all
+  three cases
 
 **Exit the VM with `Ctrl-a x`**
 
@@ -120,7 +124,7 @@ Flags:
 - `-new` - Force create new disk
 - `-no-iso` - Boot without ISO (installed system)
 - `-iso <path>` - Use specific ISO file
-- `-display serial|window` - Display mode (default: window)
+- `-display window|serial` - Display mode (default: window)
 - `-network shared|bridged|user` - Network mode (default: shared)
 - `-disk-size 60G` - Disk size for new disks
 - `-memory 4` / `-cpus 2` - VM resources (memory is in GB, not MB)
@@ -131,7 +135,9 @@ Flags:
 Shows current state:
 - Platform and dependencies
 - The ISO and disk path in use
-- Network configuration, including the bridge/tap for `shared` and `bridged`
+- Network configuration, including the bridge and tap on Linux, where
+  `shared` and `bridged` build them (on macOS QEMU's vmnet backend does the
+  bridging and there are none to name)
 - The VM's address, once one has been found
 - Running VM info
 
@@ -216,5 +222,14 @@ Override with environment variables:
 
 - Cleanup only removes what the tool created
 - Dependencies that existed before setup are never removed
-- Network cleanup reconnects your physical interface after `bridged` on a best-effort basis (NetworkManager may pick a different profile than your original one); `shared` enslaves no interface, so there's nothing to reconnect
+- Network cleanup reconnects your physical interface after `bridged`, but
+  only when it is what deleted the bridge-slave profile that had put the
+  interface on the bridge: `nmcli device connect <iface>` activates whichever
+  profile NetworkManager rates best for the device, and after a bridged run
+  that is routinely the bridge-slave one, so reconnecting while it is still
+  there would put the interface straight back on a bridge. When cleanup
+  declines, it prints which interface it left alone and how to put it back
+  yourself. When it does reconnect, NetworkManager may still pick a different
+  profile than your original one. `shared` enslaves no interface, so there is
+  nothing to reconnect
 - Destructive operations require confirmation (use `-yes` to skip)

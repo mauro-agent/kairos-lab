@@ -877,10 +877,10 @@ func TestStartWithNoNetworkFlagUsesTheDefaultMode(t *testing.T) {
 // `kairos-lab start -h` is where a user learns which modes exist: the usage
 // string on the -network flag is what -h prints, and the only listing a user
 // reaches without starting a VM, the other one being the config reviewer's
-// prompt. README.md carries a third listing, but it is stale -- it names two
-// of the three modes -- and correcting it belongs to the milestone that
-// rewrites the README, so it is deliberately not touched here and is not what
-// this test guards. Nothing else in this suite reads the usage string, so
+// prompt. README.md carries a third listing, which names all three modes and
+// the default now; it is still not what this test guards, because nothing in
+// this suite reads the README and a listing no test reads is one that goes
+// stale quietly. Nothing else in this suite reads the usage string, so
 // dropping shared from the list -- the obvious edit when reverting or
 // rewording -- was previously invisible, and a mode nobody is told about is
 // one nobody chooses.
@@ -1038,6 +1038,36 @@ func TestUsageDescriptionsShareOneColumn(t *testing.T) {
 			}
 			if at != column {
 				t.Fatalf("description in %q starts at column %d but %q starts its own at %d; every row in these two lists shares one column", line, at, first, column)
+			}
+		}
+	}
+}
+
+// A flag in either usage list is spelled the way a user types it everywhere
+// else in this CLI: with one dash.
+//
+// `reset [--disk name]` said two, while the flag it names is declared -disk,
+// the error runReset prints when it gets a positional argument says "remove a
+// single disk with -disk", and the README says `-disk <name>`. Go's flag
+// package accepts both spellings, so nothing failed -- the cost was a user
+// reading two different names for one flag in the same tool.
+//
+// Only the name column is read. The descriptions are prose and may hold a
+// dash pair for their own reasons.
+func TestUsageSpellsFlagsWithASingleDash(t *testing.T) {
+	var stdout bytes.Buffer
+	if err := Run(nil, strings.NewReader(""), &stdout, io.Discard, "test"); err != nil {
+		t.Fatalf("Run with no arguments: %v", err)
+	}
+	name := regexp.MustCompile(`^ {2}(\S.*?)\s{2,}\S`)
+	for _, header := range []string{"Commands:", "Start flags:"} {
+		for _, line := range usageBlock(t, stdout.String(), header) {
+			m := name.FindStringSubmatch(line)
+			if m == nil {
+				t.Fatalf("usage row %q under %q is not an indented name followed by a padded description", line, header)
+			}
+			if strings.Contains(m[1], "--") {
+				t.Errorf("usage row %q spells a flag with two dashes; the rest of the CLI uses one", line)
 			}
 		}
 	}
@@ -3410,6 +3440,57 @@ func TestStatusNetworkRowsForEachMode(t *testing.T) {
 			}
 		})
 	}
+}
+
+// The bridge row is gated on there being something to put in it, and not on
+// the mode.
+//
+// Only the LINUX prepares write BridgeName and TapName. On macOS both shared
+// and bridged hand the bridging to QEMU's vmnet backend and record neither,
+// so a mode gate printed "bridge resources: bridge=none tap=none" under every
+// shared and every bridged run there -- a permanently empty row in the status
+// of the default mode, on one of the two supported platforms.
+func TestStatusOmitsTheBridgeRowWhenNoBridgeWasRecorded(t *testing.T) {
+	for _, mode := range []string{"shared", "bridged"} {
+		t.Run(mode, func(t *testing.T) {
+			// A macOS-shaped state: the mode ran, and the two fields only
+			// vm's Linux prepares ever write are empty.
+			out := runStatusOutput(t, func(st *state.State) {
+				st.Platform.OS = "darwin"
+				st.Platform.Arch = "arm64"
+				st.Network.Mode = mode
+				st.Network.BridgeInterface = "en0"
+				st.VM.IPAddress = "192.168.64.12"
+			})
+			if strings.Contains(out, "bridge resources:") {
+				t.Errorf("status prints a bridge row this run has nothing for:\n%s", out)
+			}
+			// The rows this platform does have are untouched: the mode, the
+			// address, and -- for bridged, which names an interface on macOS
+			// too -- the uplink.
+			want := []string{"network mode: " + mode + "\n", "vm ip address: 192.168.64.12\n"}
+			if mode == "bridged" {
+				want = append(want, "bridge iface: en0")
+			}
+			for _, row := range want {
+				if !strings.Contains(out, row) {
+					t.Errorf("status does not print %q:\n%s", row, out)
+				}
+			}
+		})
+	}
+
+	// Half a pair recorded is the case a reader most needs to see, so the
+	// gate is either field and not both.
+	t.Run("one of the two fields recorded", func(t *testing.T) {
+		out := runStatusOutput(t, func(st *state.State) {
+			st.Network.Mode = "shared"
+			st.Network.BridgeName = "kairoslab0"
+		})
+		if !strings.Contains(out, "bridge resources: bridge=kairoslab0 tap=none\n") {
+			t.Errorf("status hides a bridge it recorded because the tap is missing:\n%s", out)
+		}
+	})
 }
 
 // The address row is printed in every mode, including the modes and the
