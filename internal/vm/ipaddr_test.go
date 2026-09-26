@@ -1070,8 +1070,9 @@ func TestPollDefaults(t *testing.T) {
 	if DefaultIPPollTimeout <= DefaultIPPollInterval {
 		t.Errorf("DefaultIPPollTimeout = %s, not more than one interval of %s", DefaultIPPollTimeout, DefaultIPPollInterval)
 	}
-	// DefaultIPPollTimeout has no caller in the tree yet (M5 is the one that
-	// will pass it), so this is the only thing pinning its value.
+	// This pins the value. That a start passes it -- rather than a budget of
+	// its own -- is pinned next door, by internal/app's
+	// TestStartResolvesTheAddressBesideTheVMAndLeavesItForStatus.
 	if DefaultIPPollTimeout != 45*time.Second {
 		t.Errorf("DefaultIPPollTimeout = %s, want the 45s budget the PRD sets", DefaultIPPollTimeout)
 	}

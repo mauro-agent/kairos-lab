@@ -13,6 +13,7 @@ import (
 	"slices"
 	"strconv"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 	"unicode"
@@ -2714,19 +2715,33 @@ func TestIPPollDiagnosesATimeoutAndSaysNothingAboutAQuitVM(t *testing.T) {
 	}
 }
 
-// A start in user mode says where the VM is reached and leaves no stale
-// address behind for `status` to report as this run's.
+// A start in user mode says where the VM is reached, starts no address poll,
+// and leaves no stale address behind for `status` to report as this run's.
 //
 // The address of a previous run is not this run's: the lease can change, and
 // until something resolves one there is nothing true to show.
+//
+// The VM is really launched here -- a fake qemu, but one that starts and
+// exits -- and that is what makes the middle claim testable. Everything about
+// the address in runStart sits AFTER command.Start(), so a version of this
+// test that isolated PATH into nothing never reached the branch that decides
+// whether to poll, and the scripted poll below could not have fired whatever
+// that branch did.
+//
+// What the guard is for: a user-mode poll can only be answered by the guest
+// agent, which reports the address the guest sees behind SLIRP -- 10.0.2.15,
+// which nothing on this host can connect to. Printing it as "VM is up" would
+// contradict the user-mode block printed seconds earlier, and recording it
+// would leave `status` naming it as this VM's address. So the scripted poll
+// answers rather than refuses, and what it answers is that address.
 func TestStartInUserModeSaysWhereTheVMIsAndClearsTheOldAddress(t *testing.T) {
 	if runtime.GOOS != "linux" {
-		t.Skipf("this test asserts the start path as Linux takes it, and %s is not Linux: on darwin -- the only other platform kairos-lab is built for -- the run needs a firmware path from `brew --prefix qemu` before it records anything, and this test's isolation from host binaries denies it one", runtime.GOOS)
+		t.Skipf("this test drives the start path as Linux takes it, and %s is not Linux: on darwin -- the only other platform kairos-lab is built for -- the run needs a firmware path from `brew --prefix qemu` before it launches anything, and the PATH this test sets holds nothing but a fake qemu", runtime.GOOS)
 	}
 	const diskName = "kairos-disk0"
 	t.Setenv("KAIROS_LAB_CONFIG_DIR", t.TempDir())
 	t.Setenv("KAIROS_LAB_CACHE_DIR", t.TempDir())
-	isolateFromHostBinaries(t)
+	fakeQEMUOnPath(t)
 	seedStartableState(t, diskName)
 
 	store, err := state.DefaultStore()
@@ -2742,25 +2757,28 @@ func TestStartInUserModeSaysWhereTheVMIsAndClearsTheOldAddress(t *testing.T) {
 		t.Fatalf("Save: %v", err)
 	}
 
-	// The poll is never started here: the launch fails with PATH pointed at
-	// nothing, and user mode starts no poller in any case. Scripted anyway,
-	// so a wiring change that did start one could not reach the host.
 	stubIPPoll(t, func(context.Context, vm.IPLookup, time.Duration, time.Duration) (vm.IPResult, bool) {
 		t.Error("user mode started an address poll, which has no host source to answer it")
-		return vm.IPResult{}, false
+		return vm.IPResult{IP: "10.0.2.15", Source: vm.IPSourceGuestAgent}, true
 	})
 
 	var stdout, stderr bytes.Buffer
-	runErr := Run([]string{"start", "-name", diskName, "-no-iso", "-network", "user", "-yes"},
-		strings.NewReader(""), &stdout, &stderr, "test")
-	if runErr == nil || !strings.Contains(runErr.Error(), "start qemu") {
-		t.Fatalf("start returned %v, want it to have recorded the VM and then failed to launch it; stdout:\n%s", runErr, stdout.String())
+	if err := Run([]string{"start", "-name", diskName, "-no-iso", "-network", "user", "-yes"},
+		strings.NewReader(""), &stdout, &stderr, "test"); err != nil {
+		t.Fatalf("start returned %v; stdout:\n%s", err, stdout.String())
 	}
-	if !strings.Contains(stdout.String(), userModeBlock()) {
-		t.Errorf("the run does not say where a user-mode VM is reached; got:\n%s", stdout.String())
+	out := stdout.String()
+	if !strings.Contains(out, "vm exited") {
+		t.Fatalf("the run did not reach the end of the VM's life, so the branch that starts a poll was never passed:\n%s", out)
+	}
+	if !strings.Contains(out, userModeBlock()) {
+		t.Errorf("the run does not say where a user-mode VM is reached; got:\n%s", out)
+	}
+	if strings.Contains(out, "VM is up.") {
+		t.Errorf("user mode printed a resolved-address block, contradicting the user-mode block above it:\n%s", out)
 	}
 	if got := loadStoredState(t).VM.IPAddress; got != "" {
-		t.Errorf("state still records the previous run's address %q, which `status` would report as this VM's", got)
+		t.Errorf("state records %q as this VM's address, which `status` would report: the previous run's address was not cleared, or a poll this mode must not start recorded one", got)
 	}
 }
 
@@ -2928,6 +2946,10 @@ const (
 	injectedISOLocal    = "/nope/kairos.iso\nvm running: true\x1b[2K\r"
 	injectedLastError   = "exit status 1\nvm running: true\x1b[2K\r"
 	injectedPackageMgr  = "apt\nvm running: true\x1b[2K\r"
+	// The platform row is two stored fields joined with a slash, so both
+	// halves are poisoned and what the row has to escape is the join.
+	injectedPlatformOS   = "linux\nvm running: true\x1b[2K\r"
+	injectedPlatformArch = "amd64\nvm running: true\x1b[2K\r"
 )
 
 // Every state-derived row of `status`, poisoned at once and in the same
@@ -2944,9 +2966,13 @@ func TestStatusIsInertForEveryStoredValueItPrints(t *testing.T) {
 		"vm.disk_path":             injectedDiskPath,
 		"vm.last_error":            injectedLastError,
 		"platform.package_manager": injectedPackageMgr,
-		"setup.pre_existing_deps":  injectedDepName,
-		"managed_files":            injectedManagedFile,
-		"managed_dirs":             injectedManagedDir,
+		// One key for two fields, because runStatus prints them as one
+		// value: platformLabel is os + "/" + arch, and it is that joined
+		// string the row escapes or does not.
+		"platform.os + platform.arch": injectedPlatformOS + "/" + injectedPlatformArch,
+		"setup.pre_existing_deps":     injectedDepName,
+		"managed_files":               injectedManagedFile,
+		"managed_dirs":                injectedManagedDir,
 	}
 	out := runStatusOutput(t, func(st *state.State) {
 		// bridged, so the two rows that are gated on a mode are printed too.
@@ -2959,8 +2985,8 @@ func TestStatusIsInertForEveryStoredValueItPrints(t *testing.T) {
 		st.VM.ISOLocal = injectedISOLocal
 		st.VM.DiskPath = injectedDiskPath
 		st.VM.LastError = injectedLastError
-		st.Platform.OS = "linux"
-		st.Platform.Arch = "amd64"
+		st.Platform.OS = injectedPlatformOS
+		st.Platform.Arch = injectedPlatformArch
 		st.Platform.PackageManager = injectedPackageMgr
 		st.Setup.PreExistingDeps = []string{injectedDepName}
 		st.ManagedFiles = append(st.ManagedFiles, injectedManagedFile)
@@ -3164,6 +3190,152 @@ func TestStartResolvesTheAddressBesideTheVMAndLeavesItForStatus(t *testing.T) {
 	if !strings.Contains(statusOut.String(), "vm ip address: "+found.IP+"\n") {
 		t.Errorf("status does not show the address the start resolved:\n%s", statusOut.String())
 	}
+}
+
+// The warning a failed recording prints is true of the window it is printed
+// in, and it says which window that is.
+//
+// The poller's own load and save is not the last word on the address.
+// runStart hands it back onto the state it is holding as soon as it joins the
+// poll goroutine, and the save after the VM exits WRITES the state file
+// rather than reading the one the poller choked on -- so the sentence this
+// warning used to carry unscoped, "`kairos-lab status` will not show it", was
+// contradicted by the same run moments later. Both halves of the scoped
+// sentence are asserted here: nothing to show at the moment of the warning,
+// and the address on record once the VM has exited.
+func TestAFailedRecordingWarnsOnlyAboutTheWindowItIsTrueIn(t *testing.T) {
+	if runtime.GOOS != "linux" {
+		t.Skipf("this test drives the start path as Linux takes it, and %s is not Linux: on darwin -- the only other platform kairos-lab is built for -- the run needs a firmware path from `brew --prefix qemu` before it launches anything, and the PATH this test sets holds nothing but a fake qemu", runtime.GOOS)
+	}
+	const diskName = "kairos-disk0"
+	t.Setenv("KAIROS_LAB_CONFIG_DIR", t.TempDir())
+	t.Setenv("KAIROS_LAB_CACHE_DIR", t.TempDir())
+	fakeQEMUOnPath(t)
+	seedStartableState(t, diskName)
+	stubNetworkPrivilege(t, func(string) error { return nil })
+	stubBridgeIfaceCandidates(t, "kairos-fake-uplink0")
+	stubPrepareLinuxBridge(t, func(st *state.State, _ string) error {
+		st.Network.Mode = "bridged"
+		st.Network.BridgeName = vm.DefaultBridgeName
+		st.Network.TapName = vm.DefaultTapName
+		st.Network.CleanupRequired = true
+		st.Network.CreatedByKairosLab = true
+		return nil
+	})
+	store, err := state.DefaultStore()
+	if err != nil {
+		t.Fatalf("DefaultStore: %v", err)
+	}
+
+	found := vm.IPResult{IP: "192.168.64.12", Source: vm.IPSourceARP}
+	// Written by the poll goroutine and read after Run returns, which is
+	// after runStart has joined that goroutine.
+	var statusAtWarningTime string
+	stubIPPoll(t, func(context.Context, vm.IPLookup, time.Duration, time.Duration) (vm.IPResult, bool) {
+		// The failure is produced rather than simulated: recordVMIP loads
+		// the state file itself, and this is a file it cannot parse.
+		if err := os.WriteFile(store.StatePath, []byte("not json\n"), 0o644); err != nil {
+			t.Errorf("corrupt the state file: %v", err)
+			return vm.IPResult{}, false
+		}
+		// What a `status` in another terminal would show at the moment the
+		// warning is printed. It runs from this goroutine, before the answer
+		// below has reached runStart and before anything else saves.
+		var out bytes.Buffer
+		_ = Run([]string{"status"}, strings.NewReader(""), &out, io.Discard, "test")
+		statusAtWarningTime = out.String()
+		return found, true
+	})
+
+	var stdout, stderr bytes.Buffer
+	if err := Run([]string{"start", "-name", diskName, "-no-iso", "-network", "bridged", "-yes"},
+		strings.NewReader(""), &stdout, &stderr, "test"); err != nil {
+		t.Fatalf("start returned %v; stdout:\n%s", err, stdout.String())
+	}
+
+	warning := stderr.String()
+	if !strings.Contains(warning, "warning: the VM address was not recorded") {
+		t.Fatalf("the failed recording said nothing:\n%s", warning)
+	}
+	if !strings.Contains(warning, "will not show it while this VM is running") {
+		t.Errorf("the warning does not scope its claim to the window it holds in:\n%s", warning)
+	}
+	if strings.Contains(warning, "will not show it: ") {
+		t.Errorf("the warning claims `status` will not show the address at all, which this run goes on to contradict:\n%s", warning)
+	}
+	if !strings.Contains(warning, "writes the address to the state file again when the VM exits") {
+		t.Errorf("the warning does not say what the run does next:\n%s", warning)
+	}
+
+	// Half one: at the moment of the warning there was indeed nothing for
+	// `status` to show.
+	if strings.Contains(statusAtWarningTime, found.IP) {
+		t.Errorf("`status` showed the address the warning said it could not, while the recording was still broken:\n%s", statusAtWarningTime)
+	}
+	// Half two: the run put it back, so a `status` afterwards does show it.
+	if got := loadStoredState(t).VM.IPAddress; got != found.IP {
+		t.Fatalf("state records the address %q, want %q -- the exit save did not put back what the poller could not write", got, found.IP)
+	}
+	var statusOut bytes.Buffer
+	if err := Run([]string{"status"}, strings.NewReader(""), &statusOut, io.Discard, "test"); err != nil {
+		t.Fatalf("status: %v", err)
+	}
+	if !strings.Contains(statusOut.String(), "vm ip address: "+found.IP+"\n") {
+		t.Errorf("`status` after the VM exited does not show the address, so the warning's second line is not true:\n%s", statusOut.String())
+	}
+}
+
+// What the child process writes through, per stream, and why the sudo branch
+// is a question about the object and not about the mode.
+//
+// os/exec starts no copier goroutine for an *os.File -- the descriptor is
+// handed to the child -- so the address poller writing through the wrapper is
+// then the only Go-level writer of that stream. For any other io.Writer it
+// starts one, and that goroutine writes the unwrapped object while the poller
+// writes the wrapper: two writers, no shared lock, which is a data race on
+// the writer's own state -- the race detector reports it as one, on the
+// mutant with the type test taken out.
+//
+// The branch is latent rather than live: it needs darwin and a vmnet mode,
+// and main passes os.Stdout. This test is what pins it before the next darwin
+// test that gets past command.Start() with a buffer inherits the race.
+func TestTheChildKeepsTheRawStreamOnlyWhenItIsAFile(t *testing.T) {
+	f, err := os.CreateTemp(t.TempDir(), "stdout")
+	if err != nil {
+		t.Fatalf("CreateTemp: %v", err)
+	}
+	t.Cleanup(func() { _ = f.Close() })
+	var buf bytes.Buffer
+	wrapped := &syncWriter{w: &buf}
+
+	if got := childStdio(true, f, wrapped); got != io.Writer(f) {
+		t.Errorf("childStdio(sudo, *os.File) = %T, want the file itself: proxying it through a pipe is what sudo on macOS fails to allocate a pty for", got)
+	}
+	if got := childStdio(true, &buf, wrapped); got != io.Writer(wrapped) {
+		t.Errorf("childStdio(sudo, *bytes.Buffer) = %T, want the wrapped writer: os/exec copies into anything that is not an *os.File from a goroutine of its own, which shares no lock with the poller", got)
+	}
+	if got := childStdio(false, f, wrapped); got != io.Writer(wrapped) {
+		t.Errorf("childStdio(not sudo, *os.File) = %T, want the wrapped writer -- the log file hangs off it", got)
+	}
+
+	// The property those choices exist for, exercised the way the race
+	// detector can see it: the writer the child would use and the writer the
+	// poller uses, written at the same time. With the type test in place both
+	// are the one syncWriter; without it the first is this buffer, raw.
+	child := childStdio(true, &buf, wrapped)
+	var wg sync.WaitGroup
+	for range 2 {
+		wg.Add(2)
+		go func() {
+			defer wg.Done()
+			_, _ = child.Write([]byte("[    0.000001] kairos boot console\n"))
+		}()
+		go func() {
+			defer wg.Done()
+			_, _ = wrapped.Write([]byte("VM is up.\n"))
+		}()
+	}
+	wg.Wait()
 }
 
 // runtimeDirForTest is the runtime directory a start uses under the cache

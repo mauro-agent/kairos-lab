@@ -849,20 +849,11 @@ func runStart(args []string, stdin io.Reader, stdout, stderr io.Writer, store *s
 	} else {
 		command.Stdin = os.Stdin
 	}
-	if cmdName == "sudo" {
-		// sudo on macOS may fail with "unable to allocate pty" when stdio is
-		// proxied through pipes. Keep stdio attached directly to the terminal.
-		//
-		// The lock is not shared with the child here, and for this caller it
-		// does not need to be: os/exec hands an *os.File to the child as a
-		// descriptor instead of copying through a Go writer, and an *os.File
-		// is what main passes and what this branch exists to preserve.
-		command.Stdout = stdout
-		command.Stderr = stderr
-	} else {
-		command.Stdout = io.MultiWriter(vmOut, logFile)
-		command.Stderr = io.MultiWriter(vmErr, logFile)
-	}
+	// Which of the two the child writes through is childStdio's decision, and
+	// it is a decision about the object rather than about the mode: the sudo
+	// branch it exists for is only safe for a stream that is an *os.File.
+	command.Stdout = childStdio(cmdName == "sudo", stdout, io.MultiWriter(vmOut, logFile))
+	command.Stderr = childStdio(cmdName == "sudo", stderr, io.MultiWriter(vmErr, logFile))
 	if err := command.Start(); err != nil {
 		st.VM.LastError = err.Error()
 		_ = store.Save(st)
@@ -1241,8 +1232,16 @@ func (p vmIPPoll) run(ctx context.Context) (vm.IPResult, bool) {
 		// read. state.json is the durable copy and `status` is where a user
 		// reads it back. A link-local address is recorded like any other,
 		// and `status` qualifies it there the same way this block does.
+		//
+		// The warning this failure prints is scoped to the window it is true
+		// in, because the failure is not the end of the story: runStart puts
+		// the address back on its own state after it joins this goroutine and
+		// saves that when the VM exits, and that save writes the file rather
+		// than reading the one this attempt failed on. So what is lost is a
+		// `status` run made WHILE the VM is up -- the very window this poll
+		// exists to serve -- and not the record afterwards.
 		if err := recordVMIP(p.Store, res.IP); err != nil {
-			writef(p.Stderr, "warning: the VM address was not recorded, so `kairos-lab status` will not show it: %s\n", planValue(err.Error()))
+			writef(p.Stderr, "warning: the VM address was not recorded, so `kairos-lab status` will not show it while this VM is running: %s\n         this run writes the address to the state file again when the VM exits.\n", planValue(err.Error()))
 		}
 		return res, true
 	}
@@ -1271,6 +1270,32 @@ func (p vmIPPoll) facts() ipPollFacts {
 		GOOS:    p.GOOS,
 		Timeout: p.Timeout,
 	}
+}
+
+// childStdio picks what one of the child process's output streams is
+// attached to: the writer this process was handed, or the wrapped one that
+// shares a lock with the address poller and copies to the run's log file.
+//
+// The direct stream is the sudo branch. sudo on macOS may fail with "unable
+// to allocate pty" when stdio is proxied through pipes, so a run launched
+// through it keeps the terminal attached to the child instead.
+//
+// What makes that branch safe is the type test and not the caller's habits,
+// which is why the test is here rather than in a comment. os/exec hands an
+// *os.File to the child as a descriptor and starts no copier goroutine for
+// it, so the poller writing through the wrapper is the only Go-level writer
+// of that stream. Hand it any OTHER io.Writer and os/exec spawns a goroutine
+// that writes THAT object -- the unwrapped one -- while the poller writes the
+// wrapper around it: two writers of one writer's state, sharing no lock. main
+// passes os.Stdout, so the real caller still gets the direct stream; anything
+// else gets the wrapped one, and the log file with it.
+func childStdio(sudo bool, direct, wrapped io.Writer) io.Writer {
+	if sudo {
+		if _, ok := direct.(*os.File); ok {
+			return direct
+		}
+	}
+	return wrapped
 }
 
 // syncWriter serialises writes to one io.Writer, so that the guest's console
