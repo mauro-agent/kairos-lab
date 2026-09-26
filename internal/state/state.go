@@ -143,20 +143,20 @@ func (s *Store) Load() (*State, error) {
 	return &st, nil
 }
 
-// Save publishes st at s.StatePath.
+// Save publishes st at s.StatePath, by writing a complete temporary file
+// beside it and renaming that over the name, so a concurrent reader sees
+// either the whole old file or the whole new one and never something in
+// between.
 //
-// There is deliberately no test for the property "no failure inside Save can
-// truncate s.StatePath". TestSaveFailureLeavesPreviousStateIntact covers the
-// case a user can actually observe -- a save that cannot finish leaves the
-// previous file byte for byte -- but the general property is structural rather
-// than observable, and no portable test can pin it. Inside this function
-// s.StatePath reaches the filesystem at exactly two places, the Lstat that
-// reads its mode and the Rename that replaces it, and neither of those can
-// shorten a file.
-// Reintroducing a truncation would mean reintroducing an in-place write, which
-// is the one thing this function exists to avoid, and the ways the rename
-// itself can still fail either fail earlier at create time or run against a
-// path where there is no previous file left to compare.
+// No failure in here can shorten s.StatePath, and that is structural rather
+// than tested: below, s.StatePath reaches the filesystem at exactly two
+// places -- the Lstat that reads its mode and the Rename that replaces it --
+// and neither can truncate. Reintroducing a truncation would mean
+// reintroducing the in-place write this function exists to avoid.
+// TestSaveFailureLeavesPreviousStateIntact pins the half of that a user can
+// observe; the general property has no portable test, because the remaining
+// ways the rename can fail either fail earlier at create time or run against
+// a path with no previous file to compare.
 func (s *Store) Save(st *State) error {
 	if err := os.MkdirAll(s.ConfigDir, 0o755); err != nil {
 		return fmt.Errorf("create config directory: %w", err)

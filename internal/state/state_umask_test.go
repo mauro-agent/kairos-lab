@@ -1,12 +1,22 @@
-// The tests in this file pin file modes, so they need the process umask to be
-// a known value rather than whatever the developer's shell or the CI runner
-// happened to set. syscall.Umask is how they get one, and it exists on every
-// unix platform Go targets and nowhere else -- hence the constraint. The rest
-// of the package's tests are portable and stay in state_test.go, so a build
-// for a platform without a umask loses these two and keeps the others.
 //go:build unix
 
 package state
+
+// The tests in this file pin file modes, so they need the process umask to be
+// a known value rather than whatever the developer's shell or the CI runner
+// happened to set, and syscall.Umask is how they get one.
+//
+// The unix constraint is what guarantees that call exists: Windows and plan9
+// have no umask at all. It also excludes js/wasm and wasip1, which do have
+// one -- neither is a target this repo builds, and dropping two tests on a
+// platform where they would have worked is the conservative direction of the
+// two.
+//
+// The rest of the package's tests need none of this and stay in
+// state_test.go, unconstrained, so a build for a platform without a umask
+// loses these and keeps those. Splitting rather than constraining the whole
+// test file is the point: a file-wide tag would have taken every portable
+// test in the package with it.
 
 import (
 	"fmt"
@@ -25,8 +35,8 @@ import (
 // The umask is a property of the whole process and not of the goroutine that
 // sets it, so this is only safe because nothing in this package calls
 // t.Parallel -- Go runs the tests of one package sequentially otherwise.
-// syscall.Umask is also the reason for the build constraint at the top of this
-// file: it exists on every unix platform Go targets and nowhere else.
+// syscall.Umask is also the reason for the build constraint at the top of
+// this file.
 func pinUmask(t *testing.T, mask int) {
 	t.Helper()
 	previous := syscall.Umask(mask)
