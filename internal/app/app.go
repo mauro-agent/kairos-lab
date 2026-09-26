@@ -313,6 +313,37 @@ func runStart(args []string, stdin io.Reader, stdout, stderr io.Writer, store *s
 	if !networkModeValid(*network) {
 		return fmt.Errorf("invalid network mode: %s", *network)
 	}
+	// TEMPORARY, and deliberately Linux-only. What deletes this block is the
+	// commit that adds the vm.PrepareLinuxShared call to the "[1/3] Preparing
+	// networking" block further down; whoever writes that commit should check
+	// that the reason below is actually gone rather than drop a guard whose
+	// purpose is no longer visible.
+	//
+	// The reason: nothing in this package prepares the host side of shared on
+	// Linux yet. There is no vm.PrepareLinuxShared call site, so no bridge, no
+	// tap and no dnsmasq are created, st.Network.TapName keeps whatever the
+	// previous run left in it, and runStart passes that name straight on as
+	// StartConfig.LinuxTapName. internal/vm's buildLinux takes shared and
+	// bridged through one arm and accepts any non-empty tap name, so on a host
+	// that has ever run bridged the guest is handed the bridged tap -- a
+	// bridge with the host's physical NIC enslaved, that is, the LAN -- while
+	// state.json records "mode": "shared" and no sudo prompt is shown. Those
+	// NetworkManager connections are created with autoconnect on and only
+	// reset and cleanup delete them, so the stale tap long outlives the run
+	// that made it. On a host that has never run bridged the same start
+	// instead dies inside buildLinux with "shared linux mode requires tap
+	// name", which tells the user nothing they can act on. Refusing the mode
+	// up front therefore costs no working behaviour and closes the silent
+	// LAN attach.
+	//
+	// macOS is not guarded here, on purpose: shared there is -netdev
+	// vmnet-shared, which needs root, so QEMU exits non-zero with the reason
+	// in its log instead of quietly attaching the guest to anything. That is a
+	// privilege problem, and the next milestone's privilege pre-flight is
+	// where it belongs.
+	if *network == "shared" && runtime.GOOS == "linux" {
+		return fmt.Errorf("shared networking is not wired up on Linux yet: use -network bridged to put the VM on your LAN (needs sudo), or -network user for port-forwarded access")
+	}
 	if *display != "serial" && *display != "window" {
 		return fmt.Errorf("invalid display mode: %s", *display)
 	}
@@ -1493,14 +1524,17 @@ func bridgeIfaceCandidates() []string {
 // flag's validation, the reviewer's prompt and both rejection messages then
 // agree by construction.
 //
-// Which of these the -network flag defaults to is a separate decision, taken
-// at the flag declaration in runStart, and it is still bridged. Accepting a
-// mode and defaulting to it are not the same step: nothing in this package
-// calls vm.PrepareLinuxShared yet, so a shared start on Linux prepares no
-// bridge, no tap and no dnsmasq, and BuildQEMUCommand then hands the guest
+// Membership is not availability. Which of these the -network flag defaults
+// to is a separate decision, taken at the flag declaration in runStart, and it
+// is still bridged; and shared, though it is a member here, is refused on
+// Linux by the temporary guard runStart applies right after the mode check.
+// Both exist for the same missing piece: nothing in this package calls
+// vm.PrepareLinuxShared yet, so a shared start on Linux would prepare no
+// bridge, no tap and no dnsmasq, and BuildQEMUCommand would hand the guest
 // whatever st.Network.TapName still holds -- the bridged tap a previous run
 // left behind, which puts the guest on the LAN under the one mode that exists
-// to keep it off. The default moves once the preparation is wired.
+// to keep it off. The guard goes and the default moves once the preparation
+// is wired; the guard's own comment is where that reasoning is written out.
 //
 // Matching is deliberately exact. "Shared", "SHARED" and " shared" are all
 // rejected rather than folded, both because every other enumerated value in

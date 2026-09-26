@@ -679,14 +679,28 @@ func TestNetworkModesAreExactlyTheDocumentedModes(t *testing.T) {
 // it, on the config review's Network row, after a `start` that passed no
 // -network at all.
 //
-// The mode is bridged and not shared on purpose. shared is accepted
-// everywhere now, but nothing in this package prepares its host side yet --
-// vm.PrepareLinuxShared has no call site here -- so on Linux a flag-less
-// start under shared would either refuse for want of a tap name or, on a host
-// that has ever run bridged, reuse the tap left in state.json and put the
-// guest on the LAN. The milestone that wires the preparation flips the flag
-// to shared, and this test is what will catch that flip: wantMode below is
-// meant to be retargeted in that same commit, not deleted.
+// The mode is bridged and not shared on purpose. shared is accepted by the
+// flag everywhere, but nothing in this package prepares its host side yet --
+// vm.PrepareLinuxShared has no call site here -- so on Linux runStart refuses
+// the mode outright rather than let a start reuse the tap a previous bridged
+// run left in state.json and put the guest on the LAN. The milestone that
+// wires the preparation drops that refusal and flips the flag to shared, and
+// this test is what will catch the flip: wantMode below is meant to be
+// retargeted in that same commit, not deleted.
+//
+// -bridge-if is passed for one reason, and it is not the interface. It keeps
+// the test off the host: networkIface in runStart starts out as this flag's
+// value, and both interface-detection blocks only run when it is empty, so a
+// non-empty one skips vm.DetectUplinkCandidates on Linux and
+// vm.DetectBridgeIfaceCandidates on macOS. Without it the test shells out to
+// `ip route show default` or `ifconfig` and fails wherever the answer is
+// unhelpful -- a container whose only default-route device is one of the
+// filtered virtual ones (docker*, br-*, veth*, virbr*, cni*, podman*), or a
+// macOS runner with no interface reporting an active link. runStart then
+// returns "no suitable uplink interface found for bridged networking" before
+// the config review is ever printed, which looks exactly like the default
+// having moved. The value itself is never used: the run is cancelled at the
+// Enter prompt, long before networking is prepared.
 func TestStartWithNoNetworkFlagUsesTheDefaultMode(t *testing.T) {
 	t.Setenv("KAIROS_LAB_CONFIG_DIR", t.TempDir())
 	t.Setenv("KAIROS_LAB_CACHE_DIR", t.TempDir())
@@ -698,22 +712,28 @@ func TestStartWithNoNetworkFlagUsesTheDefaultMode(t *testing.T) {
 	// -no-iso and an existing disk keep this out of the ISO resolver, and the
 	// single newline answers the review's menu and then runs out, so the
 	// "Press Enter to start" read hits EOF and the run is cancelled before
-	// anything is created or executed. The error is therefore not the subject
-	// here; the bytes printed on the way to it are.
-	_ = Run([]string{"start", "-name", "kairos-disk0", "-no-iso"}, scriptedInput("\n"), &stdout, &stderr, "test")
+	// anything is created or executed. The error is therefore not what is
+	// asserted -- the bytes printed on the way to it are -- but it is kept and
+	// reported, because a failure here is usually a run that stopped before
+	// the review and the error is the only thing that says where.
+	err := Run([]string{"start", "-name", "kairos-disk0", "-no-iso", "-bridge-if", "kairos-test-uplink0"}, scriptedInput("\n"), &stdout, &stderr, "test")
 
 	want := fmt.Sprintf("  7) Network:      %s\n", wantMode)
 	if !strings.Contains(stdout.String(), want) {
-		t.Fatalf("the config review does not show %q, so the -network flag no longer defaults to %q; got:\n%s", want, wantMode, stdout.String())
+		t.Fatalf("the config review does not show %q: either the -network flag no longer defaults to %q, or the run ended before the review printed. Run returned %v.\nstdout:\n%s\nstderr:\n%s", want, wantMode, err, stdout.String(), stderr.String())
 	}
 }
 
 // `kairos-lab start -h` is where a user learns which modes exist: the usage
-// string on the -network flag is the only listing of them outside the config
-// reviewer's prompt, which a user has to start a VM to reach. Nothing else in
-// this suite reads it, so dropping shared from the list -- the obvious edit
-// when reverting or rewording -- was previously invisible, and a mode nobody
-// is told about is one nobody chooses.
+// string on the -network flag is what -h prints, and the only listing a user
+// reaches without starting a VM, the other one being the config reviewer's
+// prompt. README.md carries a third listing, but it is stale -- it names two
+// of the three modes -- and correcting it belongs to the milestone that
+// rewrites the README, so it is deliberately not touched here and is not what
+// this test guards. Nothing else in this suite reads the usage string, so
+// dropping shared from the list -- the obvious edit when reverting or
+// rewording -- was previously invisible, and a mode nobody is told about is
+// one nobody chooses.
 //
 // The registered default is asserted from the same line, since flag prints it
 // as part of the entry. That is a second and more direct witness than
@@ -760,8 +780,16 @@ func captureOSStderr(t *testing.T, fn func() error) (string, error) {
 		t.Fatalf("CreateTemp: %v", err)
 	}
 	saved := os.Stderr
-	// Restored on the way out of a panicking fn too: leaving the whole test
-	// binary writing into a temp file would silence every later failure.
+	// A defer as well as the plain restore below, so a panicking fn still
+	// leaves the process as it was found. What that is worth is narrower than
+	// it looks and worth stating, because the obvious claim is false: the
+	// testing package writes failures and recovered panics to os.Stdout, and
+	// the runtime writes an unrecovered panic to fd 2 directly rather than
+	// through this variable, so a missed restore would silence neither. What
+	// it would break is anything that reads the os.Stderr variable at write
+	// time -- a later call to this helper, or production code handed
+	// os.Stderr -- which would be writing into a file this function has
+	// already closed, in a directory t.TempDir removes when the test ends.
 	defer func() { os.Stderr = saved }()
 	os.Stderr = f
 	fnErr := fn()
@@ -777,10 +805,17 @@ func captureOSStderr(t *testing.T, fn func() error) (string, error) {
 }
 
 // Every mode the CLI documents has to get past validation, and nothing else
-// may. These all stop at requireSetup on a fresh config dir -- the same seam
+// may. These stop at requireSetup on a fresh config dir -- the same seam
 // TestRunAcceptsSubcommandsWithoutPositionalArguments uses -- which is proof
 // they cleared the mode check without a VM, a disk or a host network being
 // touched.
+//
+// shared on Linux is the one exception, and only to how far it gets: the
+// temporary refusal in runStart sits between the mode check and requireSetup,
+// so it stops one seam earlier. What this test is about still holds there --
+// the mode cleared validation, since an unaccepted one is rejected before the
+// refusal can fire -- so the assertion is made against that error instead.
+// TestStartRefusesSharedNetworkModeOnLinux owns the refusal itself.
 func TestStartAcceptsEveryDocumentedNetworkMode(t *testing.T) {
 	for _, mode := range []string{"shared", "bridged", "user"} {
 		t.Run(mode, func(t *testing.T) {
@@ -789,8 +824,75 @@ func TestStartAcceptsEveryDocumentedNetworkMode(t *testing.T) {
 
 			var stdout, stderr bytes.Buffer
 			err := Run([]string{"start", "-network", mode, "-iso", "/tmp/kairos.iso"}, strings.NewReader(""), &stdout, &stderr, "test")
+			if mode == "shared" && runtime.GOOS == "linux" {
+				if err == nil || strings.Contains(err.Error(), "invalid network mode") {
+					t.Fatalf("-network shared: got %v, want the temporary Linux refusal rather than a validation failure", err)
+				}
+				return
+			}
 			if !errors.Is(err, errSetupRequired) {
 				t.Fatalf("-network %s: got %v, want %v", mode, err, errSetupRequired)
+			}
+		})
+	}
+}
+
+// The temporary refusal of -network shared on Linux, pinned so that it cannot
+// be dropped quietly and so that it stays a refusal the user can act on.
+//
+// Until something calls vm.PrepareLinuxShared, a shared start on Linux has
+// two outcomes and no third: on a host that never ran bridged it dies inside
+// internal/vm's buildLinux with "shared linux mode requires tap name", and on
+// a host that did it is handed the tap that run left in state.json -- a tap
+// on a bridge with the physical NIC enslaved -- and the guest lands on the
+// LAN with state.json recording "mode": "shared" and no sudo prompt shown.
+// The refusal is what stands between a user typing -network shared and that
+// second outcome, so its removal has to be deliberate: it goes in the commit
+// that adds the vm.PrepareLinuxShared call, which is also the commit that
+// makes this test wrong on purpose.
+//
+// bridged and user are exercised alongside it because the guard is a single
+// condition, and a condition widened by one word would take the working modes
+// down with it.
+func TestStartRefusesSharedNetworkModeOnLinux(t *testing.T) {
+	if runtime.GOOS != "linux" {
+		t.Skipf("the refusal is Linux-only on purpose: on %s shared means -netdev vmnet-shared, which fails visibly for want of root, and the privilege pre-flight is where that is handled", runtime.GOOS)
+	}
+
+	t.Run("shared", func(t *testing.T) {
+		t.Setenv("KAIROS_LAB_CONFIG_DIR", t.TempDir())
+		t.Setenv("KAIROS_LAB_CACHE_DIR", t.TempDir())
+
+		var stdout, stderr bytes.Buffer
+		err := Run([]string{"start", "-network", "shared", "-iso", "/tmp/kairos.iso"}, strings.NewReader(""), &stdout, &stderr, "test")
+		if err == nil {
+			t.Fatalf("-network shared was accepted on linux, where nothing prepares its host side; stdout:\n%s", stdout.String())
+		}
+		// Ahead of requireSetup, which is where every other mode stops on a
+		// fresh config dir. The refusal has to come before anything reads
+		// state.json, because the stale tap it protects against is read from
+		// there.
+		if errors.Is(err, errSetupRequired) {
+			t.Fatalf("-network shared reached requireSetup (%v), so the refusal is not where it belongs -- in runStart's flag-checking block, before the state is loaded", err)
+		}
+		// A refusal that only says "unimplemented" leaves the user stuck, so
+		// the two modes that do work today have to be named in it.
+		for _, want := range []string{"-network bridged", "-network user"} {
+			if !strings.Contains(err.Error(), want) {
+				t.Errorf("the refusal %q does not point the user at %s", err, want)
+			}
+		}
+	})
+
+	for _, mode := range []string{"bridged", "user"} {
+		t.Run(mode, func(t *testing.T) {
+			t.Setenv("KAIROS_LAB_CONFIG_DIR", t.TempDir())
+			t.Setenv("KAIROS_LAB_CACHE_DIR", t.TempDir())
+
+			var stdout, stderr bytes.Buffer
+			err := Run([]string{"start", "-network", mode, "-iso", "/tmp/kairos.iso"}, strings.NewReader(""), &stdout, &stderr, "test")
+			if !errors.Is(err, errSetupRequired) {
+				t.Fatalf("-network %s: got %v, want %v -- the refusal is meant to catch shared and nothing else", mode, err, errSetupRequired)
 			}
 		})
 	}
