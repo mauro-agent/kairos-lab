@@ -117,7 +117,7 @@ Downloads a Kairos ISO with interactive selection:
 
 Boots a VM with sensible defaults:
 - **Display**: `window` (graphical) by default
-- **Network**: `shared` by default (VM gets a real address on a NAT subnet)
+- **Network**: `shared` by default; see [Networking](#networking) for what each of the three modes can and can't reach
 - **Disk**: Select existing or create new
 
 Flags:
@@ -127,8 +127,10 @@ Flags:
 - `-iso <path>` - Use specific ISO file
 - `-display window|serial` - Display mode (default: window)
 - `-network shared|bridged|user` - Network mode (default: shared)
+- `-bridge-if <iface>` - Uplink for `bridged` (default: resolved at run time; ignored in `shared` and `user`)
 - `-disk-size 60G` - Disk size for new disks
-- `-memory 4` / `-cpus 2` - VM resources (memory is in GB, not MB)
+- `-memory <GB>` / `-cpus <n>` - VM resources (memory is in GB, not MB;
+  defaults: 2 vCPUs, and 8 GB of memory on Apple Silicon or 4 GB elsewhere)
 - `-yes` - Auto-confirm prompts
 
 ### `status`
@@ -139,7 +141,11 @@ Shows current state:
 - Network configuration, including the bridge and tap on Linux, where
   `shared` and `bridged` build them (on macOS QEMU's vmnet backend does the
   bridging and there are none to name)
-- The VM's address, once one has been found
+- The VM's address - always printed, in every mode, reading `none` until one
+  is known
+- In `user` mode, the two forwarded host ports - 2222 for SSH, 8080 for the
+  WebUI - since a SLIRP guest has no address on the host's network to show
+  instead
 - Running VM info
 
 ### `reset`
