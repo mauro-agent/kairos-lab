@@ -3,11 +3,13 @@ package app
 import (
 	"bytes"
 	"errors"
+	"flag"
 	"fmt"
 	"io"
 	"os"
 	"path/filepath"
 	"runtime"
+	"slices"
 	"strconv"
 	"strings"
 	"testing"
@@ -647,35 +649,50 @@ func TestNetworkModeValidRejectsTheEmptyString(t *testing.T) {
 	}
 }
 
-// Shared is the default because it is the mode that gives a guest a usable
-// address without bridging onto the host's LAN: internal/vm notes that it
-// works over Wi-Fi where bridged cannot, and unlike user mode -- which is a
-// port-forwarded NAT behind QEMU, with no address of the guest's own and so no
-// way for two VMs to form a cluster -- it leaves the guests able to see each
-// other. This is the one place in the tests the literal is written down, on
-// purpose: changing the default should be a deliberate edit here rather than a
-// silent change in behaviour.
-func TestDefaultNetworkModeIsShared(t *testing.T) {
-	if defaultNetworkMode != "shared" {
-		t.Errorf("defaultNetworkMode = %q, want %q", defaultNetworkMode, "shared")
-	}
-	// A default the validator rejects would fail every start that passes no
-	// -network at all, which is the common case.
-	if !networkModeValid(defaultNetworkMode) {
-		t.Errorf("networkModeValid(%q) is false, so the default mode cannot be started", defaultNetworkMode)
+// The membership of networkModes, pinned entry by entry. networkModeValid
+// only reports whether a mode is in the slice, so every test that asks it a
+// question stays green no matter what the slice contains -- a fourth entry is
+// simply a fourth mode they never ask about.
+//
+// That matters because the slice is now the single gate the two former inline
+// checks collapsed into. An entry added by accident, or a typo in one ("tap",
+// "brigded"), is accepted by the -network flag, accepted by the config
+// reviewer, written to state.json as the run's mode, and then falls through
+// the default arm of internal/vm's buildLinux/buildMacOS switch to user
+// networking: a VM that boots, looks healthy, and is on a network the user did
+// not ask for. That is the outcome the slice's own doc comment argues against
+// for case folding, reached through the list instead.
+//
+// The comparison is ordered, which is stricter than the gate needs but is what
+// the rest of the CLI shows the user: this is the order the -network usage
+// string and the reviewer's prompt 7 name the modes in, so a reordering that
+// leaves those behind is worth a red test too.
+func TestNetworkModesAreExactlyTheDocumentedModes(t *testing.T) {
+	want := []string{"shared", "bridged", "user"}
+	if !slices.Equal(networkModes, want) {
+		t.Fatalf("networkModes = %q, want exactly %q; every mode in this slice is one the -network flag and the config reviewer both accept and hand to internal/vm", networkModes, want)
 	}
 }
 
-// The declared default of the -network flag, asserted through the flag rather
-// than by re-reading the constant: the value is observed where the user would
-// see it, on the config review's Network row, after a `start` that passed no
-// -network. Repeating "shared" here instead would pass even if the flag
-// declaration still said "bridged", which is exactly the wiring this exists to
-// check.
+// The declared default of the -network flag, asserted end to end rather than
+// by re-reading the declaration: the value is observed where the user meets
+// it, on the config review's Network row, after a `start` that passed no
+// -network at all.
+//
+// The mode is bridged and not shared on purpose. shared is accepted
+// everywhere now, but nothing in this package prepares its host side yet --
+// vm.PrepareLinuxShared has no call site here -- so on Linux a flag-less
+// start under shared would either refuse for want of a tap name or, on a host
+// that has ever run bridged, reuse the tap left in state.json and put the
+// guest on the LAN. The milestone that wires the preparation flips the flag
+// to shared, and this test is what will catch that flip: wantMode below is
+// meant to be retargeted in that same commit, not deleted.
 func TestStartWithNoNetworkFlagUsesTheDefaultMode(t *testing.T) {
 	t.Setenv("KAIROS_LAB_CONFIG_DIR", t.TempDir())
 	t.Setenv("KAIROS_LAB_CACHE_DIR", t.TempDir())
 	seedStartableState(t, "kairos-disk0")
+
+	const wantMode = "bridged"
 
 	var stdout, stderr bytes.Buffer
 	// -no-iso and an existing disk keep this out of the ISO resolver, and the
@@ -685,10 +702,78 @@ func TestStartWithNoNetworkFlagUsesTheDefaultMode(t *testing.T) {
 	// here; the bytes printed on the way to it are.
 	_ = Run([]string{"start", "-name", "kairos-disk0", "-no-iso"}, scriptedInput("\n"), &stdout, &stderr, "test")
 
-	want := fmt.Sprintf("  7) Network:      %s\n", defaultNetworkMode)
+	want := fmt.Sprintf("  7) Network:      %s\n", wantMode)
 	if !strings.Contains(stdout.String(), want) {
-		t.Fatalf("the config review does not show %q, so the -network flag's default is not defaultNetworkMode; got:\n%s", want, stdout.String())
+		t.Fatalf("the config review does not show %q, so the -network flag no longer defaults to %q; got:\n%s", want, wantMode, stdout.String())
 	}
+}
+
+// `kairos-lab start -h` is where a user learns which modes exist: the usage
+// string on the -network flag is the only listing of them outside the config
+// reviewer's prompt, which a user has to start a VM to reach. Nothing else in
+// this suite reads it, so dropping shared from the list -- the obvious edit
+// when reverting or rewording -- was previously invisible, and a mode nobody
+// is told about is one nobody chooses.
+//
+// The registered default is asserted from the same line, since flag prints it
+// as part of the entry. That is a second and more direct witness than
+// TestStartWithNoNetworkFlagUsesTheDefaultMode's trip through the config
+// review, and it is the other half of what the next milestone flips.
+func TestStartUsageListsEveryNetworkModeAndItsDefault(t *testing.T) {
+	t.Setenv("KAIROS_LAB_CONFIG_DIR", t.TempDir())
+	t.Setenv("KAIROS_LAB_CACHE_DIR", t.TempDir())
+
+	usage, err := captureOSStderr(t, func() error {
+		return Run([]string{"start", "-h"}, strings.NewReader(""), io.Discard, io.Discard, "test")
+	})
+	// -h is not a flag runStart declares, so the flag package handles it:
+	// print the usage, return ErrHelp. Anything else means the run got past
+	// parsing and what was captured is not the usage message.
+	if !errors.Is(err, flag.ErrHelp) {
+		t.Fatalf("start -h returned %v, want flag.ErrHelp; captured:\n%s", err, usage)
+	}
+	want := `network mode: shared|bridged|user (default "bridged")`
+	if !strings.Contains(usage, want) {
+		t.Fatalf("start -h does not print %q, so either a mode is undocumented or the default moved; got:\n%s", want, usage)
+	}
+}
+
+// captureOSStderr returns what fn wrote to the process's standard error,
+// along with fn's error.
+//
+// It has to reach for the process-wide file rather than the stderr writer Run
+// is handed, because those are not the same destination for a usage message:
+// runStart builds its flag set with flag.NewFlagSet and never calls
+// SetOutput, so flag.FlagSet.Output() falls through to os.Stderr. Giving the
+// flag set the writer instead would be a change to production code made only
+// so a test could see it, and the point here is to observe what a user at a
+// terminal actually gets.
+//
+// The swap works because Output() reads the os.Stderr variable at the moment
+// it prints rather than at flag-set construction. A temp file rather than an
+// os.Pipe means there is no reader to schedule and no way to deadlock on a
+// full pipe buffer, whatever the usage message grows to.
+func captureOSStderr(t *testing.T, fn func() error) (string, error) {
+	t.Helper()
+	f, err := os.CreateTemp(t.TempDir(), "stderr-*.txt")
+	if err != nil {
+		t.Fatalf("CreateTemp: %v", err)
+	}
+	saved := os.Stderr
+	// Restored on the way out of a panicking fn too: leaving the whole test
+	// binary writing into a temp file would silence every later failure.
+	defer func() { os.Stderr = saved }()
+	os.Stderr = f
+	fnErr := fn()
+	os.Stderr = saved
+	if err := f.Close(); err != nil {
+		t.Fatalf("close captured stderr: %v", err)
+	}
+	out, err := os.ReadFile(f.Name())
+	if err != nil {
+		t.Fatalf("read captured stderr: %v", err)
+	}
+	return string(out), fnErr
 }
 
 // Every mode the CLI documents has to get past validation, and nothing else
@@ -885,7 +970,7 @@ func reviewableConfig(t *testing.T) *vmStartConfig {
 		DiskSize:     "60G",
 		MemoryGB:     4,
 		CPUs:         2,
-		NetworkMode:  defaultNetworkMode,
+		NetworkMode:  "bridged",
 		Display:      "window",
 		DownloadsDir: t.TempDir(),
 		TakenNames:   map[string]struct{}{},

@@ -300,7 +300,7 @@ func runStart(args []string, stdin io.Reader, stdout, stderr io.Writer, store *s
 	noISO := fs.Bool("no-iso", false, "boot without ISO (for installed systems)")
 	memory := fs.Int("memory", defaultMemoryMB()/1024, "memory in GB")
 	cpus := fs.Int("cpus", 2, "number of vCPUs")
-	network := fs.String("network", defaultNetworkMode, "network mode: shared|bridged|user")
+	network := fs.String("network", "bridged", "network mode: shared|bridged|user")
 	display := fs.String("display", "window", "display mode: window|serial")
 	bridgeIface := fs.String("bridge-if", defaultBridgeIface(), "bridge interface (macOS vmnet or Linux uplink iface)")
 	autoYes := fs.Bool("yes", false, "auto-confirm sudo operations")
@@ -1479,33 +1479,38 @@ func bridgeIfaceCandidates() []string {
 	return nil
 }
 
-// defaultNetworkMode is the mode a `start` with no -network gets, and
-// networkModes is the whole set the CLI accepts. They live here, together and
+// networkModes is the whole set of modes the CLI accepts, and it lives here,
 // alone, because the set used to be spelled out inline at each of the two
 // places a mode string is checked -- once in runStart against the -network
 // flag, and once in reviewVMConfig against what the user types at prompt 7 --
 // and those two drifted the moment a mode was added. Adding a mode to the flag
 // and forgetting the reviewer leaves the CLI in the state where a run can be
 // started in the new mode but the config review cannot select it back, and
-// rejects the very default the flag just handed it, which is invisible to
-// anyone who passes -yes and unavoidable for everyone who does not.
+// rejects the very value the flag just handed it, which is invisible to anyone
+// who passes -yes and unavoidable for everyone who does not.
 //
-// So a fourth mode is one entry in the slice below and nothing else: the flag
-// default, the flag's validation, the reviewer's prompt and both rejection
-// messages then agree by construction.
+// So a fourth mode is one entry in the slice below and nothing else: the
+// flag's validation, the reviewer's prompt and both rejection messages then
+// agree by construction.
+//
+// Which of these the -network flag defaults to is a separate decision, taken
+// at the flag declaration in runStart, and it is still bridged. Accepting a
+// mode and defaulting to it are not the same step: nothing in this package
+// calls vm.PrepareLinuxShared yet, so a shared start on Linux prepares no
+// bridge, no tap and no dnsmasq, and BuildQEMUCommand then hands the guest
+// whatever st.Network.TapName still holds -- the bridged tap a previous run
+// left behind, which puts the guest on the LAN under the one mode that exists
+// to keep it off. The default moves once the preparation is wired.
 //
 // Matching is deliberately exact. "Shared", "SHARED" and " shared" are all
 // rejected rather than folded, both because every other enumerated value in
 // this CLI (the display mode validated right after the network one in
 // runStart, the subcommand names in Run) is matched exactly too, and because
 // a tolerated near-miss would be written to state.json and handed to
-// internal/vm, where
-// BuildQEMUCommand compares the mode exactly and quietly falls back to user
-// networking for anything it does not recognise -- a VM that boots, looks
-// healthy, and is on the wrong network.
-const defaultNetworkMode = "shared"
-
-var networkModes = []string{defaultNetworkMode, "bridged", "user"}
+// internal/vm, where BuildQEMUCommand compares the mode exactly and quietly
+// falls back to user networking for anything it does not recognise -- a VM
+// that boots, looks healthy, and is on the wrong network.
+var networkModes = []string{"shared", "bridged", "user"}
 
 // networkModeValid reports whether mode is one the CLI accepts. The empty
 // string is not one of them, which the reviewer relies on: an empty answer at
