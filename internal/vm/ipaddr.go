@@ -422,7 +422,7 @@ func (l IPLookup) guestAgentIP(ctx context.Context) string {
 		// a macOS host where QEMU runs as root. Neither is worth saying.
 		return ""
 	}
-	defer conn.Close()
+	defer func() { _ = conn.Close() }()
 
 	if err := conn.SetDeadline(deadline); err != nil {
 		return ""

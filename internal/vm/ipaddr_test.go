@@ -212,7 +212,7 @@ func newFakeSources(t *testing.T) *fakeSources {
 // ships no qemu-guest-agent -- the write is accepted into a virtio-serial
 // port that nothing on the other side is reading.
 func (f *fakeSources) serve(server net.Conn, reply string) {
-	defer server.Close()
+	defer func() { _ = server.Close() }()
 	buf := make([]byte, 4096)
 	if _, err := server.Read(buf); err != nil {
 		return
@@ -1137,7 +1137,7 @@ func TestGuestAgentIPStopsReadingAtTheResponseCap(t *testing.T) {
 	qgaDial = func(_ context.Context, _ string) (net.Conn, error) {
 		client, server := net.Pipe()
 		go func() {
-			defer server.Close()
+			defer func() { _ = server.Close() }()
 			if _, err := server.Read(make([]byte, 4096)); err != nil {
 				return
 			}
