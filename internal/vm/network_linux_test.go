@@ -29,10 +29,13 @@ package vm
 
 import (
 	"fmt"
+	"io"
+	"io/fs"
 	"os"
 	"slices"
 	"strconv"
 	"strings"
+	"syscall"
 	"testing"
 
 	"github.com/kairos-io/kairos-lab/internal/state"
@@ -70,6 +73,20 @@ type fakeHost struct {
 	// pair of answers is the state the pre-activation port assertion exists
 	// for, and without this field the fake cannot produce it.
 	invisibleLinks map[string]bool
+	// invisibleBridges are devices the /sys stat cannot be asked about: it
+	// fails with something other than "no such file or directory". Measured
+	// against real os.Stat, that covers permission denied on a /sys that is
+	// not readable, ENOTDIR (/sys/class/net/bonding_masters is a regular
+	// file, so the "bridge" under it is not a directory entry), and a symlink
+	// loop. Every one of those makes isLinuxBridge answer false, which is the
+	// same answer it gives for a device that is not there -- and that is the
+	// pair netDeviceExists exists to tell apart. The value is the error the
+	// stat failed with, because which error it is decides the answer.
+	invisibleBridges map[string]error
+	// slaveLinksCalls counts how many times the port list was read. The
+	// number is a claim internal/app's consent paragraph makes out loud, so
+	// it is pinned rather than described.
+	slaveLinksCalls int
 	// slaveLinksErr, when set, is what the `ip -o link show master` probe
 	// fails with. A busybox `ip` has no `show master` filter and exits 2 for
 	// every bridge on the host, so this models a property of the machine
@@ -93,12 +110,13 @@ type fakeHost struct {
 func newFakeHost(t *testing.T) *fakeHost {
 	t.Helper()
 	h := &fakeHost{
-		conns:          map[string]bool{},
-		links:          map[string]bool{},
-		bridges:        map[string]bool{},
-		slaves:         map[string][]string{},
-		profiles:       map[string]nmProfile{},
-		invisibleLinks: map[string]bool{},
+		conns:            map[string]bool{},
+		links:            map[string]bool{},
+		bridges:          map[string]bool{},
+		slaves:           map[string][]string{},
+		profiles:         map[string]nmProfile{},
+		invisibleLinks:   map[string]bool{},
+		invisibleBridges: map[string]error{},
 	}
 
 	origSudo := sudo
@@ -106,6 +124,7 @@ func newFakeHost(t *testing.T) *fakeHost {
 	origNmcli := nmcliAvailable
 	origConnExists := nmConnectionExists
 	origIsBridge := isLinuxBridge
+	origStatDevice := statNetDevice
 	origLinkExists := linkExists
 	origSlaveLinks := bridgeSlaveLinks
 	origDelay := staleCleanupSettleDelay
@@ -115,6 +134,7 @@ func newFakeHost(t *testing.T) *fakeHost {
 		nmcliAvailable = origNmcli
 		nmConnectionExists = origConnExists
 		isLinuxBridge = origIsBridge
+		statNetDevice = origStatDevice
 		linkExists = origLinkExists
 		bridgeSlaveLinks = origSlaveLinks
 		staleCleanupSettleDelay = origDelay
@@ -124,7 +144,27 @@ func newFakeHost(t *testing.T) *fakeHost {
 	networkManagerActive = func() bool { return true }
 	nmcliAvailable = func() bool { return true }
 	nmConnectionExists = func(name string) bool { return name != "" && h.conns[name] }
-	isLinuxBridge = func(name string) bool { return name != "" && h.bridges[name] }
+	// A failing stat is a false here, whatever it failed with: the real
+	// isLinuxBridge is `os.Stat(...); return err == nil`, so an unreadable
+	// /sys and a missing device are one answer to it.
+	isLinuxBridge = func(name string) bool {
+		return name != "" && h.invisibleBridges[name] == nil && h.bridges[name]
+	}
+	// The same stat, rendered as os.Stat renders it: nil for a device that is
+	// there -- whether or not it is a bridge, which is what a bond master
+	// looks like under /sys/class/net/<name> -- a *fs.PathError wrapping
+	// fs.ErrNotExist for one that is not, and whatever invisibleBridges says
+	// when the stat itself cannot answer. Only the raw result is faked; the
+	// classification of it is netDeviceExists's and runs for real here.
+	statNetDevice = func(name string) error {
+		if err := h.invisibleBridges[name]; err != nil {
+			return err
+		}
+		if name != "" && (h.links[name] || h.bridges[name]) {
+			return nil
+		}
+		return &fs.PathError{Op: "stat", Path: "/sys/class/net/" + name, Err: fs.ErrNotExist}
+	}
 	linkExists = func(name string) bool {
 		return name != "" && !h.invisibleLinks[name] && (h.links[name] || h.bridges[name])
 	}
@@ -158,6 +198,7 @@ func (h *fakeHost) run(name string, args ...string) error {
 // slave list, one line per attached interface, in the kernel's format -- or
 // fails the way a host that cannot answer the question does.
 func (h *fakeHost) slaveLinks(bridge string) (string, error) {
+	h.slaveLinksCalls++
 	if h.slaveLinksErr != nil {
 		return "", h.slaveLinksErr
 	}
@@ -497,7 +538,7 @@ func TestPrepareLinuxSharedRefusalDescribesOnlyWhatItKnows(t *testing.T) {
 		if err == nil {
 			t.Fatal("PrepareLinuxShared continued over a teardown that could not finish")
 		}
-		if !strings.Contains(err.Error(), "reconnect eth0") {
+		if !strings.Contains(err.Error(), `reconnect "eth0"`) {
 			t.Errorf("the refusal does not name the step that failed:\n%v", err)
 		}
 		assertRefusalWording(t, err)
@@ -1677,7 +1718,7 @@ func TestCleanupNMConnectionsReportsEveryFailure(t *testing.T) {
 			"delete connection kairoslab0",
 			"delete interface kairoslab-tap0",
 			"delete interface kairoslab0",
-			"reconnect eth0",
+			`reconnect "eth0"`,
 		} {
 			if !strings.Contains(err.Error(), want) {
 				t.Errorf("error does not mention %q:\n%v", want, err)
@@ -1782,5 +1823,400 @@ func TestCleanupNMConnectionsRefusesAMalformedStoredTapName(t *testing.T) {
 			"nmcli connection delete kairoslab0",
 			"ip link delete kltap0",
 		})
+	})
+}
+
+// The gate that replaced the probe-level fail-open reintroduced it one layer
+// down: `if !isLinuxBridge(bridge) { return nil }` in front of all three port
+// checks, where isLinuxBridge is
+// `os.Stat("/sys/class/net/<name>/bridge"); return err == nil`.
+//
+// `err == nil` is the whole predicate, so every stat error collapses to the
+// one false. Measured against real os.Stat on this host:
+//
+//	okbr      err == nil is true    -- a bridge
+//	eaccesbr  err == nil is false   -- permission denied
+//	notdir    err == nil is false   -- not a directory
+//	loop      err == nil is false   -- too many levels of symbolic links
+//	gone      err == nil is false   -- no such file or directory
+//
+// Only the last of those means "no such device, therefore no ports", and it
+// is the only one that may skip the check. The ENOTDIR row is live on a real
+// /sys today: /sys/class/net/bonding_masters is a regular file.
+//
+// The host below is the sharpest form of it. `ip` works perfectly, eth0 is
+// already a port of the bridge, and the stat is the only thing that cannot
+// answer -- so with the gate in front of the checks the port list was never
+// read at all, ipv4.method shared was applied over the NIC, and the start
+// wrote its state.
+func TestPrepareLinuxSharedRefusesWhenTheBridgeStatCannotAnswer(t *testing.T) {
+	const statted = "/sys/class/net/" + DefaultBridgeName
+	tests := []struct {
+		name    string
+		statErr error
+	}{
+		{"permission denied", &fs.PathError{Op: "stat", Path: statted, Err: fs.ErrPermission}},
+		{"not a directory", &fs.PathError{Op: "stat", Path: statted, Err: syscall.ENOTDIR}},
+		{"symlink loop", &fs.PathError{Op: "stat", Path: statted, Err: syscall.ELOOP}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			h := newFakeHost(t)
+			h.bridges[DefaultBridgeName] = true
+			h.invisibleLinks[DefaultBridgeName] = true
+			h.slaves[DefaultBridgeName] = []string{"eth0"}
+			h.invisibleBridges[DefaultBridgeName] = tt.statErr
+			st := &state.State{}
+
+			err := PrepareLinuxShared(st, t.TempDir())
+			if err == nil {
+				t.Fatal("PrepareLinuxShared applied ipv4.method shared over a bridge it never read the port list of")
+			}
+
+			// Nothing is activated: the refusal comes from the check that
+			// sits before the first `connection up`, so the method is never
+			// applied to a bridge carrying a NIC.
+			for _, line := range h.lines() {
+				if strings.HasPrefix(line, "nmcli connection up") {
+					t.Errorf("a connection was activated over a bridge whose ports could not be established: %s", line)
+				}
+			}
+			uid := testUID(t)
+			want := append([]string{}, sharedSequence(uid)[:4]...)
+			want = append(want, refusalTail()...)
+			assertSequence(t, h.lines(), want)
+
+			// And the message is about the stat, not about a port: no port
+			// list was read here and the message may not claim one.
+			for _, wantText := range []string{
+				"/sys/class/net/" + DefaultBridgeName,
+				"no such file or directory",
+			} {
+				if !strings.Contains(err.Error(), wantText) {
+					t.Errorf("the refusal does not mention %q:\n%v", wantText, err)
+				}
+			}
+			if strings.Contains(err.Error(), "reports") {
+				t.Errorf("the refusal claims a port list it never read:\n%v", err)
+			}
+			if st.Network.Mode != "" || st.Network.CreatedByKairosLab {
+				t.Errorf("state was written for a run that was refused: %+v", st.Network)
+			}
+		})
+	}
+}
+
+// The other side of the same rule, and the reason it is a rule and not a
+// blanket refusal: "no such file or directory" IS an answer. A device that is
+// not on the host has no ports, and a clean first run has no bridge yet --
+// both connections are added with autoconnect no, so nothing of that name
+// exists until the explicit `connection up`.
+//
+// A fix that refused on every stat error without excepting this one would
+// refuse every first shared start there is: the port check it would then run
+// fails closed on a probe error, and there is no port list on a device that
+// is not there.
+func TestPrepareLinuxSharedProceedsWhenTheBridgeDeviceIsNotThere(t *testing.T) {
+	h := newFakeHost(t)
+	h.invisibleBridges[DefaultBridgeName] = &fs.PathError{
+		Op:   "stat",
+		Path: "/sys/class/net/" + DefaultBridgeName,
+		Err:  fs.ErrNotExist,
+	}
+	st := &state.State{}
+
+	if err := PrepareLinuxShared(st, t.TempDir()); err != nil {
+		t.Fatalf("PrepareLinuxShared refused a host that simply has no bridge of that name yet: %v", err)
+	}
+	assertSequence(t, h.lines(), sharedSequence(testUID(t)))
+	if st.Network.Mode != "shared" {
+		t.Errorf("Mode = %q, want %q", st.Network.Mode, "shared")
+	}
+}
+
+// The second class the gate let through, and the one no stat error is needed
+// for: a master that exists, has ports, and is not a Linux bridge.
+//
+// `ip -o link show master <dev>` lists the ports of ANY master -- a bond, a
+// team, a VRF, an OVS bridge. /sys/class/net/<dev>/bridge exists only for a
+// Linux bridge, so isLinuxBridge answers false for every one of them while
+// the device sits there with the host's NIC on it. On the host this was
+// measured on, isLinuxBridge("eth0") is false and eth0 exists.
+//
+// The name comes out of state.json, which is a 0644 file, and
+// validateStoredInterfaceName accepts "bond0" in it.
+func TestPrepareLinuxSharedRefusesPortsOnAMasterThatIsNotABridge(t *testing.T) {
+	h := newFakeHost(t)
+	// A device of the bridge's name that is not a bridge: no entry in
+	// h.bridges, so isLinuxBridge answers false, exactly as /sys does for a
+	// bond master.
+	h.links[DefaultBridgeName] = true
+	h.slaves[DefaultBridgeName] = []string{"eth0"}
+	st := &state.State{}
+
+	err := PrepareLinuxShared(st, t.TempDir())
+	if err == nil {
+		t.Fatal("PrepareLinuxShared brought a NAT bridge up over a master carrying the host's NIC")
+	}
+	if !strings.Contains(err.Error(), `"eth0"`) {
+		t.Errorf("the refusal does not name the port it found:\n%v", err)
+	}
+
+	// Before any activation, which is the whole value of the check that runs
+	// there: ipv4.method shared is written to the profile by then, and
+	// bringing it up is what applies it to the device.
+	for _, line := range h.lines() {
+		if strings.HasPrefix(line, "nmcli connection up") {
+			t.Errorf("a connection was activated over a master carrying a host NIC: %s", line)
+		}
+	}
+	uid := testUID(t)
+	want := append([]string{}, sharedSequence(uid)[:4]...)
+	want = append(want, refusalTail()...)
+	assertSequence(t, h.lines(), want)
+	if st.Network.Mode != "" || st.Network.CreatedByKairosLab {
+		t.Errorf("state was written for a run that was refused: %+v", st.Network)
+	}
+}
+
+// revertSharedSetup's own rule -- "a refusal has to leave the host no more
+// dangerous than it found it" -- applied to the exits that are not refusals.
+//
+// `nmcli connection modify <bridge> ... ipv4.method shared` persists that
+// setting to a keyfile the moment it returns, and four steps run after it.
+// Each one used to return its error bare, leaving the profile on the host:
+// the next time NetworkManager activates it, the device it names runs a DHCP
+// server, IPv4 forwarding and a MASQUERADE rule with no VM anywhere near it.
+//
+// The sharpest of the four is the activation timeout, where nmcli exits
+// non-zero AFTER NetworkManager has already activated the bridge and a
+// foreign profile has put eth0 on it. That case is seeded below as a command
+// that changes the host and then fails, because that is what it does.
+func TestPrepareLinuxSharedRevertsEveryExitAfterTheMethodIsWritten(t *testing.T) {
+	uid := testUID(t)
+	shared := sharedSequence(uid)
+	tests := []struct {
+		name string
+		// failing is the joined argv of the command that fails. The expected
+		// sequence is everything up to and including it, then the revert.
+		failing string
+		// half, when set, is what the failing command did to the host before
+		// it failed.
+		half func(h *fakeHost)
+	}{
+		{
+			name:    "the tap connection cannot be added",
+			failing: shared[2],
+		},
+		{
+			name:    "the tap connection cannot be modified",
+			failing: shared[3],
+		},
+		{
+			name:    "the bridge activation times out after NetworkManager activated it",
+			failing: shared[4],
+			half: func(h *fakeHost) {
+				h.activate(DefaultBridgeName)
+				h.slaves[DefaultBridgeName] = []string{"eth0"}
+			},
+		},
+		{
+			name:    "the tap activation fails",
+			failing: shared[5],
+			half: func(h *fakeHost) {
+				h.activate(DefaultBridgeName)
+			},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			h := newFakeHost(t)
+			h.failCmd = func(argv []string) error {
+				if strings.Join(argv, " ") != tt.failing {
+					return nil
+				}
+				if tt.half != nil {
+					tt.half(h)
+				}
+				return fmt.Errorf("Error: Connection activation failed: Activation failed: timeout")
+			}
+			st := &state.State{}
+
+			err := PrepareLinuxShared(st, t.TempDir())
+			if err == nil {
+				t.Fatalf("PrepareLinuxShared reported success although %q failed", tt.failing)
+			}
+
+			// The revert ran, and the connection carrying ipv4.method shared
+			// is off the host rather than waiting for the next activation.
+			var want []string
+			for _, line := range shared {
+				want = append(want, line)
+				if line == tt.failing {
+					break
+				}
+			}
+			want = append(want, refusalTail()...)
+			assertSequence(t, h.lines(), want)
+			if h.conns[DefaultBridgeName] {
+				t.Error("the connection carrying ipv4.method shared is still on the host after a failed start")
+			}
+			if ports := h.slaves[DefaultBridgeName]; len(ports) != 0 {
+				t.Errorf("%v left on the bridge after a failed start", ports)
+			}
+
+			// And the error says what was done about it, so a user reading
+			// it knows whether anything is still there.
+			for _, wantText := range []string{
+				"ipv4.method shared",
+				"is off this host again",
+			} {
+				if !strings.Contains(err.Error(), wantText) {
+					t.Errorf("the error does not mention %q:\n%v", wantText, err)
+				}
+			}
+			if st.Network.Mode != "" || st.Network.CreatedByKairosLab {
+				t.Errorf("state was written for a run that failed: %+v", st.Network)
+			}
+		})
+	}
+}
+
+// The sibling print of the data quoteNames was written to sanitize.
+//
+// uplinkIface comes from findBridgeSlave, which reads raw `ip -o link show
+// master` output -- the same source, with the same argument: these names
+// passed no validator, and dev_valid_name() bars only an empty name, 15 or
+// more bytes, "." and "..", and any '/', ':' or whitespace. An ESC is none of
+// those. Printed raw, "\x1b[2K\x1b[1G" erases the line the teardown just
+// wrote and returns the cursor to column 1.
+func TestCleanupNMConnectionsQuotesTheInterfaceItReconnects(t *testing.T) {
+	// Assembled from pieces so the literal in this file is not itself a
+	// control byte. 12 bytes, so the kernel would take it.
+	hostile := "eth0" + "\x1b" + "[2K" + "\x1b" + "[1G"
+
+	h := newFakeHost(t)
+	h.conns[DefaultBridgeName] = true
+	h.bridges[DefaultBridgeName] = true
+	h.links[DefaultTapName] = true
+	h.slaves[DefaultBridgeName] = []string{DefaultTapName, hostile}
+	h.failCmd = func(argv []string) error {
+		if len(argv) > 1 && argv[0] == "nmcli" && argv[1] == "device" {
+			return fmt.Errorf("exit status 1")
+		}
+		return nil
+	}
+
+	var err error
+	out := captureStdout(t, func() {
+		err = cleanupNMConnections(DefaultBridgeName, DefaultTapName)
+	})
+	if err == nil {
+		t.Fatal("cleanupNMConnections reported success although the reconnect failed")
+	}
+
+	// Both places the name reaches the terminal: the progress line and the
+	// error the app layer prints in place of "reset complete".
+	for _, where := range []struct{ what, text string }{
+		{"the progress line", out},
+		{"the error", err.Error()},
+	} {
+		if !strings.Contains(where.text, strconv.Quote(hostile)) {
+			t.Errorf("%s does not quote the interface name: %q", where.what, where.text)
+		}
+		if strings.ContainsRune(where.text, '\x1b') {
+			t.Errorf("%s put a raw escape byte on the terminal: %q", where.what, where.text)
+		}
+	}
+}
+
+// captureStdout runs fn with os.Stdout replaced by a pipe and returns what
+// was written to it. cleanupNMConnections prints its progress line with
+// fmt.Printf, which resolves os.Stdout at the call, so this is the only way
+// to see it. The output is one short line and fits the pipe buffer, so
+// nothing has to drain it while fn runs.
+func captureStdout(t *testing.T, fn func()) string {
+	t.Helper()
+	r, w, err := os.Pipe()
+	if err != nil {
+		t.Fatalf("os.Pipe: %v", err)
+	}
+	orig := os.Stdout
+	os.Stdout = w
+	defer func() { os.Stdout = orig }()
+
+	fn()
+
+	if err := w.Close(); err != nil {
+		t.Fatalf("closing the pipe's write end: %v", err)
+	}
+	out, err := io.ReadAll(r)
+	if err != nil {
+		t.Fatalf("reading the captured output: %v", err)
+	}
+	if err := r.Close(); err != nil {
+		t.Fatalf("closing the pipe's read end: %v", err)
+	}
+	return string(out)
+}
+
+// internal/app's consent paragraph says out loud how many times the port list
+// is read, so the number is pinned here rather than described. It said
+// "three times" while the gate in front of the checks was making it zero on
+// whole classes of host.
+//
+// Two on a clean host and three over a device that is already there, and the
+// difference is the pre-activation check: a clean first run has no device of
+// the bridge's name, so there is nothing to read a port list off.
+func TestPrepareLinuxSharedPortListReadCount(t *testing.T) {
+	t.Run("a clean host reads it twice", func(t *testing.T) {
+		h := newFakeHost(t)
+
+		if err := PrepareLinuxShared(&state.State{}, t.TempDir()); err != nil {
+			t.Fatalf("PrepareLinuxShared = %v, want nil", err)
+		}
+		if h.slaveLinksCalls != 2 {
+			t.Errorf("the port list was read %d times, want 2 (after the bridge is up, and after the tap is on it)", h.slaveLinksCalls)
+		}
+	})
+
+	t.Run("a device already there is read three times", func(t *testing.T) {
+		h := newFakeHost(t)
+		// A device of that name with no ports and no connection of ours
+		// beside it, so hasStaleBridgeResources finds nothing and no teardown
+		// runs -- a teardown reads the same probe once more for its reconnect
+		// hint, and that read is not one of the checks this counts.
+		h.links[DefaultBridgeName] = true
+
+		if err := PrepareLinuxShared(&state.State{}, t.TempDir()); err != nil {
+			t.Fatalf("PrepareLinuxShared = %v, want nil", err)
+		}
+		if h.slaveLinksCalls != 3 {
+			t.Errorf("the port list was read %d times, want 3 (once before anything is activated, and once after each `connection up`)", h.slaveLinksCalls)
+		}
+	})
+
+	// And the count the escape produced: a stat that cannot answer used to
+	// take every one of them away.
+	t.Run("an unreadable stat no longer skips them", func(t *testing.T) {
+		h := newFakeHost(t)
+		h.bridges[DefaultBridgeName] = true
+		h.invisibleLinks[DefaultBridgeName] = true
+		h.invisibleBridges[DefaultBridgeName] = &fs.PathError{
+			Op:   "stat",
+			Path: "/sys/class/net/" + DefaultBridgeName,
+			Err:  fs.ErrPermission,
+		}
+
+		if err := PrepareLinuxShared(&state.State{}, t.TempDir()); err == nil {
+			t.Fatal("PrepareLinuxShared completed over a host it could not stat")
+		}
+		// Zero reads here is right and is not the escape: the refusal is the
+		// stat's, and it fires before any port list is worth asking for. The
+		// escape was zero reads followed by a COMPLETED start, which is what
+		// the assertion above forbids.
+		if h.slaveLinksCalls != 0 {
+			t.Errorf("the port list was read %d times after the stat refused, want 0", h.slaveLinksCalls)
+		}
 	})
 }

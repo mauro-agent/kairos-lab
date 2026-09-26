@@ -623,24 +623,29 @@ func runStart(args []string, stdin io.Reader, stdout, stderr io.Writer, store *s
 		//
 		// The parenthesis is a promise about what the next step does, and
 		// vm.PrepareLinuxShared is what keeps it: it reads the bridge's port
-		// list out of the kernel three times -- before anything is
-		// activated, once the bridge is up, and once the tap is on it -- and
-		// refuses the run if the list holds anything it did not expect,
-		// taking the bridge back down and deleting the connections it had
-		// just written rather than leaving a host NIC on a NAT bridge. Until
-		// the tap is activated it expects NO ports at all, so no name out of
-		// state.json is exempt from the check.
+		// list out of the kernel once the bridge is up and again once the tap
+		// is on it, and before either of those as well when a device of the
+		// bridge's name is already on this host -- which a clean first run
+		// has not got, since both connections are written with autoconnect no
+		// and nothing of that name exists until the first activation. It
+		// refuses the run if the list holds anything it did not expect, and
+		// attempts to take the bridge back down and delete the connections it
+		// had just written rather than leave a host NIC on a NAT bridge; the
+		// error it returns says what of that attempt failed. Until the tap is
+		// activated it expects NO ports at all, so no name out of state.json
+		// is exempt from the check.
 		//
 		// Stated no wider than that code states it. What is covered: any
 		// port the kernel reports, whatever profile attached it and whether
 		// the pre-flight's connection probes could see that profile at all;
-		// and a port list that could not be read, which is a refusal there
-		// and not a pass. What is not: an interface attached in the instant
-		// after the last of the three checks returns, and any attached later,
-		// since nothing reads the list again once the VM is running. One
-		// probe there is still trusted to say no -- the /sys stat that asks
-		// whether the bridge exists in the first place, which a host with no
-		// readable /sys answers the same way as a host with no bridge.
+		// a port list that could not be read, which is a refusal there and
+		// not a pass; and the /sys stat that decides whether the check before
+		// the first activation has anything to read at all, where only a
+		// definite "no such file or directory" skips it and every other way
+		// that stat can fail is a refusal too. What is not: an interface
+		// attached in the instant after the last check returns, and any
+		// attached later, since nothing reads the list again once the VM is
+		// running.
 		ok, err := confirm(stdin, stdout, *autoYes, "shared networking needs sudo to prepare a NAT bridge/tap (no uplink interface is used)")
 		if err != nil {
 			return err

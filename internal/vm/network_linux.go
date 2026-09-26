@@ -356,19 +356,31 @@ func prepareLinuxSharedWithNM(bridge, tap string) error {
 	// -- except for autoconnect, which is off here for the reason above: a tap
 	// left to come up on its own at boot brings its controller, and therefore
 	// the DHCP server and the NAT rule, up with it.
+	//
+	// Both steps run with ipv4.method shared already persisted to the bridge
+	// connection, so neither may walk away from its own failure; see
+	// revertAfterSharedWritten.
 	if !nmConnectionExists(tapConn) {
 		if err := sudo("nmcli", "connection", "add", "type", "tun", "ifname", tap, "con-name", tapConn, "mode", "tap", "owner", uid, "master", bridgeConn, "slave-type", "bridge", "autoconnect", "no"); err != nil {
-			return err
+			return revertAfterSharedWritten(bridgeConn, tapConn, err)
 		}
 	}
 	if err := sudo("nmcli", "connection", "modify", tapConn, "connection.interface-name", tap, "tun.mode", "tap", "tun.owner", uid, "master", bridgeConn, "slave-type", "bridge", "connection.autoconnect", "no"); err != nil {
-		return err
+		return revertAfterSharedWritten(bridgeConn, tapConn, err)
 	}
 
-	// The port assertion, made three times: before anything is activated,
-	// once the bridge is up, and once the tap is on it. What it asks the
-	// kernel is which interfaces are ports of this bridge; what it demands is
-	// that none of them is one this start did not put there.
+	// The port assertion. What it asks the kernel is which interfaces are
+	// ports of this bridge; what it demands is that none of them is one this
+	// start did not put there.
+	//
+	// The two calls made after a `connection up` returned success are
+	// unconditional. The one before any activation goes through
+	// refusePreexistingBridgePort, which has a question to settle first: a
+	// clean first run has no device of this name at all -- both connections
+	// above were added with autoconnect no and nothing has activated either
+	// -- and a device that is not on the host has no ports for the probe to
+	// read. So a clean start reads the port list TWICE, and a start that
+	// arrives over a device that is already there reads it three times.
 	//
 	// Before either `connection up` the expected port list is EMPTY. Nothing
 	// has attached the tap yet -- that is the last command in this function
@@ -380,15 +392,15 @@ func prepareLinuxSharedWithNM(bridge, tap string) error {
 	//
 	// A bridge link that got past the preflight can already carry a host NIC:
 	// linkExists answers "no" for any `ip` failure, so the `ip link delete` in
-	// the teardown is skipped while isLinuxBridge, which reads /sys, still says
-	// a bridge is there. The connection profile has just been re-pointed at
-	// ipv4.method shared, so the first of these is the last moment before that
-	// method is applied to a bridge carrying somebody's NIC.
-	if err := refuseForeignBridgePort(bridge, bridgeConn, tapConn, tap, tapNotYetAttached); err != nil {
+	// the teardown is skipped while the device is still in /sys with whatever
+	// was on it still on it. The connection profile has just been re-pointed
+	// at ipv4.method shared, so this is the last moment before that method is
+	// applied to a bridge carrying somebody's NIC.
+	if err := refusePreexistingBridgePort(bridge, bridgeConn, tapConn, tap); err != nil {
 		return err
 	}
 	if err := sudo("nmcli", "connection", "up", bridgeConn); err != nil {
-		return err
+		return revertAfterSharedWritten(bridgeConn, tapConn, err)
 	}
 	// Again now the bridge is up, which is the check that catches the hazard
 	// this mode is guarded against: a profile carrying `master <bridge>
@@ -400,16 +412,18 @@ func prepareLinuxSharedWithNM(bridge, tap string) error {
 		return err
 	}
 	if err := sudo("nmcli", "connection", "up", tapConn); err != nil {
-		return err
+		return revertAfterSharedWritten(bridgeConn, tapConn, err)
 	}
 	// And once more with the tap attached, where the expected port list is
 	// exactly the tap. `nmcli connection up` returns when the connection has
 	// activated, and an interface attached in the instant after that is not
 	// seen by the check before it; this one costs one more `ip` call and
 	// narrows that window to the tap's own activation. It is the only one of
-	// the three that names the tap, and by the time it runs an empty port
-	// list has been established twice, so a port carrying that name here is a
-	// refusal whichever thing it turns out to be.
+	// the three that names the tap, and the exemption it makes is bounded by
+	// the check before it: that one is unconditional and demands an EMPTY
+	// list, so anything on the bridge by now arrived during the tap's own
+	// activation. A port that is not the tap is refused here as at the other
+	// two.
 	//
 	// The window is narrowed and not closed: nothing reads the port list
 	// again once this function returns, and nothing watches it while the VM
@@ -427,6 +441,51 @@ const (
 	tapNotYetAttached = false
 	tapAttached       = true
 )
+
+// refusePreexistingBridgePort is the port assertion made before anything this
+// start created has been activated, where one question has to be settled
+// before the port list is worth asking for: is there a device of this name on
+// the host at all? A clean first run has none -- both connections above are
+// added with autoconnect no, so nothing of that name exists until the
+// explicit `connection up` -- and a device that is not on the host has no
+// ports, so there is no list to read. Putting the question anyway would not
+// be harmless: refuseForeignBridgePort fails closed on a probe error, so
+// every clean first start would be refused.
+//
+// The only answer that skips the check is "no such file or directory". The
+// predicate this replaced was isLinuxBridge, which answers `err == nil` for
+// the same stat, and `err == nil` collapses every way a stat can fail into
+// the one false. Measured against real os.Stat, permission denied on a /sys
+// this user cannot read, ENOTDIR (/sys/class/net is not all directories --
+// bonding_masters is a regular file) and a symlink loop each produced the
+// same false as an absent device does, and that false skipped ALL THREE
+// checks. Each of them refuses now.
+//
+// It asks about the DEVICE and not about /sys/class/net/<name>/bridge,
+// because "is this a Linux bridge" is the wrong question to hang a port check
+// on. `ip -o link show master <dev>` lists the ports of any master -- a bond,
+// a team, a VRF, an OVS bridge -- while that sysfs entry exists only for a
+// Linux bridge, so the narrower question answers "nothing to check here" for
+// a master that exists and has the host's NIC on it. The name comes out of
+// state.json, and validateStoredInterfaceName accepts "bond0" in it. "There
+// is no device of this name" is the only fact that implies "no ports", and it
+// is the fact this asks for.
+func refusePreexistingBridgePort(bridge, bridgeConn, tapConn, tap string) error {
+	exists, err := netDeviceExists(bridge)
+	if err != nil {
+		return fmt.Errorf("shared networking will not start over bridge %s, because this start could not tell whether a device of that name is already on this host: %w. "+
+			"That is what decides whether the bridge's port list has to be read before anything is activated, and the reason to read it is that a device already there -- left by an earlier run, or never ours at all -- can already have a host interface attached to it. ipv4.method shared has just been written to connection %s, and bringing that connection up is what puts a DHCP server, IPv4 forwarding and a MASQUERADE rule on whatever the device is carrying. "+
+			"The only answer that means \"no such device, and therefore no ports\" is \"no such file or directory\". Anything else is a question left unanswered, and shared mode's promise is not one this start may make unchecked. "+
+			"`ls -ld /sys/class/net/ /sys/class/net/%s` shows what could not be read; a /sys that is not mounted, or not readable by this user, is the usual cause. "+
+			"%s. "+
+			"Or use -network bridged, which attaches an interface to a bridge on purpose, or -network user, which builds no bridge at all",
+			bridge, err, bridgeConn, bridge, revertSharedSetup(bridgeConn, tapConn))
+	}
+	if !exists {
+		return nil
+	}
+	return refuseForeignBridgePort(bridge, bridgeConn, tapConn, tap, tapNotYetAttached)
+}
 
 // refuseForeignBridgePort enforces the invariant shared mode exists for: the
 // only port this bridge ever has is the tap, and it has none at all until the
@@ -451,14 +510,13 @@ const (
 // unenforced for good on whole classes of machine -- while the port list is
 // the only thing enforcing it.
 //
-// The one thing still read as "no ports" without asking `ip` is a bridge that
-// is not there. isLinuxBridge stats /sys/class/net/<bridge>/bridge, and on a
-// clean host this runs before anything has been activated, so no device of
-// that name exists yet and the probe would fail saying exactly that. A stat
-// that answers "no" for some other reason -- a host with no readable /sys --
-// takes a start past this check, and that is the last fail-open here. It is a
-// narrower one than the probe's: it needs the bridge's own sysfs entry to be
-// unreadable, not merely `ip` to be unusable.
+// Nothing here is gated on the bridge existing. Two of the three call sites
+// ask after `nmcli connection up <bridge>` has returned success, and the
+// device's existence is established by that success, so a probe that cannot
+// answer at either of those points is a probe failure and never an absent
+// bridge. The third asks before any activation and goes through
+// refusePreexistingBridgePort, which settles that question first and carries
+// on to this function unless the answer is a definite no.
 //
 // Both refusals hand the host back the way they found it, as far as they can;
 // see revertSharedSetup. The profile that did the attaching is left alone: it
@@ -466,15 +524,12 @@ const (
 // configuration on their behalf is the failure mode this whole path exists to
 // avoid.
 func refuseForeignBridgePort(bridge, bridgeConn, tapConn, tap string, tapIsAttached bool) error {
-	if !isLinuxBridge(bridge) {
-		return nil
-	}
 	out, err := bridgeSlaveLinks(bridge)
 	if err != nil {
 		return fmt.Errorf("shared networking will not start over bridge %s, because the check that nothing is attached to it could not be run: `ip -o link show master %s` failed: %w. "+
-			"The bridge exists on this host, so the question is a real one and this start could not answer it. Shared mode's promise is that no host interface is a port of its bridge -- that is what the consent prompt says, and ipv4.method shared is what makes getting it wrong expensive -- so a port list that cannot be read is a refusal and not a pass. "+
+			"A device of that name is on this host, so the question is a real one and this start could not answer it. Shared mode's promise is that no host interface is a port of its bridge -- that is what the consent prompt says, and ipv4.method shared is what makes getting it wrong expensive -- so a port list that cannot be read is a refusal and not a pass. "+
 			"`ip` may not be on PATH at all; it may be busybox's `ip`, which has no `show master` filter; or it may be an iproute2 older than that filter. `ip -V` says which. "+
-			"The same list is in `ls /sys/class/net/%s/brif`, which needs none of them: if it names an interface of yours, something is attaching that interface to this bridge; if it is empty, `sudo ip link delete %s` removes the leftover bridge and the next start builds its own. "+
+			"The same list is in `ls /sys/class/net/%s/brif` when that device is a Linux bridge, and that needs none of them: if it names an interface of yours, something is attaching that interface to this bridge; if it is empty, `sudo ip link delete %s` removes the leftover device and the next start builds its own. "+
 			"%s. "+
 			"Or use -network bridged, which attaches an interface to a bridge on purpose, or -network user, which builds no bridge at all",
 			bridge, bridge, err, bridge, bridge, revertSharedSetup(bridgeConn, tapConn))
@@ -507,33 +562,74 @@ func refuseForeignBridgePort(bridge, bridgeConn, tapConn, tap string, tapIsAttac
 		bridge, bridge, quoteNames(unexpected), expectation, bridge, bridge, revertSharedSetup(bridgeConn, tapConn))
 }
 
+// revertAfterSharedWritten turns a failure from one of the steps that run
+// after `nmcli connection modify <bridge> ... ipv4.method shared` returned
+// into an error that also says what was done about it.
+//
+// revertSharedSetup states the rule -- a start that does not finish has to
+// leave the host no more dangerous than it found it -- and it is not only the
+// refusals' rule. That method is in a NetworkManager keyfile the moment the
+// modify returns, so any exit past it that simply returns its error leaves a
+// persisted NAT-bridge profile behind. The next thing to activate that
+// connection, which a profile carrying `master <bridge> slave-type bridge`
+// with autoconnect on does by itself, puts its interface on a bridge running
+// a DHCP server, IPv4 forwarding and a MASQUERADE rule with no VM anywhere
+// near it. The activation timeout is the sharpest of these: nmcli exits
+// non-zero AFTER NetworkManager has brought the bridge up, so the profile is
+// persisted and the device is live.
+//
+// Not every caller has reached the point of creating the tap connection, and
+// `nmcli connection delete` on a name that is not there fails.
+// revertSharedSetup reports that as a failed delete rather than hiding it,
+// which costs a clause in the message and keeps it from claiming more than
+// happened.
+//
+// The modify itself is deliberately NOT wrapped in this. A modify that failed
+// wrote nothing, and the bridge connection it names may be one that predates
+// this start, so reverting there would delete a user's profile over a command
+// that changed nothing.
+func revertAfterSharedWritten(bridgeConn, tapConn string, cause error) error {
+	return fmt.Errorf("shared networking setup failed after ipv4.method shared had already been written to connection %s: %w. "+
+		"That setting is persisted as soon as nmcli returns, so this start tried to take it back off the host rather than leave it for the next thing that activates that connection: %s",
+		bridgeConn, cause, revertSharedSetup(bridgeConn, tapConn))
+}
+
 // revertSharedSetup undoes what prepareLinuxSharedWithNM has already done to
 // this host, and returns a sentence saying what it attempted and what of that
-// failed. Both refusals above call it before returning their error.
+// failed. Every exit past the modify that writes ipv4.method shared reaches
+// it: the three refusals above call it directly, and the four steps that can
+// fail after that modify returned call it through revertAfterSharedWritten.
 //
-// Deactivating is not reverting. By the time any of those checks runs,
+// Deactivating is not reverting. By the time any of those runs,
 // `nmcli connection modify <bridge> ... ipv4.method shared` has returned and
-// NetworkManager has written that to a keyfile, so a refusal that only took
-// the connection down would walk away leaving a persisted NAT-bridge profile
+// NetworkManager has written that to a keyfile, so an exit that only took the
+// connection down would walk away leaving a persisted NAT-bridge profile
 // behind -- and a refusal fires precisely when something else is attaching an
 // interface to that bridge, ordinarily a profile with autoconnect on. The
 // next time that interface comes up, NetworkManager activates its controller,
 // and the interface lands on a bridge running a DHCP server, IPv4 forwarding
 // and a MASQUERADE rule, with no VM anywhere near it. A refusal has to leave
-// the host no more dangerous than it found it.
+// the host no more dangerous than it found it, and so does a failure.
 //
 // The down comes first, even though deleting a connection deactivates it too,
 // because it is the step that releases the interface and it is worth having
 // happened even when the delete after it fails.
 //
-// The deletes are unconditional rather than gated on nmConnectionExists.
-// Both connections were modified successfully a few lines above, which is how
-// this knows they are there -- a better answer than a probe that reports
-// "does not exist" for any nmcli exit it dislikes. Deleting is more than
-// restoring, for a bridge connection that predates this start: what its
-// settings were is recorded nowhere, and what this start overwrote cannot be
-// put back. What goes is a profile named after the bridge in state.json,
-// which is the same profile every teardown in this file deletes.
+// The deletes are unconditional rather than gated on nmConnectionExists,
+// which reports "does not exist" for any nmcli exit it dislikes and would
+// skip the delete that matters on exactly the hosts this path is defending.
+// What the callers know instead is that the bridge connection was modified
+// successfully, since that modify is what put ipv4.method shared on this host
+// and is what makes a revert owed at all. The tap connection is a different
+// case: the earliest caller runs at a point where it may never have been
+// added, and a delete of a name that is not there fails and is reported below
+// as a failed delete rather than hidden.
+//
+// Deleting is more than restoring, for a bridge connection that predates this
+// start: what its settings were is recorded nowhere, and what this start
+// overwrote cannot be put back. What goes is a profile named after the bridge
+// in state.json, which is the same profile every teardown in this file
+// deletes.
 func revertSharedSetup(bridgeConn, tapConn string) string {
 	notes := make([]string, 0, 4)
 	if err := sudo("nmcli", "connection", "down", bridgeConn); err != nil {
@@ -691,10 +787,19 @@ func cleanupNMConnections(bridgeConn, tapName string) error {
 
 	// Reconnect the physical interface (NM connections are gone, so this
 	// will use a fresh/default connection, not the bridge slave profile)
+	//
+	// %q on both, for the reason quoteNames gives: uplinkIface came out of
+	// `ip -o link show master` through findBridgeSlave and passed no
+	// validator on the way, while the bridge and tap names either side of it
+	// went through validateStoredInterfaceName. dev_valid_name() bars only an
+	// empty name, IFNAMSIZ bytes or more, "." and "..", and any '/', ':' or
+	// whitespace, so an interface really can be named with a raw ESC in it --
+	// and both of these go straight to a terminal, where "\x1b[2K\x1b[1G"
+	// erases the line just written and returns the cursor to column 1.
 	if uplinkIface != "" {
-		fmt.Printf("Reconnecting %s...\n", uplinkIface)
+		fmt.Printf("Reconnecting %q...\n", uplinkIface)
 		if err := sudo("nmcli", "device", "connect", uplinkIface); err != nil {
-			failures = append(failures, fmt.Errorf("reconnect %s: %w", uplinkIface, err))
+			failures = append(failures, fmt.Errorf("reconnect %q: %w", uplinkIface, err))
 		}
 	}
 
@@ -821,6 +926,51 @@ var isLinuxBridge = func(name string) bool {
 	}
 	_, err := os.Stat(filepath.Join("/sys/class/net", name, "bridge"))
 	return err == nil
+}
+
+// statNetDevice stats a name's entry in /sys/class/net and returns whatever
+// that stat said. It is the swappable seam, and like sudo and bridgeSlaveLinks
+// it holds no branch of its own: the classification of the error is the whole
+// point of the fix it belongs to, and a seam that contained it would be a
+// decision the tests replace instead of run. The question is about the device
+// directory and not the "bridge" entry underneath it; see netDeviceExists.
+var statNetDevice = func(name string) error {
+	_, err := os.Stat(filepath.Join("/sys/class/net", name))
+	return err
+}
+
+// netDeviceExists answers whether a network device of this name is on the
+// host, and hands back the stat's error when it cannot tell.
+//
+// It is the honest form of the question isLinuxBridge above answers as a bare
+// bool. There, `err == nil` makes an unreadable /sys indistinguishable from a
+// device that is not there; both of that function's callers want the
+// fail-open reading of that -- hasStaleBridgeResources is looking for a
+// reason to run a cleanup, and cleanupNMConnections for an interface to
+// reconnect -- and the refusal that gates a root-run network reconfiguration
+// does not. So the error is returned rather than swallowed, and
+// refusePreexistingBridgePort decides what to do with it.
+//
+// Only os.ErrNotExist is a definite no, and it is a strong one: a device that
+// is not in /sys/class/net is not on the host, so it has no ports and there
+// is nothing to check. Every other stat failure is the absence of an answer.
+// Asking about the device rather than about /sys/class/net/<name>/bridge is
+// what makes the "no" mean what this needs it to mean: a bond, a team, a VRF
+// and an OVS bridge are all masters whose ports `ip -o link show master`
+// lists, and that "bridge" entry is a Linux bridge's -- which is the premise
+// isLinuxBridge above is built on, and the reason it cannot carry this.
+func netDeviceExists(name string) (bool, error) {
+	if name == "" {
+		return false, errors.New("no interface name to look for")
+	}
+	switch err := statNetDevice(name); {
+	case err == nil:
+		return true, nil
+	case errors.Is(err, os.ErrNotExist):
+		return false, nil
+	default:
+		return false, err
+	}
 }
 
 func detectDefaultUplink() (string, error) {
