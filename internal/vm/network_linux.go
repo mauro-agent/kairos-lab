@@ -453,13 +453,24 @@ const (
 // every clean first start would be refused.
 //
 // The only answer that skips the check is "no such file or directory". The
-// predicate this replaced was isLinuxBridge, which answers `err == nil` for
-// the same stat, and `err == nil` collapses every way a stat can fail into
-// the one false. Measured against real os.Stat, permission denied on a /sys
-// this user cannot read, ENOTDIR (/sys/class/net is not all directories --
-// bonding_masters is a regular file) and a symlink loop each produced the
-// same false as an absent device does, and that false skipped ALL THREE
-// checks. Each of them refuses now.
+// predicate this replaced was isLinuxBridge, whose whole body is
+// `err == nil`, and that collapses every way a stat can fail into the one
+// false an absent device gets -- which skipped ALL THREE checks. Each of
+// them refuses now.
+//
+// It is not the same stat, and the difference decides which failures are
+// live. isLinuxBridge stats /sys/class/net/<name>/bridge; netDeviceExists
+// stats /sys/class/net/<name>, for the reason the next paragraph gives. So
+// the standing ENOTDIR example does not carry over: measured on a real host,
+// /sys/class/net/bonding_masters is a regular file, which makes
+// bonding_masters/bridge ENOTDIR under the old path and bonding_masters
+// itself a clean "exists" under this one -- after which the port check runs
+// and refuses, because `ip` has no port list for a name that is not a device
+// and refuseForeignBridgePort fails closed on that. Under the device path
+// ENOTDIR needs /sys/class/net itself to be a non-directory, and a symlink
+// loop is not reachable in sysfs. The class this refusal actually covers is
+// permission denied: a /sys/class/net this user cannot read answers EACCES
+// for every name in it, and answered isLinuxBridge's false before.
 //
 // It asks about the DEVICE and not about /sys/class/net/<name>/bridge,
 // because "is this a Linux bridge" is the wrong question to hang a port check
@@ -476,7 +487,7 @@ func refusePreexistingBridgePort(bridge, bridgeConn, tapConn, tap string) error 
 		return fmt.Errorf("shared networking will not start over bridge %s, because this start could not tell whether a device of that name is already on this host: %w. "+
 			"That is what decides whether the bridge's port list has to be read before anything is activated, and the reason to read it is that a device already there -- left by an earlier run, or never ours at all -- can already have a host interface attached to it. ipv4.method shared has just been written to connection %s, and bringing that connection up is what puts a DHCP server, IPv4 forwarding and a MASQUERADE rule on whatever the device is carrying. "+
 			"The only answer that means \"no such device, and therefore no ports\" is \"no such file or directory\". Anything else is a question left unanswered, and shared mode's promise is not one this start may make unchecked. "+
-			"`ls -ld /sys/class/net/ /sys/class/net/%s` shows what could not be read; a /sys that is not mounted, or not readable by this user, is the usual cause. "+
+			"`ls -ld /sys/class/net/ /sys/class/net/%s` shows what could not be read; a /sys/class/net this user cannot read is the cause that reaches this message. "+
 			"%s. "+
 			"Or use -network bridged, which attaches an interface to a bridge on purpose, or -network user, which builds no bridge at all",
 			bridge, err, bridgeConn, bridge, revertSharedSetup(bridgeConn, tapConn))
@@ -794,8 +805,15 @@ func cleanupNMConnections(bridgeConn, tapName string) error {
 	// went through validateStoredInterfaceName. dev_valid_name() bars only an
 	// empty name, IFNAMSIZ bytes or more, "." and "..", and any '/', ':' or
 	// whitespace, so an interface really can be named with a raw ESC in it --
-	// and both of these go straight to a terminal, where "\x1b[2K\x1b[1G"
-	// erases the line just written and returns the cursor to column 1.
+	// and it goes straight to a terminal, where "\x1b[2K\x1b[1G" erases the
+	// line just written and returns the cursor to column 1.
+	//
+	// Three paths carry this value there, not the two escaped on these
+	// lines. The third is inside the %w: sudoError builds its message from
+	// the same argv this name is a word of, so the wrap below used to print
+	// one escaped copy and one raw copy of it in a single string. That copy
+	// is renderArgv's to escape, and escaping it here would not have
+	// reached it.
 	if uplinkIface != "" {
 		fmt.Printf("Reconnecting %q...\n", uplinkIface)
 		if err := sudo("nmcli", "device", "connect", uplinkIface); err != nil {
@@ -886,13 +904,16 @@ func findBridgeSlave(bridge, tap string) string {
 // sudo, bridgeSlaveLinks above it and the host probes further down this file
 // are package-level vars rather than plain functions so network_linux_test.go
 // can swap them for in-process fakes and assert the exact argv sequence these
-// paths hand to root. Each is one exec call, its result and, in
-// bridgeSlaveLinks, the wording of the error that call failed with -- no
-// branch any caller depends on. So what a fake replaces is the subprocess and
-// never a decision: findBridgeSlave, which decides which interface a teardown
-// reconnects, is a plain function for that reason, and so is
-// refuseForeignBridgePort, which decides what the port list means. Nothing in
-// production assigns these; the tests restore the originals with t.Cleanup.
+// paths hand to root. Each is one exec call and its result -- no branch, no
+// path and no wording any caller depends on. So what a fake replaces is the
+// subprocess and never a decision: findBridgeSlave, which decides which
+// interface a teardown reconnects, is a plain function for that reason, and
+// so are refuseForeignBridgePort, which decides what the port list means,
+// sudoError below, which words the failure every caller of sudo wraps, and
+// netDevicePath, which decides WHICH path the device stat asks about.
+// bridgeSlaveLinks is the one that still words its own error, and it is
+// worded from bytes the subprocess produced. Nothing in production assigns
+// these; the tests restore the originals with t.Cleanup.
 var sudo = func(name string, args ...string) error {
 	argv := append([]string{name}, args...)
 	cmd := exec.Command("sudo", argv...)
@@ -900,9 +921,20 @@ var sudo = func(name string, args ...string) error {
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
 	if err := cmd.Run(); err != nil {
-		return fmt.Errorf("sudo command failed: sudo %s: %w", strings.Join(argv, " "), err)
+		return sudoError(argv, err)
 	}
 	return nil
+}
+
+// sudoError is the error a failed root command reports. It is a plain
+// function outside the var above because it is not part of the subprocess:
+// it is the wording every caller of sudo wraps its own message around, and a
+// fake that returned its failure bare would leave that wording unexercised.
+// network_linux_test.go's fake host calls this for the same reason it calls
+// the real parse -- so the message a test measures is the message a user
+// gets.
+func sudoError(argv []string, err error) error {
+	return fmt.Errorf("sudo command failed: sudo %s: %w", renderArgv(argv), err)
 }
 
 func IsPathGone(path string) bool {
@@ -924,26 +956,48 @@ var isLinuxBridge = func(name string) bool {
 	if runtime.GOOS != "linux" || name == "" {
 		return false
 	}
-	_, err := os.Stat(filepath.Join("/sys/class/net", name, "bridge"))
+	_, err := os.Stat(filepath.Join(sysClassNet, name, "bridge"))
 	return err == nil
 }
 
-// statNetDevice stats a name's entry in /sys/class/net and returns whatever
-// that stat said. It is the swappable seam, and like sudo and bridgeSlaveLinks
-// it holds no branch of its own: the classification of the error is the whole
-// point of the fix it belongs to, and a seam that contained it would be a
-// decision the tests replace instead of run. The question is about the device
-// directory and not the "bridge" entry underneath it; see netDeviceExists.
-var statNetDevice = func(name string) error {
-	_, err := os.Stat(filepath.Join("/sys/class/net", name))
+// sysClassNet is the directory the kernel lists network devices in. A device
+// named N is on this host exactly when /sys/class/net/N is there, whatever
+// kind of device it is; the "bridge" entry isLinuxBridge stats one level
+// further down exists only for a Linux bridge.
+const sysClassNet = "/sys/class/net"
+
+// netDevicePath returns the /sys entry whose presence answers "is a device of
+// this name on this host".
+//
+// The join is out here, in production code a test can call, and not inside
+// statNetDevice below, because the PATH is the decision and the stat is not.
+// Every test swaps that var, so a path built inside it is a path no test ever
+// executes: appending "bridge" to it -- reinstating the predicate the device
+// stat replaced, which answers "not there" for a bond, a team, a VRF or an
+// OVS bridge that is very much there with the host's NIC on it -- left the
+// entire suite green. The seam is handed a finished path now, and
+// TestNetDeviceExistsStatsTheDeviceEntry reads it.
+func netDevicePath(name string) string {
+	return filepath.Join(sysClassNet, name)
+}
+
+// statNetDevice stats an already-built path and returns whatever that stat
+// said. It is the swappable seam, and like sudo and bridgeSlaveLinks it holds
+// nothing a caller depends on: not the classification of the error, which is
+// the whole point of the fix it belongs to and is netDeviceExists's, and not
+// the path, which is netDevicePath's. Either one inside here would be a
+// decision the tests replace instead of run.
+var statNetDevice = func(path string) error {
+	_, err := os.Stat(path)
 	return err
 }
 
 // netDeviceExists answers whether a network device of this name is on the
 // host, and hands back the stat's error when it cannot tell.
 //
-// It is the honest form of the question isLinuxBridge above answers as a bare
-// bool. There, `err == nil` makes an unreadable /sys indistinguishable from a
+// It is the honest form of the decision isLinuxBridge above used to carry as
+// a bare bool -- a different path, asked in a different shape. There,
+// `err == nil` makes an unreadable /sys/class/net indistinguishable from a
 // device that is not there; both of that function's callers want the
 // fail-open reading of that -- hasStaleBridgeResources is looking for a
 // reason to run a cleanup, and cleanupNMConnections for an interface to
@@ -954,6 +1008,15 @@ var statNetDevice = func(name string) error {
 // Only os.ErrNotExist is a definite no, and it is a strong one: a device that
 // is not in /sys/class/net is not on the host, so it has no ports and there
 // is nothing to check. Every other stat failure is the absence of an answer.
+//
+// A /sys that is not mounted lands on the definite no, and that is why it is
+// written down here and not in refusePreexistingBridgePort's message: /sys is
+// then an empty mount point, the stat walks into a missing /sys/class and
+// returns ENOENT -- measured -- exactly as it does for a name no device has,
+// so that refusal is never printed for it. The start proceeds instead, into
+// the two port checks prepareLinuxSharedWithNM makes unconditionally after
+// each `connection up`, both of which refuse when their probe fails.
+//
 // Asking about the device rather than about /sys/class/net/<name>/bridge is
 // what makes the "no" mean what this needs it to mean: a bond, a team, a VRF
 // and an OVS bridge are all masters whose ports `ip -o link show master`
@@ -963,7 +1026,7 @@ func netDeviceExists(name string) (bool, error) {
 	if name == "" {
 		return false, errors.New("no interface name to look for")
 	}
-	switch err := statNetDevice(name); {
+	switch err := statNetDevice(netDevicePath(name)); {
 	case err == nil:
 		return true, nil
 	case errors.Is(err, os.ErrNotExist):

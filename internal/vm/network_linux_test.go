@@ -74,14 +74,19 @@ type fakeHost struct {
 	// for, and without this field the fake cannot produce it.
 	invisibleLinks map[string]bool
 	// invisibleBridges are devices the /sys stat cannot be asked about: it
-	// fails with something other than "no such file or directory". Measured
-	// against real os.Stat, that covers permission denied on a /sys that is
-	// not readable, ENOTDIR (/sys/class/net/bonding_masters is a regular
-	// file, so the "bridge" under it is not a directory entry), and a symlink
-	// loop. Every one of those makes isLinuxBridge answer false, which is the
-	// same answer it gives for a device that is not there -- and that is the
-	// pair netDeviceExists exists to tell apart. The value is the error the
-	// stat failed with, because which error it is decides the answer.
+	// fails with something other than "no such file or directory". The stat
+	// in question is os.Stat("/sys/class/net/<name>") -- the DEVICE entry,
+	// not the "bridge" entry one level under it -- and on a real host the
+	// failure that path produces is permission denied, on a /sys/class/net
+	// this user cannot read. ENOTDIR would need /sys/class/net itself to be
+	// a non-directory, and a symlink loop is not reachable in sysfs;
+	// bonding_masters, the usual ENOTDIR example, is a regular file sitting
+	// DIRECTLY in /sys/class/net, so only the old <name>/bridge path ever saw
+	// ENOTDIR for it. Every one of these makes isLinuxBridge answer false,
+	// which is the same answer it gives for a device that is not there -- and
+	// that is the pair netDeviceExists exists to tell apart. The value is the
+	// error the stat failed with, because which error it is decides the
+	// answer.
 	invisibleBridges map[string]error
 	// slaveLinksCalls counts how many times the port list was read. The
 	// number is a claim internal/app's consent paragraph makes out loud, so
@@ -156,14 +161,25 @@ func newFakeHost(t *testing.T) *fakeHost {
 	// fs.ErrNotExist for one that is not, and whatever invisibleBridges says
 	// when the stat itself cannot answer. Only the raw result is faked; the
 	// classification of it is netDeviceExists's and runs for real here.
-	statNetDevice = func(name string) error {
+	statNetDevice = func(path string) error {
+		// The seam is handed a finished path, so the fake maps it back to
+		// the name its tables are keyed by -- and says so loudly when it
+		// cannot. Anything other than one entry directly under
+		// /sys/class/net means netDevicePath stopped asking "is a device of
+		// this name on the host", which is the question the refusal is built
+		// on; without this the suite went green over exactly that change.
+		name := strings.TrimPrefix(path, sysClassNet+"/")
+		if name == path || name == "" || strings.Contains(name, "/") {
+			t.Errorf("the device stat was handed %q, which is not one device's entry under %s", path, sysClassNet)
+			return &fs.PathError{Op: "stat", Path: path, Err: fs.ErrNotExist}
+		}
 		if err := h.invisibleBridges[name]; err != nil {
 			return err
 		}
-		if name != "" && (h.links[name] || h.bridges[name]) {
+		if h.links[name] || h.bridges[name] {
 			return nil
 		}
-		return &fs.PathError{Op: "stat", Path: "/sys/class/net/" + name, Err: fs.ErrNotExist}
+		return &fs.PathError{Op: "stat", Path: path, Err: fs.ErrNotExist}
 	}
 	linkExists = func(name string) bool {
 		return name != "" && !h.invisibleLinks[name] && (h.links[name] || h.bridges[name])
@@ -183,8 +199,17 @@ func (h *fakeHost) run(name string, args ...string) error {
 	h.commands = append(h.commands, argv)
 	if h.failCmd != nil {
 		if err := h.failCmd(argv); err != nil {
+			// Wrapped the way the real sudo wraps it, and not returned
+			// bare. What failCmd supplies is the subprocess's failure --
+			// `exit status 1` -- and what a caller of sudo actually
+			// receives is that failure inside sudoError's message, which
+			// carries a SECOND copy of the argv. A fake that skipped the
+			// wrapper made every test that reads a teardown error measure
+			// a message no user is ever shown, and hid the copy of the
+			// interface name that message puts on the terminal.
+			//
 			// Not applied: a command that failed changed nothing.
-			return err
+			return sudoError(argv, err)
 		}
 	}
 	h.apply(argv)
@@ -1841,8 +1866,23 @@ func TestCleanupNMConnectionsRefusesAMalformedStoredTapName(t *testing.T) {
 //	gone      err == nil is false   -- no such file or directory
 //
 // Only the last of those means "no such device, therefore no ports", and it
-// is the only one that may skip the check. The ENOTDIR row is live on a real
-// /sys today: /sys/class/net/bonding_masters is a regular file.
+// is the only one that may skip the check.
+//
+// The rows below are those classes against the stat that replaced it, which
+// asks about /sys/class/net/<name> and not about the "bridge" entry under
+// it, and the path decides which of them a host really produces. Permission
+// denied is the live one: a /sys/class/net this user cannot read answers
+// EACCES for every name in it. ENOTDIR and ELOOP are here because the rule
+// is "anything that is not ENOENT refuses" and the rule is what is being
+// pinned, not a catalogue of today's kernels -- under the device path
+// ENOTDIR needs /sys/class/net itself to be a non-directory, and a symlink
+// loop is not reachable in sysfs. /sys/class/net/bonding_masters, the
+// standing ENOTDIR example, is not one of these at all: it is a regular file
+// directly in /sys/class/net, so the OLD path stats bonding_masters/bridge
+// and gets ENOTDIR while this one stats bonding_masters itself and gets a
+// clean "exists", after which the port check runs and refuses: `ip` has no
+// port list for a name that is not a device, and refuseForeignBridgePort
+// fails closed on a probe error.
 //
 // The host below is the sharpest form of it. `ip` works perfectly, eth0 is
 // already a port of the bridge, and the stat is the only thing that cannot
@@ -1903,6 +1943,48 @@ func TestPrepareLinuxSharedRefusesWhenTheBridgeStatCannotAnswer(t *testing.T) {
 				t.Errorf("state was written for a run that was refused: %+v", st.Network)
 			}
 		})
+	}
+}
+
+// The path the device stat is given is the security decision, so it is
+// pinned here rather than left to the seam every other test replaces.
+//
+// It used to be built inside statNetDevice. Changing the join there to
+// filepath.Join("/sys/class/net", name, "bridge") -- the predicate the
+// device stat was introduced to replace, and one that answers "not there"
+// for a bond, a team, a VRF or an OVS bridge that IS there with the host's
+// NIC on it -- left the whole suite green, because no test runs the body of
+// that var. The join lives in netDevicePath now, and these two assertions
+// are what fail when it moves: the first reads the path the production
+// caller actually hands the seam, the second spells the literal out so the
+// expectation cannot drift with the code it describes.
+func TestNetDeviceExistsStatsTheDeviceEntry(t *testing.T) {
+	orig := statNetDevice
+	t.Cleanup(func() { statNetDevice = orig })
+
+	var statted []string
+	statNetDevice = func(path string) error {
+		statted = append(statted, path)
+		return nil
+	}
+
+	exists, err := netDeviceExists(DefaultBridgeName)
+	if err != nil {
+		t.Fatalf("netDeviceExists = %v, want nil", err)
+	}
+	if !exists {
+		t.Fatal("netDeviceExists answered false for a stat that succeeded")
+	}
+	want := []string{"/sys/class/net/" + DefaultBridgeName}
+	if !slices.Equal(statted, want) {
+		t.Errorf("the stat was asked about %q, want %q -- anything else is a different question than \"is a device of this name on the host\"", statted, want)
+	}
+
+	// A bond master is the case the device entry exists for: it is in
+	// /sys/class/net, `ip -o link show master` lists its ports, and it has no
+	// "bridge" entry under it at all.
+	if got := netDevicePath("bond0"); got != "/sys/class/net/bond0" {
+		t.Errorf("netDevicePath(%q) = %q, want %q", "bond0", got, "/sys/class/net/bond0")
 	}
 }
 
@@ -2090,6 +2172,24 @@ func TestPrepareLinuxSharedRevertsEveryExitAfterTheMethodIsWritten(t *testing.T)
 // more bytes, "." and "..", and any '/', ':' or whitespace. An ESC is none of
 // those. Printed raw, "\x1b[2K\x1b[1G" erases the line the teardown just
 // wrote and returns the cursor to column 1.
+//
+// THREE copies of that name reach a terminal, not two: the progress line,
+// the `reconnect %q` wrap, and the argv inside the error that wrap wraps,
+// which is the one a reader of that line does not see coming. The third is
+// only measurable here because the fake host wraps its failures with
+// sudoError, exactly as the real sudo does. While it returned failCmd's
+// error bare, this test passed over production code that put a raw ESC on
+// the terminal: the assertion read
+//
+//	reconnect "eth0\x1b[2K\x1b[1G": exit status 1
+//
+// where the message a user got was
+//
+//	reconnect "eth0\x1b[2K\x1b[1G": sudo command failed: sudo nmcli device
+//	connect <ESC>[2K<ESC>[1G: exit status 1
+//
+// A fake that differs from production in the very byte under test certifies
+// the fake. It does not differ now.
 func TestCleanupNMConnectionsQuotesTheInterfaceItReconnects(t *testing.T) {
 	// Assembled from pieces so the literal in this file is not itself a
 	// control byte. 12 bytes, so the kernel would take it.
@@ -2127,6 +2227,13 @@ func TestCleanupNMConnectionsQuotesTheInterfaceItReconnects(t *testing.T) {
 		if strings.ContainsRune(where.text, '\x1b') {
 			t.Errorf("%s put a raw escape byte on the terminal: %q", where.what, where.text)
 		}
+	}
+
+	// And specifically the copy inside the wrapped error: the argv sudoError
+	// renders, which no %q at the call site above it can reach.
+	wantCmd := "sudo nmcli device connect " + strconv.Quote(hostile)
+	if !strings.Contains(err.Error(), wantCmd) {
+		t.Errorf("the error does not name the command that failed with its argument escaped:\nwant %s\n got %q", wantCmd, err.Error())
 	}
 }
 

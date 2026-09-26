@@ -438,6 +438,85 @@ func TestQuoteNames(t *testing.T) {
 	}
 }
 
+// renderArgv is the render boundary for the command line inside a failed
+// root command's error, and it exists because %q on the CALLER's copy of an
+// interface name leaves the copy inside the wrapped error raw. Both copies
+// end up in one string on one terminal.
+//
+// The rule is planValue's: a word whose runes are all printable is left
+// alone, so an ordinary failure still reads back as the command that failed.
+func TestRenderArgv(t *testing.T) {
+	tests := []struct {
+		name string
+		argv []string
+		want string
+	}{
+		{name: "nothing", argv: nil, want: ""},
+		{
+			name: "an ordinary teardown command is untouched",
+			argv: []string{"nmcli", "connection", "delete", "kairoslab0"},
+			want: "nmcli connection delete kairoslab0",
+		},
+		{
+			name: "an ordinary link delete is untouched",
+			argv: []string{"ip", "link", "delete", "kairoslab-tap0"},
+			want: "ip link delete kairoslab-tap0",
+		},
+		{
+			// The name the teardown reconnects: straight out of `ip -o link
+			// show master`, through no validator.
+			name: "a control byte in an interface name",
+			argv: []string{"nmcli", "device", "connect", "eth0" + "\x1b" + "[2K"},
+			want: `nmcli device connect "eth0\x1b[2K"`,
+		},
+		{
+			name: "a newline in an interface name",
+			argv: []string{"nmcli", "device", "connect", "eth0\nwlan0"},
+			want: `nmcli device connect "eth0\nwlan0"`,
+		},
+		{
+			name: "a direction override in an interface name",
+			argv: []string{"nmcli", "device", "connect", "eth0" + "\u202e"},
+			want: `nmcli device connect "eth0\u202e"`,
+		},
+		{
+			// 0x9b is the 8-bit CSI and is not valid UTF-8 on its own, so a
+			// range loop would decode it as U+FFFD -- which is printable.
+			name: "an invalid UTF-8 byte",
+			argv: []string{"nmcli", "device", "connect", "eth0" + "\x9b" + "2K"},
+			want: `nmcli device connect "eth0\x9b2K"`,
+		},
+		{
+			// Only the words that need it, and only the ones that do: a
+			// quoted word beside untouched ones is what keeps the line
+			// readable.
+			name: "a space keeps the word one word",
+			argv: []string{"nmcli", "connection", "delete", "Wired connection 1"},
+			want: `nmcli connection delete "Wired connection 1"`,
+		},
+		{
+			// An unquoted empty word would vanish into the join and leave a
+			// shorter argv than the one that failed.
+			name: "an empty word is still a word",
+			argv: []string{"ip", "link", "delete", ""},
+			want: `ip link delete ""`,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := renderArgv(tt.argv)
+			if got != tt.want {
+				t.Errorf("renderArgv(%q) = %s, want %s", tt.argv, got, tt.want)
+			}
+			for _, r := range got {
+				if !strconv.IsPrint(r) {
+					t.Errorf("renderArgv(%q) left the unprintable rune %U on the line: %q", tt.argv, r, got)
+				}
+			}
+		})
+	}
+}
+
 // A failing probe's stderr is quoted into the refusal, because it is what
 // tells the causes that refusal lists apart. It gets one line and a cap; the
 // rest of the message has to stay readable beside it.

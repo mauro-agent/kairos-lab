@@ -6,6 +6,8 @@ import (
 	"slices"
 	"strconv"
 	"strings"
+	"unicode"
+	"unicode/utf8"
 )
 
 // The path building and the output parsing in this file are deliberately kept
@@ -241,6 +243,76 @@ func quoteNames(names []string) string {
 		quoted = append(quoted, strconv.Quote(name))
 	}
 	return strings.Join(quoted, ", ")
+}
+
+// renderArgv renders the command line an exec failed on, for the error that
+// reports the failure. Each word is quoted only when it needs to be, and the
+// words are joined with spaces, so an ordinary failure still reads
+// `sudo nmcli connection delete kairoslab0`.
+//
+// The words are not all the tool's own. `nmcli device connect <iface>` is
+// built from the interface findBridgeSlave read out of `ip -o link show
+// master` output, which passed no validator on the way -- dev_valid_name()
+// bars only an empty name, IFNAMSIZ bytes or more, "." and "..", and any
+// '/', ':' or whitespace, so a raw ESC in an interface name is a name the
+// kernel takes. The error built here is wrapped by cleanupNMConnections and
+// travels through errors.Join, the shared refusal and internal/app to
+// cmd/kairos-lab's fmt.Fprintln(os.Stderr, ...), so it reaches a terminal
+// with nothing else looking at it. The caller that quotes its OWN copy of
+// that name with %q does not cover this one: both copies are in the same
+// string, and the one inside the %w arrived raw.
+//
+// Quoting every word unconditionally would cover it too and is not what this
+// does, for the reason internal/app's planValue gives: a command line that a
+// user may have to read, retype or compare against their shell history has
+// to stay a command line. A value whose runes are all printable is returned
+// unchanged; anything else goes to strconv.Quote, which escapes every rune
+// unicode.IsPrint rejects -- C0, DEL, the C1 block including 8-bit CSI, the
+// bidi overrides, the zero-width formatters -- and renders bytes that are
+// not valid UTF-8 at all as \x escapes.
+func renderArgv(argv []string) string {
+	words := make([]string, 0, len(argv))
+	for _, word := range argv {
+		words = append(words, renderArgvWord(word))
+	}
+	return strings.Join(words, " ")
+}
+
+// renderArgvWord renders one word of a command line. The space rule is this
+// line's own and sits on top of the printability one, because a word with a
+// space in it has to still look like one word: unquoted, `sudo nmcli
+// connection delete Wired connection 1` names a command nobody ran. An empty
+// word is quoted for the same reason -- it would otherwise vanish into the
+// join and leave an argv shorter than the one that failed.
+func renderArgvWord(word string) string {
+	if word == "" || strings.ContainsAny(word, " \"") || !isPrintableValue(word) {
+		return strconv.Quote(word)
+	}
+	return word
+}
+
+// isPrintableValue reports whether s can be written to a terminal as it
+// stands. It is the predicate behind internal/app's planValue, spelled out
+// here because internal/app imports this package and not the other way
+// round, and a value on its way out of internal/vm reaches the same terminal
+// through the same cmd/kairos-lab print.
+func isPrintableValue(s string) bool {
+	// A range loop decodes an invalid byte as utf8.RuneError, and U+FFFD is
+	// printable -- so a raw 0x9b (8-bit CSI, invalid on its own in UTF-8)
+	// would pass the loop untouched. Reject invalid encoding first.
+	if !utf8.ValidString(s) {
+		return false
+	}
+	for _, r := range s {
+		// The three whitespace controls are spelled out although
+		// unicode.IsPrint already rejects all three: they are the runes that
+		// do the damage, and a reader should not have to know the Cc table
+		// to see that they are caught here.
+		if !unicode.IsPrint(r) || r == '\n' || r == '\r' || r == '\t' {
+			return false
+		}
+	}
+	return true
 }
 
 // firstLine returns the first line of s, trimmed of surrounding space and cut
