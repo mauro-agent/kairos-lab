@@ -58,8 +58,16 @@ type fakeHost struct {
 	// failCmd, when set, decides which recorded commands fail. A failing
 	// command is still recorded but is not applied to the host state, which
 	// is how a partial teardown really behaves.
-	failCmd  func(argv []string) error
-	commands [][]string
+	failCmd func(argv []string) error
+	// onCommand, when set, runs after a successful command has been applied,
+	// and is how a test models a consequence the fake cannot know about on
+	// its own. The one that matters here is NetworkManager enslaving an
+	// interface the instant `connection up <bridge>` activates the
+	// controller, because some profile elsewhere on the host carries
+	// `master <bridge> slave-type bridge` and autoconnect: the fake has no
+	// model of foreign profiles, so the test supplies the effect.
+	onCommand func(h *fakeHost, argv []string)
+	commands  [][]string
 }
 
 func newFakeHost(t *testing.T) *fakeHost {
@@ -116,6 +124,9 @@ func (h *fakeHost) run(name string, args ...string) error {
 		}
 	}
 	h.apply(argv)
+	if h.onCommand != nil {
+		h.onCommand(h, argv)
+	}
 	return nil
 }
 
@@ -307,11 +318,13 @@ func TestPrepareLinuxSharedRefusesWhenAStaleUplinkWillNotGo(t *testing.T) {
 	}
 
 	// What is still on the host, and what to do about it. The wrapped error
-	// from cleanupNMConnections names the step that failed; the rest is the
-	// way out, which the user cannot work out from "exit status 1".
+	// from cleanupNMConnections names the step that failed -- which is where
+	// the connection name comes from, and the only place it may come from:
+	// the refusal used to spell out a "-uplink" connection of its own, in
+	// states where none exists. See the test below.
 	for _, want := range []string{
 		"delete connection kairoslab0-uplink",
-		"nmcli connection delete kairoslab0-uplink",
+		"Remove the leftover the failure above names",
 		"-network bridged",
 	} {
 		if !strings.Contains(err.Error(), want) {
@@ -321,6 +334,246 @@ func TestPrepareLinuxSharedRefusesWhenAStaleUplinkWillNotGo(t *testing.T) {
 
 	if st.Network.Mode != "" || st.Network.BridgeName != "" || st.Network.CreatedByKairosLab {
 		t.Errorf("state was written for a run that prepared nothing: %+v", st.Network)
+	}
+}
+
+// The refusal above is charged on a cleanup that FAILED, which is not the
+// same fact as "a host interface is enslaved to this bridge", and the message
+// may not claim it is.
+//
+// Both cases below are states the old wording was simply false in. It said "a
+// surviving <bridge>-uplink connection carries master <bridge> slave-type
+// bridge, and NetworkManager would enslave the host's own NIC to that bridge",
+// and told the user to run `nmcli connection delete <bridge>-uplink`: after a
+// previous SHARED run there is no -uplink connection on the host at all, and
+// the joined error also covers the `nmcli device connect` reconnect, where
+// every delete succeeded and nothing is enslaved to anything.
+//
+// The message has to carry the other half too. cleanupNMConnections does not
+// stop at its first failure, so by the time this refusal returns the deletes,
+// the `ip link delete`s and the reconnect have all run, and the host can be
+// sitting there with its NIC disconnected.
+func TestPrepareLinuxSharedRefusalDescribesOnlyWhatItKnows(t *testing.T) {
+	// The state a second shared run arrives in: the bridge connection and the
+	// bridge link from the run before it, and no -uplink connection anywhere,
+	// because the shared path never creates one.
+	t.Run("no uplink connection exists", func(t *testing.T) {
+		h := newFakeHost(t)
+		h.conns[DefaultBridgeName] = true
+		h.conns[DefaultBridgeName+"-tap"] = true
+		h.bridges[DefaultBridgeName] = true
+		h.links[DefaultTapName] = true
+		h.slaves[DefaultBridgeName] = []string{DefaultTapName}
+		h.failCmd = func(argv []string) error {
+			if strings.Join(argv, " ") == "nmcli connection delete kairoslab0" {
+				return fmt.Errorf("exit status 1")
+			}
+			return nil
+		}
+
+		err := PrepareLinuxShared(&state.State{}, t.TempDir())
+		if err == nil {
+			t.Fatal("PrepareLinuxShared continued over a stale bridge connection it could not delete")
+		}
+		assertRefusalWording(t, err)
+	})
+
+	// Every delete succeeded and the host NIC was released; the one step that
+	// failed is the reconnect that was putting it back. Nothing is enslaved
+	// to this bridge -- and the user has a disconnected NIC to hear about.
+	t.Run("the failure is the reconnect step", func(t *testing.T) {
+		h := newFakeHost(t)
+		h.conns[DefaultBridgeName] = true
+		h.bridges[DefaultBridgeName] = true
+		h.slaves[DefaultBridgeName] = []string{DefaultTapName, "eth0"}
+		h.failCmd = func(argv []string) error {
+			if strings.Join(argv, " ") == "nmcli device connect eth0" {
+				return fmt.Errorf("exit status 1")
+			}
+			return nil
+		}
+
+		err := PrepareLinuxShared(&state.State{}, t.TempDir())
+		if err == nil {
+			t.Fatal("PrepareLinuxShared continued over a teardown that could not finish")
+		}
+		if !strings.Contains(err.Error(), "reconnect eth0") {
+			t.Errorf("the refusal does not name the step that failed:\n%v", err)
+		}
+		assertRefusalWording(t, err)
+	})
+}
+
+// assertRefusalWording holds the preflight refusal to what it actually knows:
+// a teardown step failed, and the rest of the teardown ran anyway.
+func assertRefusalWording(t *testing.T, err error) {
+	t.Helper()
+	if strings.Contains(err.Error(), "-uplink") {
+		t.Errorf("the refusal names a -uplink connection in a state that has none:\n%v", err)
+	}
+	// What the partial teardown already did to this host, which is the half
+	// the user cannot see from the failure alone.
+	for _, want := range []string{
+		"still attempted",
+		"nmcli device connect",
+		"-network bridged",
+	} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("the refusal does not mention %q:\n%v", want, err)
+		}
+	}
+}
+
+// The invariant shared mode exists for is "no host interface is a port of
+// this bridge", and these three tests are where it is enforced: against the
+// kernel's port list, either side of bringing the bridge up.
+//
+// Charging the refusal on a failed cleanup instead let two hosts through. One:
+// nmConnectionExists runs `nmcli connection show <name>` and reads ANY
+// non-zero exit as "does not exist", so a profile it cannot see is never
+// deleted, cleanupNMConnections joins no errors and returns nil, and the
+// preflight declares the host clean. Two: cleanupNMConnections only ever
+// touches <bridge>-tap, <bridge>-uplink and <bridge>, so a profile with any
+// other name -- a "Wired connection 1" somebody pointed at this bridge --
+// survives a cleanup that fully succeeded. In both, the bridge comes up
+// carrying ipv4.method shared, the profile enslaves the host's NIC to it, and
+// the host's connectivity goes behind a NAT bridge.
+//
+// The fake host models exactly that: no connection of ours is visible to any
+// probe, and the interface appears on the bridge when the bridge activates.
+func TestPrepareLinuxSharedRefusesAnInterfaceEnslavedWhenTheBridgeComesUp(t *testing.T) {
+	// enslaveOnBridgeUp is the foreign profile's effect, and the only part of
+	// it the host can observe: eth0 becomes a port of the bridge when the
+	// bridge activates. Whatever the profile is called, this is what arrives.
+	enslaveOnBridgeUp := func(h *fakeHost, argv []string) {
+		if strings.Join(argv, " ") == "nmcli connection up kairoslab0" {
+			h.slaves[DefaultBridgeName] = []string{DefaultTapName, "eth0"}
+		}
+	}
+
+	tests := []struct {
+		name string
+		seed func(h *fakeHost)
+		// prefix is what the preflight issues before the shared sequence.
+		prefix []string
+	}{
+		{
+			// nmConnectionExists cannot see the profile, so the preflight
+			// finds nothing stale, deletes nothing, joins no errors and
+			// reports a clean host. The old refusal, charged on that error,
+			// never fired.
+			name: "the connection probes are blind to the profile",
+			seed: func(h *fakeHost) {},
+		},
+		{
+			// Nothing is blind here and nothing fails: the leftover this
+			// cleanup knows about is deleted, and it returns nil. The
+			// profile that enslaves eth0 is named something
+			// cleanupNMConnections never touches, so a fully successful
+			// teardown leaves it exactly where it was.
+			name: "cleanup fully succeeds with a foreign profile present",
+			seed: func(h *fakeHost) {
+				h.conns[DefaultBridgeName+"-tap"] = true
+				h.conns["Wired connection 1"] = true
+			},
+			prefix: []string{"nmcli connection delete kairoslab0-tap"},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			h := newFakeHost(t)
+			tt.seed(h)
+			h.onCommand = enslaveOnBridgeUp
+			st := &state.State{}
+
+			err := PrepareLinuxShared(st, t.TempDir())
+			if err == nil {
+				t.Fatal("PrepareLinuxShared left the host's NIC enslaved to a NAT bridge and reported success")
+			}
+
+			// The refusal names the interface the KERNEL reported, because
+			// that is the only name anything here actually knows: the
+			// profile that enslaved it may be called anything at all.
+			if !strings.Contains(err.Error(), "eth0") {
+				t.Errorf("the refusal does not name the interface found on the bridge:\n%v", err)
+			}
+			// And the bridge goes back down, so the refusal releases the NIC
+			// instead of leaving it on a bridge carrying ipv4.method shared.
+			// The tap is never brought up: no guest is put on a bridge this
+			// run is abandoning.
+			uid := testUID(t)
+			shared := sharedSequence(uid)
+			want := append([]string{}, tt.prefix...)
+			want = append(want, shared[:len(shared)-1]...)
+			want = append(want, "nmcli connection down kairoslab0")
+			assertSequence(t, h.lines(), want)
+
+			if st.Network.Mode != "" || st.Network.CreatedByKairosLab {
+				t.Errorf("state was written for a run that was refused: %+v", st.Network)
+			}
+		})
+	}
+}
+
+// The same assertion at the other end: an interface already on the bridge
+// before anything is activated. linkExists reads `ip link show` and answers
+// "no" on any failure of it, where isLinuxBridge reads /sys -- so a bridge can
+// survive a cleanup that skipped its `ip link delete`, with a NIC still on it,
+// and the profile that has just been re-pointed at ipv4.method shared is the
+// one about to be applied to it.
+func TestPrepareLinuxSharedRefusesAnInterfaceAlreadyEnslavedBeforeTheBridgeComesUp(t *testing.T) {
+	h := newFakeHost(t)
+	// Nothing of ours is visible to the connection probes, so the preflight
+	// finds this host clean and no cleanup runs. The kernel still has eth0 on
+	// the bridge.
+	h.slaves[DefaultBridgeName] = []string{DefaultTapName, "eth0"}
+	st := &state.State{}
+
+	err := PrepareLinuxShared(st, t.TempDir())
+	if err == nil {
+		t.Fatal("PrepareLinuxShared brought a NAT bridge up over an enslaved host NIC")
+	}
+	if !strings.Contains(err.Error(), "eth0") {
+		t.Errorf("the refusal does not name the interface found on the bridge:\n%v", err)
+	}
+
+	// Nothing is activated at all: the check sits before the `connection up`,
+	// so ipv4.method shared is never applied to a bridge carrying a NIC.
+	for _, line := range h.lines() {
+		if strings.HasPrefix(line, "nmcli connection up") {
+			t.Errorf("a connection was activated over an enslaved host NIC: %s", line)
+		}
+	}
+	if got := h.lines()[len(h.lines())-1]; got != "nmcli connection down kairoslab0" {
+		t.Errorf("last command was %q, want the bridge taken down so eth0 is released", got)
+	}
+	if st.Network.Mode != "" || st.Network.CreatedByKairosLab {
+		t.Errorf("state was written for a run that was refused: %+v", st.Network)
+	}
+}
+
+// The clean case, which is the one that has to stay silent: the tap is a port
+// of this bridge on every successful run, and it is not a foreign one. A
+// check that could not tell them apart would refuse every shared start and
+// take the bridge down behind it.
+func TestPrepareLinuxSharedAcceptsABridgeWhoseOnlyPortIsTheTap(t *testing.T) {
+	h := newFakeHost(t)
+	h.onCommand = func(h *fakeHost, argv []string) {
+		if strings.Join(argv, " ") == "nmcli connection up kairoslab0" {
+			h.slaves[DefaultBridgeName] = []string{DefaultTapName}
+		}
+	}
+	st := &state.State{}
+
+	if err := PrepareLinuxShared(st, t.TempDir()); err != nil {
+		t.Fatalf("PrepareLinuxShared refused a bridge whose only port is its own tap: %v", err)
+	}
+	// The sequence is the ordinary one, so the assertion issued no command of
+	// its own -- a `connection down` here would deactivate the bridge the run
+	// just built.
+	assertSequence(t, h.lines(), sharedSequence(testUID(t)))
+	if st.Network.Mode != "shared" {
+		t.Errorf("Mode = %q, want %q", st.Network.Mode, "shared")
 	}
 }
 

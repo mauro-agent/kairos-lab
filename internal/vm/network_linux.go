@@ -62,23 +62,39 @@ func linuxNetworkPreflight(st *state.State, runtimeDir, mode string) (bridge, ta
 		fmt.Println("Found stale network configuration, cleaning up...")
 		cleanupErr := cleanupNMConnections(bridge, tap)
 		// A leftover that will not go is fatal for shared and survivable for
-		// bridged, and the whole difference is the <bridge>-uplink
-		// connection. It carries `master <bridge> slave-type bridge` and
-		// autoconnect yes, both set by the bridged path, so bringing this
-		// bridge up with that connection still on the host has
-		// NetworkManager enslave the host's physical NIC to it. For bridged
-		// that is roughly what the run was going to do anyway, and the path
-		// recreates and re-modifies that connection itself a few lines
-		// later, which is why the error is dropped there. For shared the
-		// bridge carries ipv4.method shared and its only port is meant to be
-		// the tap: enslaving the NIC destroys the "no uplink" invariant the
-		// mode exists for, and takes the host's connectivity with it. That
-		// is not a start to attempt and then explain.
+		// bridged. Every connection this teardown deletes is one the bridged
+		// path recreates and re-modifies a few lines later, with the master,
+		// the slave type and the autoconnect that run wants, so a failed
+		// delete leaves it with a profile it is about to overwrite -- which
+		// is why the error is dropped there. The shared path rewrites none
+		// of them: its bridge carries ipv4.method shared and its only port
+		// is meant to be the tap, and a surviving profile that carries
+		// `master <bridge> slave-type bridge` has NetworkManager enslave a
+		// host NIC to that bridge when it comes up.
+		//
+		// What this refusal knows, though, is only that a teardown step
+		// failed -- not that such a profile survived. The step may have been
+		// the `nmcli device connect` reconnect at the end, where every
+		// delete succeeded and nothing is enslaved to anything. Not knowing
+		// the state of the host is reason enough to stop a mode whose whole
+		// promise is that no host interface is attached, so the refusal
+		// stays; the message below claims no more than that. The invariant
+		// itself is enforced where it is observable, by the bridge-port
+		// assertion in prepareLinuxSharedWithNM, which reads the kernel's
+		// port list even on a host this preflight found clean.
+		//
+		// This is not a refusal that comes before anything was touched,
+		// either. cleanupNMConnections attempts every step whatever the ones
+		// before it did, so by the time the error arrives here the deletes,
+		// the `ip link delete`s and the reconnect have all run. The message
+		// therefore has to say what the host has already had done to it, not
+		// only what to do next.
 		if cleanupErr != nil && mode == "shared" {
 			return "", "", fmt.Errorf("shared networking cannot start until the leftover network configuration is gone, and removing it failed: %w. "+
-				"Shared mode enslaves no host interface, so it will not bring its NAT bridge up over leftovers: a surviving %s-uplink connection carries master %s slave-type bridge, and NetworkManager would enslave the host's own NIC to that bridge. "+
-				"Remove what the failure above names (for example: sudo nmcli connection delete %s-uplink) and start again, or use -network bridged, which rebuilds these connections itself",
-				cleanupErr, bridge, bridge, bridge)
+				"The cleanup does not stop at its first failure, so every step after the one above was still attempted: deleting the remaining %s connections, deleting the %s and %s interfaces, and handing any host interface that was enslaved to the bridge to `nmcli device connect`. The host's networking may therefore have changed, and a physical interface may be left with no active connection -- `nmcli device status` shows which, and `sudo nmcli device connect <iface>` puts it back. "+
+				"The start is refused rather than attempted because shared mode enslaves no host interface: its bridge carries ipv4.method shared and its only port is meant to be the tap, and a leftover this tool could not remove may be what attaches a NIC to that bridge. "+
+				"Remove the leftover the failure above names and start again, or use -network bridged, which rebuilds these connections itself",
+				cleanupErr, bridge, bridge, tap)
 		}
 		time.Sleep(staleCleanupSettleDelay)
 	}
@@ -103,11 +119,19 @@ var staleCleanupSettleDelay = 2 * time.Second
 // a `--network shared` run that brought its bridge up over it would have
 // NetworkManager enslave the host's physical NIC to a NAT bridge -- which
 // destroys the "no uplink is enslaved" invariant that is the entire reason
-// shared mode exists, and takes the host's connectivity with it. A shared run
-// therefore has to SEE the orphan here, and linuxNetworkPreflight refuses the
-// start when the delete it then attempts fails. The bridged path carries on
-// over the same failure, because it recreates and re-modifies the -uplink
-// connection itself.
+// shared mode exists, and takes the host's connectivity with it. Widening
+// this predicate is what gets that orphan DELETED on a shared run, and
+// linuxNetworkPreflight refuses the start when the delete it then attempts
+// fails. The bridged path carries on over the same failure, because it
+// recreates and re-modifies the -uplink connection itself.
+//
+// Seeing it here is not what ENFORCES the invariant, and nothing in this file
+// should read as if it were: every probe in the expression below answers "no"
+// when it cannot get an answer, and the three connection names it knows are
+// not the only ones a profile can have. What enforces it is the bridge-port
+// assertion in prepareLinuxSharedWithNM, which asks the kernel which
+// interfaces are actually ports of the bridge. This predicate makes the
+// common case a clean start instead of a refusal.
 //
 // linuxNetworkPreflight and HasStaleNetworkResources both call this so the
 // narrower of the two predicates cannot drift back into existence.
@@ -338,13 +362,83 @@ func prepareLinuxSharedWithNM(bridge, tap string) error {
 		return err
 	}
 
+	// The port assertion, before the bridge is activated. A bridge link that
+	// got past the preflight can already have a host NIC on it: linkExists
+	// answers "no" for any `ip` failure, so the `ip link delete` in the
+	// teardown is skipped while isLinuxBridge, which reads /sys, still says a
+	// bridge is there. The connection profile has just been re-pointed at
+	// ipv4.method shared, so this is the last moment before that method is
+	// applied to a bridge carrying somebody's NIC.
+	if err := refuseForeignBridgePort(bridge, bridgeConn, tap); err != nil {
+		return err
+	}
 	if err := sudo("nmcli", "connection", "up", bridgeConn); err != nil {
+		return err
+	}
+	// And again now the bridge is up, which is the check that catches the
+	// hazard this mode is guarded against: a profile carrying `master
+	// <bridge> slave-type bridge` with autoconnect on enslaves its interface
+	// the moment the controller activates, whether the preflight's connection
+	// probes could see that profile or not. The tap comes up only after this
+	// passes, so a refused run never puts a guest on the bridge.
+	//
+	// `nmcli connection up` returns when the bridge has activated, and a
+	// slave that attaches after that instant is not seen here. This narrows
+	// the window to the activation itself rather than closing it; the next
+	// start sees such a slave at the check above.
+	if err := refuseForeignBridgePort(bridge, bridgeConn, tap); err != nil {
 		return err
 	}
 	if err := sudo("nmcli", "connection", "up", tapConn); err != nil {
 		return err
 	}
 	return nil
+}
+
+// refuseForeignBridgePort enforces the invariant shared mode exists for: the
+// only port of this bridge is the tap. It asks the kernel, through
+// findBridgeSlave and `ip -o link show master <bridge>`, rather than inferring
+// the answer from what the teardown before it believed it had deleted -- those
+// are different questions, and the second one has been wrong twice. A profile
+// nmConnectionExists could not see (it reports "does not exist" for any nmcli
+// exit it dislikes, a restarting NetworkManager included) is never deleted, so
+// cleanup joins no errors and returns nil; and a profile named anything other
+// than the three cleanupNMConnections knows about -- a "Wired connection 1"
+// somebody pointed at this bridge -- survives a cleanup that fully succeeded.
+// Both end with a preflight that saw a clean host and a NIC on a NAT bridge.
+// The port list is the one answer that does not depend on either guess.
+//
+// It is not an oracle either: `ip` failing to run leaves this reporting no
+// ports, the same shape of fail-open as the probes above. It closes the
+// reachable escapes rather than proving a negative.
+//
+// `nmcli connection down` is issued on the bridge before the error returns,
+// so a refusal does not simply walk away from a host NIC left on a bridge
+// whose profile now carries ipv4.method shared. What NetworkManager then
+// does with the interface is its decision and is not read back here, which
+// is why the message reports what was attempted rather than promising a
+// result, says so when the down itself failed, and tells the user how to put
+// the interface back: releasing it can leave it with no active connection.
+// The check before activation can also fire on a bridge this run never
+// brought up, where there is nothing to deactivate and the down fails; the
+// message is written to be true in that case too.
+//
+// The profile that did the enslaving is left alone: it may be one this tool
+// never created, and deleting a user's network configuration on their behalf
+// is the failure mode this whole path exists to avoid.
+func refuseForeignBridgePort(bridge, bridgeConn, tap string) error {
+	iface := findBridgeSlave(bridge, tap)
+	if iface == "" {
+		return nil
+	}
+	released := fmt.Sprintf("The bridge has been taken back down, which should release %s", iface)
+	if err := sudo("nmcli", "connection", "down", bridgeConn); err != nil {
+		released = fmt.Sprintf("Taking the bridge back down to release %s failed (%v), so it may still be enslaved", iface, err)
+	}
+	return fmt.Errorf("shared networking will not run with the host interface %s enslaved to bridge %s: shared mode attaches no host interface, because its bridge carries ipv4.method shared and its only port is meant to be the tap %s. "+
+		"Some NetworkManager profile is attaching %s to this bridge, and completing the start would put the host's own connectivity behind a NAT bridge. %s. "+
+		"Put %s back on the network with `sudo nmcli device connect %s`, find the profile that enslaves it (`nmcli -f NAME,DEVICE,TYPE connection show --active`, and `nmcli -f connection.master connection show <name>` to confirm) and delete or re-point it, then start again -- or use -network bridged, which attaches an interface on purpose",
+		iface, bridge, tap, iface, released, iface, iface)
 }
 
 func CleanupLinuxBridge(st *state.State) error {

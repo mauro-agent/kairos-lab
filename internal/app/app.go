@@ -620,11 +620,14 @@ func runStart(args []string, stdin io.Reader, stdout, stderr io.Writer, store *s
 		// interface would be asking the user to consent to something this
 		// mode never does, and `status` would then report a stale uplink as
 		// this VM's. The parenthesis is a promise about what the next step
-		// does, and vm.PrepareLinuxShared is what keeps it: its pre-flight
-		// refuses the run when a leftover <bridge>-uplink connection from an
-		// earlier bridged run cannot be deleted, because that connection
-		// carries master/slave-type bridge and would have NetworkManager
-		// enslave the host NIC to this NAT bridge when it comes up.
+		// does, and vm.PrepareLinuxShared is what keeps it: it reads the
+		// bridge's port list out of the kernel on either side of bringing
+		// the bridge up, and refuses the run -- taking the bridge back down
+		// rather than leaving a host NIC on a NAT bridge -- if anything but
+		// the tap is a port of it. A leftover NetworkManager profile that
+		// attaches a host NIC to this bridge is caught there whatever that
+		// profile is called, and whether the pre-flight's connection probes
+		// could see it at all.
 		ok, err := confirm(stdin, stdout, *autoYes, "shared networking needs sudo to prepare a NAT bridge/tap (no uplink interface is used)")
 		if err != nil {
 			return err
@@ -654,12 +657,22 @@ func runStart(args []string, stdin io.Reader, stdout, stderr io.Writer, store *s
 		if err := prepareLinuxBridge(st, runtimeDir); err != nil {
 			return err
 		}
-		// Read back what the prepare enslaved instead of trusting what it was
-		// asked for. vm.PrepareLinuxBridge writes the uplink it used onto the
-		// state, and it has a detection path of its own that runs when the
-		// field arrives empty; taking its answer here is what keeps the
-		// command line, the recorded state and the prompt above describing
-		// one and the same interface.
+		// Read back what the prepare enslaved instead of trusting what it
+		// was asked for. From this caller that is a no-op today, and the
+		// comment used to claim otherwise: the guarantee at the top of this
+		// branch is that networkIface is non-empty here, and
+		// vm.PrepareLinuxBridge runs a detection path of its own only when
+		// the field arrives EMPTY -- so the name it writes back is the name
+		// it was handed. The empty case is not live from here, and saying it
+		// was made two comments eight lines apart contradict each other.
+		//
+		// The line stays as defence in depth, because what it keeps true is
+		// a three-way agreement -- the prompt above, the recorded state and
+		// the command line all naming one interface -- and it is the prepare
+		// that decides which interface was enslaved, not this function.
+		// Relax the guarantee above, or give the prepare any other reason to
+		// use a different interface, and this readback is what stops the
+		// three drifting apart without anyone noticing.
 		networkIface = st.Network.BridgeInterface
 	}
 

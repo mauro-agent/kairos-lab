@@ -632,7 +632,7 @@ func TestRenderCommandLeavesAnOrdinaryCommandLineAlone(t *testing.T) {
 // qemu on the isolated PATH.
 func TestRunningLineIsInertForAStoredDiskPath(t *testing.T) {
 	if runtime.GOOS != "linux" {
-		t.Skipf("on %s the run needs a firmware path from `brew --prefix qemu` before it prints the command, and this test isolates itself from host binaries", runtime.GOOS)
+		t.Skipf("this test asserts the start path as Linux takes it, and %s is not Linux: on darwin -- the only other platform kairos-lab is built for -- the run needs a firmware path from `brew --prefix qemu` before it prints the command, and this test's isolation from host binaries denies it one", runtime.GOOS)
 	}
 	t.Setenv("KAIROS_LAB_CONFIG_DIR", t.TempDir())
 	t.Setenv("KAIROS_LAB_CACHE_DIR", t.TempDir())
@@ -1710,7 +1710,7 @@ func TestBridgeInterfaceForModeAnswersOnlyForBridged(t *testing.T) {
 // the table above covers the other rows.
 func TestStartRecordsNoUplinkForAModeThatAttachesToNone(t *testing.T) {
 	if runtime.GOOS != "linux" {
-		t.Skipf("on %s the run needs a firmware path from `brew --prefix qemu` before it records anything, and this test isolates itself from host binaries", runtime.GOOS)
+		t.Skipf("this test asserts the start path as Linux takes it, and %s is not Linux: on darwin -- the only other platform kairos-lab is built for -- the run needs a firmware path from `brew --prefix qemu` before it records anything, and this test's isolation from host binaries denies it one", runtime.GOOS)
 	}
 	t.Setenv("KAIROS_LAB_CONFIG_DIR", t.TempDir())
 	t.Setenv("KAIROS_LAB_CACHE_DIR", t.TempDir())
@@ -1755,7 +1755,7 @@ func TestStartRecordsNoUplinkForAModeThatAttachesToNone(t *testing.T) {
 // filled in.
 func TestStartGivesEachDiskItsOwnStickyMAC(t *testing.T) {
 	if runtime.GOOS != "linux" {
-		t.Skipf("on %s the run needs a firmware path from `brew --prefix qemu` before it records anything, and this test isolates itself from host binaries", runtime.GOOS)
+		t.Skipf("this test asserts the start path as Linux takes it, and %s is not Linux: on darwin -- the only other platform kairos-lab is built for -- the run needs a firmware path from `brew --prefix qemu` before it records anything, and this test's isolation from host binaries denies it one", runtime.GOOS)
 	}
 	const diskName = "kairos-disk0"
 	const storedMAC = "52:54:00:ab:cd:ef"
@@ -1842,7 +1842,7 @@ func TestStartGivesEachDiskItsOwnStickyMAC(t *testing.T) {
 // other MAC test drives a disk that is never renamed.
 func TestStartDerivesTheMACFromTheRenamedDisk(t *testing.T) {
 	if runtime.GOOS != "linux" {
-		t.Skipf("on %s the run needs a firmware path from `brew --prefix qemu` before it records anything, and this test isolates itself from host binaries", runtime.GOOS)
+		t.Skipf("this test asserts the start path as Linux takes it, and %s is not Linux: on darwin -- the only other platform kairos-lab is built for -- the run needs a firmware path from `brew --prefix qemu` before it records anything, and this test's isolation from host binaries denies it one", runtime.GOOS)
 	}
 	const finalName = "renamed-disk"
 	t.Setenv("KAIROS_LAB_CONFIG_DIR", t.TempDir())
