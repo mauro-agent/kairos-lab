@@ -117,7 +117,8 @@ Downloads a Kairos ISO with interactive selection:
 
 Boots a VM with sensible defaults:
 - **Display**: `window` (graphical) by default
-- **Network**: `shared` by default; see [Networking](#networking) for what each of the three modes can and can't reach
+- **Network**: `shared` by default; see [Networking](#networking) for what
+  each of the three modes can and can't reach
 - **Disk**: Select existing or create new
 
 Flags:
@@ -127,10 +128,12 @@ Flags:
 - `-iso <path>` - Use specific ISO file
 - `-display window|serial` - Display mode (default: window)
 - `-network shared|bridged|user` - Network mode (default: shared)
-- `-bridge-if <iface>` - Uplink for `bridged` (default: resolved at run time; ignored in `shared` and `user`)
+- `-bridge-if <iface>` - Uplink for `bridged`, dropped if the run ends up in
+  `shared` or `user` (default: resolved from the host's interfaces at run time)
 - `-disk-size 60G` - Disk size for new disks
-- `-memory <GB>` / `-cpus <n>` - VM resources (memory is in GB, not MB;
-  defaults: 2 vCPUs, and 8 GB of memory on Apple Silicon or 4 GB elsewhere)
+- `-memory <GB>` / `-cpus <n>` - VM resources (memory is in GB, not MB). A
+  new disk gets 2 vCPUs and 8 GB of memory on Apple Silicon, 4 GB elsewhere;
+  an existing one reuses what it was last started with unless you pass the flag
 - `-yes` - Auto-confirm prompts
 
 ### `status`
@@ -202,9 +205,9 @@ access points and fails on others.
 `ssh -p 2222 kairos@localhost` and `http://localhost:8080`. It needs no
 privileges and no NetworkManager. SLIRP is a userspace NAT inside the QEMU
 process, so the guest has no address on your network at all and those two
-forwarded ports are the only way in. That is what keeps `user` to a single VM
-and out of any cluster, and it is a limit of the network itself, not of the
-CLI.
+forwarded ports are the only way in. That is what keeps `user` out of any
+cluster, and unlike the one-VM limit above it is the network's rather than
+this CLI's - no change here would lift it.
 
 ### macOS
 
@@ -231,11 +234,12 @@ it doesn't.
 
 `start` prints a warning when the interface it ends up with - default-route,
 fallback, or one you named - is a Wi-Fi radio, so you see that risk before the
-VM boots rather than after it fails to get a lease. `shared` has no such problem, since it
-attaches to no interface at all.
+VM boots rather than after it fails to get a lease. `shared` has no such
+problem, since it attaches to no interface at all.
 
-vmnet typically puts the shared subnet's gateway at `192.168.64.1/24` and
-leases guests addresses above it, but treat that as an example, not a promise: the QEMU command line only ever asks for
+vmnet typically puts the shared subnet's gateway at `192.168.64.1/24`, and
+the DHCP server behind it leases guests addresses above that. Treat the number
+as an example, not a promise: the QEMU command line only ever asks for
 `-netdev vmnet-shared,id=net0`, with no address options at all, so the guest
 lands wherever Apple's vmnet framework decides to put it. Apple documents no
 subnet policy for `VMNET_SHARED_MODE` - the maintainer of Apple's own
