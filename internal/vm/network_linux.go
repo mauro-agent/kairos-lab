@@ -84,17 +84,20 @@ func linuxNetworkPreflight(st *state.State, runtimeDir, mode string) (bridge, ta
 		// port list even on a host this preflight found clean.
 		//
 		// This is not a refusal that comes before anything was touched,
-		// either. cleanupNMConnections attempts every step whatever the ones
-		// before it did, so by the time the error arrives here the deletes,
-		// the `ip link delete`s and the reconnect have all run. The message
-		// therefore has to say what the host has already had done to it, not
-		// only what to do next.
+		// either. cleanupNMConnections stops at no failure, so every later
+		// step was reached -- which is not the same as every later step
+		// having run: the two `ip link delete`s are skipped when linkExists
+		// cannot see their interface, and the reconnect when findBridgeSlave
+		// named nobody. Which of them issued anything is not knowable from
+		// the joined error, so the message names the gates instead of
+		// listing the steps as though they had all run.
 		if cleanupErr != nil && mode == "shared" {
 			return "", "", fmt.Errorf("shared networking cannot start until the leftover network configuration is gone, and removing it failed: %w. "+
-				"The cleanup does not stop at its first failure, so every step after the one above was still attempted: deleting the remaining %s connections, deleting the %s and %s interfaces, and handing any host interface that was enslaved to the bridge to `nmcli device connect`. The host's networking may therefore have changed, and a physical interface may be left with no active connection -- `nmcli device status` shows which, and `sudo nmcli device connect <iface>` puts it back. "+
+				"The cleanup does not stop at its first failure, so every step after the one above was still attempted where it had anything to attempt, and the failure above names each one that failed. Several steps do nothing when there is nothing to do: the `ip link delete`s run only for an interface `ip link show` can see, and the reconnect only for an interface found on the bridge. After a reboot, where the connection keyfiles survive and the interfaces do not, the delete that failed above can be the only command this cleanup issued at all. "+
+				"Where it did issue something, the host's networking has changed, and a physical interface can be left with no active connection -- `nmcli device status` shows which, and `sudo nmcli connection up <profile>` puts it back on the profile you name. Prefer that to `sudo nmcli device connect <iface>`, which activates whichever profile NetworkManager rates best for the device, routinely the bridge-slave profile after a bridged run -- one of the leftovers this cleanup was trying to remove. "+
 				"The start is refused rather than attempted because shared mode enslaves no host interface: its bridge carries ipv4.method shared and its only port is meant to be the tap, and a leftover this tool could not remove may be what attaches a NIC to that bridge. "+
 				"Remove the leftover the failure above names and start again, or use -network bridged, which rebuilds these connections itself",
-				cleanupErr, bridge, bridge, tap)
+				cleanupErr)
 		}
 		time.Sleep(staleCleanupSettleDelay)
 	}
@@ -362,83 +365,206 @@ func prepareLinuxSharedWithNM(bridge, tap string) error {
 		return err
 	}
 
-	// The port assertion, before the bridge is activated. A bridge link that
-	// got past the preflight can already have a host NIC on it: linkExists
-	// answers "no" for any `ip` failure, so the `ip link delete` in the
-	// teardown is skipped while isLinuxBridge, which reads /sys, still says a
-	// bridge is there. The connection profile has just been re-pointed at
-	// ipv4.method shared, so this is the last moment before that method is
-	// applied to a bridge carrying somebody's NIC.
-	if err := refuseForeignBridgePort(bridge, bridgeConn, tap); err != nil {
+	// The port assertion, made three times: before anything is activated,
+	// once the bridge is up, and once the tap is on it. What it asks the
+	// kernel is which interfaces are ports of this bridge; what it demands is
+	// that none of them is one this start did not put there.
+	//
+	// Before either `connection up` the expected port list is EMPTY. Nothing
+	// has attached the tap yet -- that is the last command in this function
+	// -- so a bridge with any port at all at this point has one from
+	// somewhere else. Expecting nothing is also what keeps st.Network.TapName
+	// out of the predicate: an exception named by the untrusted file this
+	// check exists to defend against is an exception that file can aim at the
+	// host's own NIC, and validateStoredInterfaceName accepts "eth0" there.
+	//
+	// A bridge link that got past the preflight can already carry a host NIC:
+	// linkExists answers "no" for any `ip` failure, so the `ip link delete` in
+	// the teardown is skipped while isLinuxBridge, which reads /sys, still says
+	// a bridge is there. The connection profile has just been re-pointed at
+	// ipv4.method shared, so the first of these is the last moment before that
+	// method is applied to a bridge carrying somebody's NIC.
+	if err := refuseForeignBridgePort(bridge, bridgeConn, tapConn, tap, tapNotYetAttached); err != nil {
 		return err
 	}
 	if err := sudo("nmcli", "connection", "up", bridgeConn); err != nil {
 		return err
 	}
-	// And again now the bridge is up, which is the check that catches the
-	// hazard this mode is guarded against: a profile carrying `master
-	// <bridge> slave-type bridge` with autoconnect on enslaves its interface
-	// the moment the controller activates, whether the preflight's connection
-	// probes could see that profile or not. The tap comes up only after this
-	// passes, so a refused run never puts a guest on the bridge.
-	//
-	// `nmcli connection up` returns when the bridge has activated, and a
-	// slave that attaches after that instant is not seen here. This narrows
-	// the window to the activation itself rather than closing it; the next
-	// start sees such a slave at the check above.
-	if err := refuseForeignBridgePort(bridge, bridgeConn, tap); err != nil {
+	// Again now the bridge is up, which is the check that catches the hazard
+	// this mode is guarded against: a profile carrying `master <bridge>
+	// slave-type bridge` with autoconnect on enslaves its interface the moment
+	// the controller activates, whether the preflight's connection probes
+	// could see that profile or not. The tap comes up only after this passes,
+	// so a refused run never puts a guest on the bridge.
+	if err := refuseForeignBridgePort(bridge, bridgeConn, tapConn, tap, tapNotYetAttached); err != nil {
 		return err
 	}
 	if err := sudo("nmcli", "connection", "up", tapConn); err != nil {
 		return err
 	}
+	// And once more with the tap attached, where the expected port list is
+	// exactly the tap. `nmcli connection up` returns when the connection has
+	// activated, and an interface attached in the instant after that is not
+	// seen by the check before it; this one costs one more `ip` call and
+	// narrows that window to the tap's own activation. It is the only one of
+	// the three that names the tap, and by the time it runs an empty port
+	// list has been established twice, so a port carrying that name here is a
+	// refusal whichever thing it turns out to be.
+	//
+	// The window is narrowed and not closed: nothing reads the port list
+	// again once this function returns, and nothing watches it while the VM
+	// runs.
+	if err := refuseForeignBridgePort(bridge, bridgeConn, tapConn, tap, tapAttached); err != nil {
+		return err
+	}
 	return nil
 }
 
+// tapNotYetAttached and tapAttached spell out refuseForeignBridgePort's last
+// argument at the call sites, which would otherwise be a bare true or false
+// on three calls that differ in nothing else.
+const (
+	tapNotYetAttached = false
+	tapAttached       = true
+)
+
 // refuseForeignBridgePort enforces the invariant shared mode exists for: the
-// only port of this bridge is the tap. It asks the kernel, through
-// findBridgeSlave and `ip -o link show master <bridge>`, rather than inferring
-// the answer from what the teardown before it believed it had deleted -- those
-// are different questions, and the second one has been wrong twice. A profile
-// nmConnectionExists could not see (it reports "does not exist" for any nmcli
-// exit it dislikes, a restarting NetworkManager included) is never deleted, so
-// cleanup joins no errors and returns nil; and a profile named anything other
-// than the three cleanupNMConnections knows about -- a "Wired connection 1"
-// somebody pointed at this bridge -- survives a cleanup that fully succeeded.
-// Both end with a preflight that saw a clean host and a NIC on a NAT bridge.
-// The port list is the one answer that does not depend on either guess.
+// only port this bridge ever has is the tap, and it has none at all until the
+// tap is activated. It asks the kernel, through `ip -o link show master
+// <bridge>`, rather than inferring the answer from what the teardown before
+// it believed it had deleted -- those are different questions, and the second
+// one has been wrong twice. A profile nmConnectionExists could not see (it
+// reports "does not exist" for any nmcli exit it dislikes, a restarting
+// NetworkManager included) is never deleted, so cleanup joins no errors and
+// returns nil; and a profile named anything other than the three
+// cleanupNMConnections knows about -- a "Wired connection 1" somebody pointed
+// at this bridge -- survives a cleanup that fully succeeded. Both end with a
+// preflight that saw a clean host and a NIC on a NAT bridge.
 //
-// It is not an oracle either: `ip` failing to run leaves this reporting no
-// ports, the same shape of fail-open as the probes above. It closes the
-// reachable escapes rather than proving a negative.
+// It fails CLOSED, which is the whole reason bridgeSlaveLinks returns an
+// error. A probe that cannot answer is not an answer, and this one gates a
+// root-run network reconfiguration. `ip -o link show master` is missing from
+// busybox's `ip`, which exits 2 with `either "dev" is duplicate`; from an
+// iproute2 older than the filter; and from a host with no `ip` on PATH at
+// all. Every one of those is a permanent property of the host rather than a
+// transient failure, so reading them as "no ports" would leave the invariant
+// unenforced for good on whole classes of machine -- while the port list is
+// the only thing enforcing it.
 //
-// `nmcli connection down` is issued on the bridge before the error returns,
-// so a refusal does not simply walk away from a host NIC left on a bridge
-// whose profile now carries ipv4.method shared. What NetworkManager then
-// does with the interface is its decision and is not read back here, which
-// is why the message reports what was attempted rather than promising a
-// result, says so when the down itself failed, and tells the user how to put
-// the interface back: releasing it can leave it with no active connection.
-// The check before activation can also fire on a bridge this run never
-// brought up, where there is nothing to deactivate and the down fails; the
-// message is written to be true in that case too.
+// The one thing still read as "no ports" without asking `ip` is a bridge that
+// is not there. isLinuxBridge stats /sys/class/net/<bridge>/bridge, and on a
+// clean host this runs before anything has been activated, so no device of
+// that name exists yet and the probe would fail saying exactly that. A stat
+// that answers "no" for some other reason -- a host with no readable /sys --
+// takes a start past this check, and that is the last fail-open here. It is a
+// narrower one than the probe's: it needs the bridge's own sysfs entry to be
+// unreadable, not merely `ip` to be unusable.
 //
-// The profile that did the enslaving is left alone: it may be one this tool
-// never created, and deleting a user's network configuration on their behalf
-// is the failure mode this whole path exists to avoid.
-func refuseForeignBridgePort(bridge, bridgeConn, tap string) error {
-	iface := findBridgeSlave(bridge, tap)
-	if iface == "" {
+// Both refusals hand the host back the way they found it, as far as they can;
+// see revertSharedSetup. The profile that did the attaching is left alone: it
+// may be one this tool never created, and deleting a user's network
+// configuration on their behalf is the failure mode this whole path exists to
+// avoid.
+func refuseForeignBridgePort(bridge, bridgeConn, tapConn, tap string, tapIsAttached bool) error {
+	if !isLinuxBridge(bridge) {
 		return nil
 	}
-	released := fmt.Sprintf("The bridge has been taken back down, which should release %s", iface)
-	if err := sudo("nmcli", "connection", "down", bridgeConn); err != nil {
-		released = fmt.Sprintf("Taking the bridge back down to release %s failed (%v), so it may still be enslaved", iface, err)
+	out, err := bridgeSlaveLinks(bridge)
+	if err != nil {
+		return fmt.Errorf("shared networking will not start over bridge %s, because the check that nothing is attached to it could not be run: `ip -o link show master %s` failed: %w. "+
+			"The bridge exists on this host, so the question is a real one and this start could not answer it. Shared mode's promise is that no host interface is a port of its bridge -- that is what the consent prompt says, and ipv4.method shared is what makes getting it wrong expensive -- so a port list that cannot be read is a refusal and not a pass. "+
+			"`ip` may not be on PATH at all; it may be busybox's `ip`, which has no `show master` filter; or it may be an iproute2 older than that filter. `ip -V` says which. "+
+			"The same list is in `ls /sys/class/net/%s/brif`, which needs none of them: if it names an interface of yours, something is attaching that interface to this bridge; if it is empty, `sudo ip link delete %s` removes the leftover bridge and the next start builds its own. "+
+			"%s. "+
+			"Or use -network bridged, which attaches an interface to a bridge on purpose, or -network user, which builds no bridge at all",
+			bridge, bridge, err, bridge, bridge, revertSharedSetup(bridgeConn, tapConn))
 	}
-	return fmt.Errorf("shared networking will not run with the host interface %s enslaved to bridge %s: shared mode attaches no host interface, because its bridge carries ipv4.method shared and its only port is meant to be the tap %s. "+
-		"Some NetworkManager profile is attaching %s to this bridge, and completing the start would put the host's own connectivity behind a NAT bridge. %s. "+
-		"Put %s back on the network with `sudo nmcli device connect %s`, find the profile that enslaves it (`nmcli -f NAME,DEVICE,TYPE connection show --active`, and `nmcli -f connection.master connection show <name>` to confirm) and delete or re-point it, then start again -- or use -network bridged, which attaches an interface on purpose",
-		iface, bridge, tap, iface, released, iface, iface)
+	var expected []string
+	if tapIsAttached {
+		expected = []string{tap}
+	}
+	unexpected := unexpectedBridgePorts(parseBridgePorts(out), expected)
+	if len(unexpected) == 0 {
+		return nil
+	}
+	// The message names every unexpected port and not the first one: a host
+	// with two NICs on this bridge used to be told about one of them, and the
+	// user who cleared that one was refused again on the next start naming
+	// the second, with no hint there had been more. It also says what it
+	// observed and no more than that -- a port list read out of the kernel --
+	// because it observed no profile and used to claim one.
+	expectation := fmt.Sprintf("this bridge is meant to have no ports at all at this point, since the tap %s is attached by a later step of this same start", tap)
+	if tapIsAttached {
+		expectation = fmt.Sprintf("the only port this bridge is meant to have is the tap %s", tap)
+	}
+	return fmt.Errorf("shared networking will not run over bridge %s: `ip -o link show master %s` reports %s on it, and %s. "+
+		"That port list is all this start observed. It is the kernel's own answer about what is attached to the bridge; which profile attached it, or whether any profile did, was not looked at and is not claimed here. "+
+		"The likely cause is a NetworkManager profile carrying `master %s slave-type bridge`: `nmcli -f NAME,DEVICE,TYPE connection show --active` lists the active ones, `nmcli -f connection.master connection show <name>` confirms which bridge one attaches to, and deleting or re-pointing it is the fix. "+
+		"There may be no such profile to find. A bridge left behind by an earlier run keeps whatever is on it across a NetworkManager restart with nothing live holding it there, and then `sudo ip link delete %s` -- which removes the bridge and releases every port on it -- or `sudo ip link set dev <iface> nomaster` for one of them is what clears it. "+
+		"Put an interface back with `sudo nmcli connection up <profile>` naming the profile you want, and only once the offending one is gone or re-pointed: `nmcli device connect <iface>` activates whichever profile NetworkManager rates best for that device, and after a bridged run that is routinely the bridge-slave profile it left behind, which attaches the interface to a bridge again. "+
+		"%s. "+
+		"Then start again, or use -network bridged, which attaches an interface to its bridge on purpose",
+		bridge, bridge, quoteNames(unexpected), expectation, bridge, bridge, revertSharedSetup(bridgeConn, tapConn))
+}
+
+// revertSharedSetup undoes what prepareLinuxSharedWithNM has already done to
+// this host, and returns a sentence saying what it attempted and what of that
+// failed. Both refusals above call it before returning their error.
+//
+// Deactivating is not reverting. By the time any of those checks runs,
+// `nmcli connection modify <bridge> ... ipv4.method shared` has returned and
+// NetworkManager has written that to a keyfile, so a refusal that only took
+// the connection down would walk away leaving a persisted NAT-bridge profile
+// behind -- and a refusal fires precisely when something else is attaching an
+// interface to that bridge, ordinarily a profile with autoconnect on. The
+// next time that interface comes up, NetworkManager activates its controller,
+// and the interface lands on a bridge running a DHCP server, IPv4 forwarding
+// and a MASQUERADE rule, with no VM anywhere near it. A refusal has to leave
+// the host no more dangerous than it found it.
+//
+// The down comes first, even though deleting a connection deactivates it too,
+// because it is the step that releases the interface and it is worth having
+// happened even when the delete after it fails.
+//
+// The deletes are unconditional rather than gated on nmConnectionExists.
+// Both connections were modified successfully a few lines above, which is how
+// this knows they are there -- a better answer than a probe that reports
+// "does not exist" for any nmcli exit it dislikes. Deleting is more than
+// restoring, for a bridge connection that predates this start: what its
+// settings were is recorded nowhere, and what this start overwrote cannot be
+// put back. What goes is a profile named after the bridge in state.json,
+// which is the same profile every teardown in this file deletes.
+func revertSharedSetup(bridgeConn, tapConn string) string {
+	notes := make([]string, 0, 4)
+	if err := sudo("nmcli", "connection", "down", bridgeConn); err != nil {
+		notes = append(notes, fmt.Sprintf("taking connection %s down failed (%v), which is what a bridge this start never activated does; if it was up, it may be up still", bridgeConn, err))
+	} else {
+		notes = append(notes, fmt.Sprintf("connection %s was taken down, which should release what it had attached", bridgeConn))
+	}
+	var deleted, failed []string
+	bridgeDeleted := false
+	for _, conn := range []string{tapConn, bridgeConn} {
+		if err := sudo("nmcli", "connection", "delete", conn); err != nil {
+			failed = append(failed, fmt.Sprintf("%s (%v)", conn, err))
+			continue
+		}
+		deleted = append(deleted, conn)
+		if conn == bridgeConn {
+			bridgeDeleted = true
+		}
+	}
+	if len(deleted) > 0 {
+		notes = append(notes, fmt.Sprintf("the connections this start had written were deleted (%s)", strings.Join(deleted, ", ")))
+	}
+	if len(failed) > 0 {
+		notes = append(notes, fmt.Sprintf("deleting %s failed", strings.Join(failed, ", ")))
+	}
+	if bridgeDeleted {
+		notes = append(notes, fmt.Sprintf("so the ipv4.method shared this start had written to %s is off this host again", bridgeConn))
+	} else {
+		notes = append(notes, fmt.Sprintf("so the ipv4.method shared this start had written to %s is still on this host, and `sudo nmcli connection delete %s` is what removes it", bridgeConn, bridgeConn))
+	}
+	return strings.Join(notes, "; ")
 }
 
 func CleanupLinuxBridge(st *state.State) error {
@@ -501,9 +627,13 @@ func CleanupStaleNetworkResources(st *state.State) error {
 // threads through reset and cleanup, so those warnings were invisible to the
 // app layer and to every test at that level.
 //
-// Collecting does not mean stopping. Every step below is still attempted
-// whatever the ones before it did: one connection that will not delete must
-// not strand the tap, the bridge and the reconnect behind it.
+// Collecting does not mean stopping. Every step below is REACHED whatever the
+// ones before it did: one connection that will not delete must not strand the
+// tap, the bridge and the reconnect behind it. Reached is not the same as
+// issued, and no caller may say it is: the two `ip link delete`s run only for
+// an interface linkExists can see, and the reconnect only for an interface
+// findBridgeSlave found on the bridge, so a teardown can reach every step and
+// issue one command.
 func cleanupNMConnections(bridgeConn, tapName string) error {
 	// Every destructive command below is built from these two names, which
 	// come out of state.json -- a 0644 file any process running as the user
@@ -585,8 +715,19 @@ var linkExists = func(name string) bool {
 }
 
 // bridgeSlaveLinks returns the output of `ip -o link show master <bridge>`,
-// one line per interface enslaved to that bridge, or "" when the command
-// fails -- an unknown bridge, or no `ip` on PATH.
+// one line per interface attached to that bridge, and whatever the command
+// failed with.
+//
+// The error IS the signature's point. This used to answer "" for any failure,
+// which made "the bridge has no ports" and "this host cannot answer the
+// question" the same value -- and to refuseForeignBridgePort the first of
+// those means PROCEED. The second one is permanent on a host whose `ip` is
+// busybox's, which has no `show master` filter and exits 2 with `either "dev"
+// is duplicate, or "br0" is garbage`; on an iproute2 older than the filter;
+// and on a host with no `ip` on PATH. So that shape left the invariant
+// unenforced for good on every such machine, while the port list was the only
+// thing left enforcing it. Each caller now decides for itself: the assertion
+// refuses on the error, the teardown carries on past it.
 //
 // This is the swappable seam, and it sits one level BELOW findBridgeSlave,
 // which used to be the var itself. Replacing the whole function also replaced
@@ -594,29 +735,59 @@ var linkExists = func(name string) bool {
 // was never executed by a test: deleting that filter left the entire suite
 // green. With only the exec replaced, every test that reaches a teardown runs
 // the real parse and the real filter over output the fake supplies.
-var bridgeSlaveLinks = func(bridge string) string {
+var bridgeSlaveLinks = func(bridge string) (string, error) {
 	out, err := exec.Command("ip", "-o", "link", "show", "master", bridge).Output()
 	if err != nil {
-		return ""
+		// What `ip` printed is what tells "no such device" from "unknown
+		// option" from "operation not permitted", and the refusal built on
+		// this error asks the user to tell exactly those apart. %q because
+		// these are another program's bytes on their way to a terminal.
+		var exitErr *exec.ExitError
+		if errors.As(err, &exitErr) && len(exitErr.Stderr) > 0 {
+			return "", fmt.Errorf("%w: %q", err, firstLine(string(exitErr.Stderr), maxProbeStderrLen))
+		}
+		return "", err
 	}
-	return string(out)
+	return string(out), nil
 }
+
+// maxProbeStderrLen caps how much of a failing probe's stderr is quoted into
+// an error. One line of `ip` diagnostics is what is wanted out of it; the
+// rest of the message has to stay readable beside it.
+const maxProbeStderrLen = 200
 
 // findBridgeSlave finds the physical interface enslaved to the given bridge,
 // or "" when it has none. tap is the tap device in play; it is a port of this
 // same bridge and is never the answer. The choosing is parseBridgeSlave's, in
 // network_shared_parse.go, where it can be tested on any host.
+//
+// A probe that failed answers "" here, and that tolerance is deliberate:
+// cleanupNMConnections is this function's only caller, and what it wants is a
+// reconnect hint, not a security control. The cost of a wrong "" there is one
+// `nmcli device connect` not issued at the end of a teardown that has already
+// deleted the connections and the links, where a teardown that refused to run
+// because `ip` could not answer would instead leave the bridge, the tap and
+// their profiles standing. The check that must not fail open calls
+// bridgeSlaveLinks itself and refuses on the error; see
+// refuseForeignBridgePort.
 func findBridgeSlave(bridge, tap string) string {
-	return parseBridgeSlave(bridgeSlaveLinks(bridge), tap)
+	out, err := bridgeSlaveLinks(bridge)
+	if err != nil {
+		return ""
+	}
+	return parseBridgeSlave(out, tap)
 }
 
 // sudo, bridgeSlaveLinks above it and the host probes further down this file
 // are package-level vars rather than plain functions so network_linux_test.go
 // can swap them for in-process fakes and assert the exact argv sequence these
-// paths hand to root. Every one of them is an exec call and nothing more, so
-// what a fake replaces is the subprocess and never a decision: findBridgeSlave
-// is a plain function for that reason. Nothing in production assigns these;
-// the tests restore the originals with t.Cleanup.
+// paths hand to root. Each is one exec call, its result and, in
+// bridgeSlaveLinks, the wording of the error that call failed with -- no
+// branch any caller depends on. So what a fake replaces is the subprocess and
+// never a decision: findBridgeSlave, which decides which interface a teardown
+// reconnects, is a plain function for that reason, and so is
+// refuseForeignBridgePort, which decides what the port list means. Nothing in
+// production assigns these; the tests restore the originals with t.Cleanup.
 var sudo = func(name string, args ...string) error {
 	argv := append([]string{name}, args...)
 	cmd := exec.Command("sudo", argv...)
