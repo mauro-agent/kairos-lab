@@ -11,7 +11,7 @@ After you've played with kairos-lab, whether you choose to continue your Kairos 
 It helps you:
 
 - download a Kairos ISO (`download`)
-- boot a Kairos VM with bridged networking (`start`)
+- boot a Kairos VM with shared networking by default (`start`)
 - manage multiple VM disks
 - inspect state (`status`)
 - clean VM artifacts (`reset`)
@@ -81,8 +81,16 @@ The ISO is saved to the cache directory and tracked for cleanup.
 This will:
 - Create a new disk (named after the ISO + timestamp)
 - Boot the VM with the ISO attached
-- Use bridged networking (VM gets a LAN IP you can SSH to)
+- Use shared networking (VM gets a real address on a NAT subnet you can SSH to)
 - Open a graphical window
+- Poll for the VM's address for up to 45s. While the VM is running that ends
+  one of three ways: a usable address prints a WebUI URL and an SSH command; a
+  link-local one (169.254.x.x, what a guest assigns itself when no DHCP server
+  answers it) prints the same two lines under a heading saying the address is
+  link-local, with what to check, since those URLs will not reach the VM; and a
+  poll that runs out of time says it has stopped looking. The VM keeps running
+  in all three. Quit the VM before any of them and the poll simply stops,
+  saying nothing
 
 **Exit the VM with `Ctrl-a x`**
 
@@ -109,7 +117,7 @@ Downloads a Kairos ISO with interactive selection:
 
 Boots a VM with sensible defaults:
 - **Display**: `window` (graphical) by default
-- **Network**: `bridged` by default (VM gets LAN IP)
+- **Network**: `shared` by default (VM gets a real address on a NAT subnet)
 - **Disk**: Select existing or create new
 
 Flags:
@@ -117,25 +125,27 @@ Flags:
 - `-new` - Force create new disk
 - `-no-iso` - Boot without ISO (installed system)
 - `-iso <path>` - Use specific ISO file
-- `-display serial|window` - Display mode (default: window)
-- `-network bridged|user` - Network mode (default: bridged)
+- `-display window|serial` - Display mode (default: window)
+- `-network shared|bridged|user` - Network mode (default: shared)
 - `-disk-size 60G` - Disk size for new disks
-- `-memory 4096` / `-cpus 2` - VM resources
+- `-memory 4` / `-cpus 2` - VM resources (memory is in GB, not MB)
 - `-yes` - Auto-confirm prompts
 
 ### `status`
 
 Shows current state:
 - Platform and dependencies
-- Downloaded ISOs
-- Disks and their associated ISOs
-- Network configuration
+- The ISO and disk path in use
+- Network configuration, including the bridge and tap on Linux, where
+  `shared` and `bridged` build them (on macOS QEMU's vmnet backend does the
+  bridging and there are none to name)
+- The VM's address, once one has been found
 - Running VM info
 
 ### `reset`
 
 Removes VM artifacts:
-- Disks (all or specific with `--disk <name>`)
+- Disks (all or specific with `-disk <name>`)
 - Network configuration
 - Keeps downloaded ISOs and setup
 
@@ -149,28 +159,55 @@ Removes everything created by `kairos-lab`:
 
 ## Networking
 
+Three modes, picked with `-network`:
+
+- **shared** (the default) attaches no physical interface at all - it puts the
+  VM on a private NAT subnet instead. That's also why it works over Wi-Fi,
+  where `bridged` often can't: no guest frame leaves the host with a MAC the
+  access point never saw associate. The VM still gets a real address on that
+  subnet, not just forwarded ports.
+- **bridged** puts the VM on your LAN with a real LAN address, at the cost of
+  enslaving a physical interface to the bridge.
+- **user** is QEMU's own NAT with ports forwarded to localhost. It needs no
+  privileges and no NetworkManager, but it supports a single VM and no
+  cluster - the guest has no address on your network.
+
 ### macOS
 
-Uses QEMU's `vmnet-bridged` mode. Requires sudo for QEMU to access vmnet.
+Both `shared` and `bridged` use QEMU's vmnet backend and need sudo: Apple
+gates the vmnet entitlement to virtualization vendors, so a Homebrew QEMU can
+reach it only when it's launched as root. `start` checks for that up front,
+before anything is built (no disk image, no bridge, no tap), and refuses if
+you can't get it - not in the admin or wheel group, or no sudo binary at all -
+rather than fail midway through.
 
-The bridge interface defaults to the one holding the host's default route.
+`bridged`'s interface defaults to the one holding the host's default route.
 `start` refuses to run when that interface has no link, because vmnet builds
 the bridge anyway and the VM then boots with no DHCP lease and no error. Pass
-`-bridge-if <iface>` to choose a different one, or `-network user` for
-port-forwarded access.
+`-bridge-if <iface>` to choose a different one, or use `-network shared` or
+`-network user` instead.
 
 Bridging onto Wi-Fi works on some access points and not on others: many reject
 frames from a MAC other than the one that associated. `start` prints a warning
-when the interface it picked is a Wi-Fi radio.
+when the interface it picked is a Wi-Fi radio. `shared` has no such problem,
+since it attaches to no interface at all.
 
 ### Linux
 
-Requires **NetworkManager** for bridged networking. The tool:
-- Creates a bridge (`kairoslab0`) and tap device
-- Enslaves your physical interface to the bridge
-- VM gets DHCP from your LAN
+Both `shared` and `bridged` require **NetworkManager**, and both build a
+bridge (`kairoslab0`) and a tap device for the VM:
+- **shared** attaches nothing but the tap. NetworkManager runs a DHCP server
+  and NAT on the bridge, so the VM gets an address on a private subnet with no
+  physical interface touched. Its connections are created with autoconnect
+  off, so `systemctl restart NetworkManager` while a shared VM is running
+  takes the bridge and tap down with it, and they only come back on the next
+  `start` - the trade for not running a DHCP server, DNS forwarder and NAT
+  rule on every boot of a host that has no VM up at all.
+- **bridged** also enslaves your physical interface to the bridge, so the VM
+  takes its lease from your LAN instead. Its connections autoconnect, so a
+  NetworkManager restart brings the bridge back on its own.
 
-If NetworkManager is not available, use `--network user` for port-forwarded access (SSH via `localhost:2222`).
+If NetworkManager is not available, use `-network user` for port-forwarded access (SSH via `localhost:2222`).
 
 ## State and Paths
 
@@ -186,5 +223,14 @@ Override with environment variables:
 
 - Cleanup only removes what the tool created
 - Dependencies that existed before setup are never removed
-- Network cleanup restores original interface connection
+- Network cleanup reconnects your physical interface after `bridged`, but
+  only when it is what deleted the bridge-slave profile that had put the
+  interface on the bridge: `nmcli device connect <iface>` activates whichever
+  profile NetworkManager rates best for the device, and after a bridged run
+  that is routinely the bridge-slave one, so reconnecting while it is still
+  there would put the interface straight back on a bridge. When cleanup
+  declines, it prints which interface it left alone and how to put it back
+  yourself. When it does reconnect, NetworkManager may still pick a different
+  profile than your original one. `shared` enslaves no interface, so there is
+  nothing to reconnect
 - Destructive operations require confirmation (use `-yes` to skip)

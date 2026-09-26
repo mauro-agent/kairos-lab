@@ -3,6 +3,8 @@ package vm
 import (
 	"fmt"
 	"path/filepath"
+	"slices"
+	"strconv"
 	"strings"
 	"testing"
 )
@@ -259,6 +261,17 @@ func TestParseBridgeSlave(t *testing.T) {
 			tap:  DefaultTapName,
 			want: "",
 		},
+		{
+			// `ip` renders a device with a link-layer parent as
+			// "<name>@<parent>", and only the part before the '@' is a
+			// device name: the teardown hands this straight to `nmcli device
+			// connect`, which fails on "eth0.100@eth0".
+			name: "a VLAN slave is named as a device",
+			out: ipLinkLine(3, DefaultTapName, bridge) + "\n" +
+				ipLinkLine(4, "eth0.100@eth0", bridge) + "\n",
+			tap:  DefaultTapName,
+			want: "eth0.100",
+		},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -276,4 +289,269 @@ func ipLinkLine(index int, iface, bridge string) string {
 	return fmt.Sprintf(
 		"%d: %s: <BROADCAST,MULTICAST,UP,LOWER_UP> mtu 1500 qdisc noqueue master %s state UP mode DEFAULT group default qlen 1000\\    link/ether 02:00:00:00:00:%02x brd ff:ff:ff:ff:ff:ff",
 		index, iface, bridge, index)
+}
+
+// parseBridgePorts is parseBridgeSlave's sibling and excludes nothing, which
+// is the whole of the difference: the name the shared path's assertion would
+// have to exclude to reuse the other one is st.Network.TapName, out of the
+// same 0644 state.json the assertion defends against.
+func TestParseBridgePorts(t *testing.T) {
+	const bridge = DefaultBridgeName
+	tests := []struct {
+		name string
+		out  string
+		want []string
+	}{
+		{
+			name: "no output at all",
+			out:  "",
+			want: nil,
+		},
+		{
+			// The shape the two pre-activation checks require: a bridge with
+			// nothing on it reports nothing, and only then do they pass.
+			name: "a bridge with no ports",
+			out:  "\n",
+			want: nil,
+		},
+		{
+			// The tap is a port like any other here. Before the tap is
+			// activated its caller expects no ports at all, so this function
+			// may not be the thing that decides the tap is special.
+			name: "the tap is not special",
+			out:  ipLinkLine(3, DefaultTapName, bridge) + "\n",
+			want: []string{DefaultTapName},
+		},
+		{
+			name: "every port, in the order the kernel printed them",
+			out: ipLinkLine(3, DefaultTapName, bridge) + "\n" +
+				ipLinkLine(4, "eth0", bridge) + "\n" +
+				ipLinkLine(5, "wlan0", bridge) + "\n",
+			want: []string{DefaultTapName, "eth0", "wlan0"},
+		},
+		{
+			name: "malformed lines are skipped",
+			out:  "\n\n   \ngarbage\n4:\n" + ipLinkLine(5, "eth0", bridge) + "\n",
+			want: []string{"eth0"},
+		},
+		{
+			name: "a VLAN and a veth port are named as devices",
+			out: ipLinkLine(3, "eth0.100@eth0", bridge) + "\n" +
+				ipLinkLine(4, "veth7a1b@if12", bridge) + "\n",
+			want: []string{"eth0.100", "veth7a1b"},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := parseBridgePorts(tt.out)
+			if !slices.Equal(got, tt.want) {
+				t.Errorf("parseBridgePorts() = %q, want %q\nfrom:\n%s", got, tt.want, tt.out)
+			}
+		})
+	}
+}
+
+// The predicate the three assertions are built on. An empty expected list is
+// the one the two pre-activation checks pass, and it is what removes the
+// untrusted tap name from the decision entirely.
+func TestUnexpectedBridgePorts(t *testing.T) {
+	tests := []struct {
+		name     string
+		ports    []string
+		expected []string
+		want     []string
+	}{
+		{
+			name:  "nothing on the bridge, nothing expected",
+			ports: nil,
+			want:  nil,
+		},
+		{
+			name:  "the tap alone is unexpected before it is activated",
+			ports: []string{DefaultTapName},
+			want:  []string{DefaultTapName},
+		},
+		{
+			name:     "the tap alone is expected once it is",
+			ports:    []string{DefaultTapName},
+			expected: []string{DefaultTapName},
+			want:     nil,
+		},
+		{
+			name:     "a host NIC beside the tap is not",
+			ports:    []string{DefaultTapName, "eth0"},
+			expected: []string{DefaultTapName},
+			want:     []string{"eth0"},
+		},
+		{
+			name:     "every unexpected port is returned, in order",
+			ports:    []string{"eth0", DefaultTapName, "wlan0"},
+			expected: []string{DefaultTapName},
+			want:     []string{"eth0", "wlan0"},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := unexpectedBridgePorts(tt.ports, tt.expected)
+			if !slices.Equal(got, tt.want) {
+				t.Errorf("unexpectedBridgePorts(%q, %q) = %q, want %q", tt.ports, tt.expected, got, tt.want)
+			}
+		})
+	}
+}
+
+// Interface names reach the terminal through these errors, and they passed no
+// validator on the way: dev_valid_name() bars only NUL, '/', ':' and
+// whitespace, so the kernel accepts a name with a raw ESC or a U+202E in it.
+func TestQuoteNames(t *testing.T) {
+	tests := []struct {
+		name  string
+		names []string
+		want  string
+	}{
+		{name: "nothing", names: nil, want: ""},
+		{name: "one name", names: []string{"eth0"}, want: `"eth0"`},
+		{name: "several", names: []string{"eth0", "wlan0"}, want: `"eth0", "wlan0"`},
+		{
+			name:  "a control byte is escaped",
+			names: []string{"eth0" + "\x1b" + "[2K"},
+			want:  `"eth0\x1b[2K"`,
+		},
+		{
+			name:  "a direction override is escaped",
+			names: []string{"eth0" + "\u202e"},
+			want:  `"eth0\u202e"`,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := quoteNames(tt.names)
+			if got != tt.want {
+				t.Errorf("quoteNames(%q) = %s, want %s", tt.names, got, tt.want)
+			}
+			for _, r := range got {
+				if !strconv.IsPrint(r) {
+					t.Errorf("quoteNames(%q) returned an unprintable rune %U", tt.names, r)
+				}
+			}
+		})
+	}
+}
+
+// renderArgv is the render boundary for the command line inside a failed
+// root command's error, and it exists because %q on the CALLER's copy of an
+// interface name leaves the copy inside the wrapped error raw. Both copies
+// end up in one string on one terminal.
+//
+// The rule is planValue's: a word whose runes are all printable is left
+// alone, so an ordinary failure still reads back as the command that failed.
+func TestRenderArgv(t *testing.T) {
+	tests := []struct {
+		name string
+		argv []string
+		want string
+	}{
+		{name: "nothing", argv: nil, want: ""},
+		{
+			name: "an ordinary teardown command is untouched",
+			argv: []string{"nmcli", "connection", "delete", "kairoslab0"},
+			want: "nmcli connection delete kairoslab0",
+		},
+		{
+			name: "an ordinary link delete is untouched",
+			argv: []string{"ip", "link", "delete", "kairoslab-tap0"},
+			want: "ip link delete kairoslab-tap0",
+		},
+		{
+			// The name the teardown reconnects: straight out of `ip -o link
+			// show master`, through no validator.
+			name: "a control byte in an interface name",
+			argv: []string{"nmcli", "device", "connect", "eth0" + "\x1b" + "[2K"},
+			want: `nmcli device connect "eth0\x1b[2K"`,
+		},
+		{
+			name: "a newline in an interface name",
+			argv: []string{"nmcli", "device", "connect", "eth0\nwlan0"},
+			want: `nmcli device connect "eth0\nwlan0"`,
+		},
+		{
+			name: "a direction override in an interface name",
+			argv: []string{"nmcli", "device", "connect", "eth0" + "\u202e"},
+			want: `nmcli device connect "eth0\u202e"`,
+		},
+		{
+			// 0x9b is the 8-bit CSI and is not valid UTF-8 on its own, so a
+			// range loop would decode it as U+FFFD -- which is printable.
+			name: "an invalid UTF-8 byte",
+			argv: []string{"nmcli", "device", "connect", "eth0" + "\x9b" + "2K"},
+			want: `nmcli device connect "eth0\x9b2K"`,
+		},
+		{
+			// Only the words that need it, and only the ones that do: a
+			// quoted word beside untouched ones is what keeps the line
+			// readable.
+			name: "a space keeps the word one word",
+			argv: []string{"nmcli", "connection", "delete", "Wired connection 1"},
+			want: `nmcli connection delete "Wired connection 1"`,
+		},
+		{
+			// An unquoted empty word would vanish into the join and leave a
+			// shorter argv than the one that failed.
+			name: "an empty word is still a word",
+			argv: []string{"ip", "link", "delete", ""},
+			want: `ip link delete ""`,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := renderArgv(tt.argv)
+			if got != tt.want {
+				t.Errorf("renderArgv(%q) = %s, want %s", tt.argv, got, tt.want)
+			}
+			for _, r := range got {
+				if !strconv.IsPrint(r) {
+					t.Errorf("renderArgv(%q) left the unprintable rune %U on the line: %q", tt.argv, r, got)
+				}
+			}
+		})
+	}
+}
+
+// A failing probe's stderr is quoted into the refusal, because it is what
+// tells the causes that refusal lists apart. It gets one line and a cap; the
+// rest of the message has to stay readable beside it.
+func TestFirstLine(t *testing.T) {
+	tests := []struct {
+		name   string
+		in     string
+		maxLen int
+		want   string
+	}{
+		{name: "empty", in: "", maxLen: 20, want: ""},
+		{
+			name:   "what busybox says to `show master`",
+			in:     "ip: either \"dev\" is duplicate, or \"br0\" is garbage\n",
+			maxLen: 200,
+			want:   `ip: either "dev" is duplicate, or "br0" is garbage`,
+		},
+		{
+			name:   "only the first line",
+			in:     "first\nsecond\nthird\n",
+			maxLen: 200,
+			want:   "first",
+		},
+		{
+			name:   "cut to the cap",
+			in:     strings.Repeat("a", 50),
+			maxLen: 10,
+			want:   strings.Repeat("a", 10),
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := firstLine(tt.in, tt.maxLen); got != tt.want {
+				t.Errorf("firstLine(%q, %d) = %q, want %q", tt.in, tt.maxLen, got, tt.want)
+			}
+		})
+	}
 }

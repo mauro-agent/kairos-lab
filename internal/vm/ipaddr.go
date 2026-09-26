@@ -62,8 +62,12 @@ const (
 // qgaReadTimeout is well under this interval: with the two at 2s and 1s the
 // real cadence was 1.8s, and a 45s budget bought 23 attempts rather than 45.
 //
-// DefaultIPPollTimeout has no consumer in the tree yet -- M5 is the caller
-// that will pass it -- so nothing but TestPollDefaults pins its value today.
+// Both constants have a consumer: internal/app's runStart passes them to
+// vm.IPLookup.Poll for every start that is not in user mode, so this timeout
+// is the budget a user with no address actually waits out. TestPollDefaults
+// pins the values here; that a start passes THESE rather than a budget of its
+// own is pinned next door, by internal/app's
+// TestStartResolvesTheAddressBesideTheVMAndLeavesItForStatus.
 const (
 	DefaultIPPollInterval = 1 * time.Second
 	DefaultIPPollTimeout  = 45 * time.Second

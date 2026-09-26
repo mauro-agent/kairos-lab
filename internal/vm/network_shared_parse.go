@@ -3,7 +3,11 @@ package vm
 import (
 	"fmt"
 	"path/filepath"
+	"slices"
+	"strconv"
 	"strings"
+	"unicode"
+	"unicode/utf8"
 )
 
 // The path building and the output parsing in this file are deliberately kept
@@ -142,18 +146,193 @@ func validateStoredInterfaceName(field, name string) error {
 // configured name so that a tap name edited in state.json after the tap was
 // created cannot make the old tap look like a physical slave; for the default
 // configuration the two are the same string and the behaviour is unchanged.
+//
+// This is a teardown's question and not the shared path's assertion, which is
+// why parseBridgePorts below exists beside it rather than being built out of
+// it: excluding a name is right here and wrong there. See the comment on that
+// function.
 func parseBridgeSlave(out, tap string) string {
 	for _, line := range strings.Split(out, "\n") {
-		fields := strings.Fields(line)
-		if len(fields) < 2 {
-			continue
-		}
-		// Format: "3: enp0s31f6: <BROADCAST,MULTICAST,UP,LOWER_UP> mtu 1500 ..."
-		iface := strings.TrimSuffix(fields[1], ":")
+		iface := bridgePortName(line)
 		if iface == "" || iface == tap || iface == DefaultTapName {
 			continue
 		}
 		return iface
 	}
 	return ""
+}
+
+// parseBridgePorts returns every interface named in `ip -o link show master
+// <bridge>` output, in the order the kernel printed them, with no name
+// treated as special.
+//
+// Nothing is excluded, and that is the difference from parseBridgeSlave. The
+// one name a shared-mode port check would have to exclude to reuse that
+// function is st.Network.TapName, and that string comes out of state.json --
+// a 0644 file anything running as the user can write, and the file the check
+// exists to defend against. validateStoredInterfaceName accepts "eth0" there,
+// so a check that honoured the exclusion would look straight past the host's
+// own NIC sitting on the NAT bridge. The callers say what they expect the
+// port list to hold instead, and before the tap is activated that is nothing
+// at all.
+func parseBridgePorts(out string) []string {
+	var ports []string
+	for _, line := range strings.Split(out, "\n") {
+		if name := bridgePortName(line); name != "" {
+			ports = append(ports, name)
+		}
+	}
+	return ports
+}
+
+// bridgePortName returns the interface name carried by one line of `ip -o
+// link show` output, or "" when the line carries none.
+//
+// The name is the second field with the ':' the kernel prints after it
+// removed, and with anything from an '@' onwards removed too. `ip` renders a
+// device that has a link-layer parent as "<name>@<parent>", so a VLAN port
+// reads "eth0.100@eth0" and a veth reads "veth7a1b@if12". Only the part
+// before the '@' names a device: `nmcli device connect eth0.100@eth0` and
+// `ip link set dev veth7a1b@if12 nomaster` both fail, so a message built from
+// the untrimmed field sends the user to a command that cannot work, and a
+// teardown built from it reconnects nothing. A VLAN sub-interface on a bridge
+// is an ordinary host layout rather than a corner case.
+func bridgePortName(line string) string {
+	fields := strings.Fields(line)
+	if len(fields) < 2 {
+		return ""
+	}
+	// Format: "3: enp0s31f6: <BROADCAST,MULTICAST,UP,LOWER_UP> mtu 1500 ..."
+	name := strings.TrimSuffix(fields[1], ":")
+	if at := strings.IndexByte(name, '@'); at >= 0 {
+		name = name[:at]
+	}
+	return name
+}
+
+// unexpectedBridgePorts returns the ports that are not in expected, in the
+// order they were reported. An empty expected makes every port unexpected,
+// which is what the shared path asserts before it activates its tap.
+func unexpectedBridgePorts(ports, expected []string) []string {
+	var unexpected []string
+	for _, port := range ports {
+		if slices.Contains(expected, port) {
+			continue
+		}
+		unexpected = append(unexpected, port)
+	}
+	return unexpected
+}
+
+// quoteNames renders interface names for a message: each one quoted, comma
+// separated.
+//
+// These names come from `ip` output and passed no validator on the way --
+// unlike the bridge and tap names, which validateStoredInterfaceName has
+// narrowed to letters, digits, '_' and '-'. The kernel's own rule is far
+// wider: dev_valid_name() bars only an empty name, a name of IFNAMSIZ bytes
+// or more, "." and "..", and any '/', ':' or whitespace, so an interface can
+// really be named with a raw ESC in it or with U+202E. The errors these go
+// into are printed to a terminal by cmd/kairos-lab, which is the same
+// boundary internal/app's planValue draws for the cleanup plan; strconv.Quote
+// is what that helper uses on a value with an unprintable rune in it, and it
+// is what is applied here to every one of them.
+func quoteNames(names []string) string {
+	quoted := make([]string, 0, len(names))
+	for _, name := range names {
+		quoted = append(quoted, strconv.Quote(name))
+	}
+	return strings.Join(quoted, ", ")
+}
+
+// renderArgv renders the command line an exec failed on, for the error that
+// reports the failure. Each word is quoted only when it needs to be, and the
+// words are joined with spaces, so an ordinary failure still reads
+// `sudo nmcli connection delete kairoslab0`.
+//
+// The words are not all the tool's own. `nmcli device connect <iface>` is
+// built from the interface findBridgeSlave read out of `ip -o link show
+// master` output, which passed no validator on the way -- dev_valid_name()
+// bars only an empty name, IFNAMSIZ bytes or more, "." and "..", and any
+// '/', ':' or whitespace, so a raw ESC in an interface name is a name the
+// kernel takes. The error built here is wrapped by cleanupNMConnections and
+// travels through errors.Join, the shared refusal and internal/app to
+// cmd/kairos-lab's fmt.Fprintln(os.Stderr, ...), so it reaches a terminal
+// with nothing else looking at it. The caller that quotes its OWN copy of
+// that name with %q does not cover this one: both copies are in the same
+// string, and the one inside the %w arrived raw.
+//
+// Quoting every word unconditionally would cover it too and is not what this
+// does, for the reason internal/app's planValue gives: a command line that a
+// user may have to read, retype or compare against their shell history has
+// to stay a command line. A value whose runes are all printable is returned
+// unchanged; anything else goes to strconv.Quote, which escapes every rune
+// unicode.IsPrint rejects -- C0, DEL, the C1 block including 8-bit CSI, the
+// bidi overrides, the zero-width formatters -- and renders bytes that are
+// not valid UTF-8 at all as \x escapes.
+func renderArgv(argv []string) string {
+	words := make([]string, 0, len(argv))
+	for _, word := range argv {
+		words = append(words, renderArgvWord(word))
+	}
+	return strings.Join(words, " ")
+}
+
+// renderArgvWord renders one word of a command line. The space rule is this
+// line's own and sits on top of the printability one, because a word with a
+// space in it has to still look like one word: unquoted, `sudo nmcli
+// connection delete Wired connection 1` names a command nobody ran. An empty
+// word is quoted for the same reason -- it would otherwise vanish into the
+// join and leave an argv shorter than the one that failed.
+func renderArgvWord(word string) string {
+	if word == "" || strings.ContainsAny(word, " \"") || !isPrintableValue(word) {
+		return strconv.Quote(word)
+	}
+	return word
+}
+
+// isPrintableValue reports whether s can be written to a terminal as it
+// stands. It is the predicate behind internal/app's planValue, spelled out
+// here because internal/app imports this package and not the other way
+// round, and a value on its way out of internal/vm reaches the same terminal
+// through the same cmd/kairos-lab print.
+func isPrintableValue(s string) bool {
+	// A range loop decodes an invalid byte as utf8.RuneError, and U+FFFD is
+	// printable -- so a raw 0x9b (8-bit CSI, invalid on its own in UTF-8)
+	// would pass the loop untouched. Reject invalid encoding first.
+	if !utf8.ValidString(s) {
+		return false
+	}
+	for _, r := range s {
+		// The three whitespace controls are spelled out although
+		// unicode.IsPrint already rejects all three: they are the runes that
+		// do the damage, and a reader should not have to know the Cc table
+		// to see that they are caught here.
+		if !unicode.IsPrint(r) || r == '\n' || r == '\r' || r == '\t' {
+			return false
+		}
+	}
+	return true
+}
+
+// firstLine returns the first line of s, trimmed of surrounding space and cut
+// to at most maxLen bytes, for quoting another program's stderr into an error
+// message.
+//
+// A failing `ip` is worth quoting -- "ip: either \"dev\" is duplicate, or
+// \"br0\" is garbage" is what a busybox `ip` says to `show master`, and it
+// tells the user exactly which of the causes the message lists they have --
+// but it is output from another program and gets neither the terminal nor the
+// whole message to itself. The cut is on bytes and may split a rune; the
+// caller quotes the result, and strconv.Quote renders an invalid byte as an
+// escape rather than passing it through.
+func firstLine(s string, maxLen int) string {
+	s = strings.TrimSpace(s)
+	if nl := strings.IndexByte(s, '\n'); nl >= 0 {
+		s = s[:nl]
+	}
+	if len(s) > maxLen {
+		s = s[:maxLen]
+	}
+	return strings.TrimSpace(s)
 }
