@@ -1233,15 +1233,24 @@ func (p vmIPPoll) run(ctx context.Context) (vm.IPResult, bool) {
 		// reads it back. A link-local address is recorded like any other,
 		// and `status` qualifies it there the same way this block does.
 		//
-		// The warning this failure prints is scoped to the window it is true
-		// in, because the failure is not the end of the story: runStart puts
-		// the address back on its own state after it joins this goroutine and
-		// saves that when the VM exits, and that save writes the file rather
-		// than reading the one this attempt failed on. So what is lost is a
-		// `status` run made WHILE the VM is up -- the very window this poll
-		// exists to serve -- and not the record afterwards.
+		// The warning this failure prints is scoped to the window it is
+		// certainly true in, and its second line claims an attempt rather
+		// than an outcome, because recordVMIP fails in two ways that end
+		// differently. Its LOAD fails on a state file this process cannot
+		// parse, and the save runStart makes when the VM exits rebuilds that
+		// file from the state it is holding rather than reading the one this
+		// attempt choked on -- so the address does land. Its SAVE fails on a
+		// filesystem that will not take the write: a full disk, a quota, a
+		// read-only remount, a config dir the user may no longer create a
+		// file in. The exit save is the same store.Save on the same store, so
+		// it fails again for as long as that condition holds and nothing is
+		// recorded at all. Even after a load failure the later write is only
+		// an attempt -- the disk can fill between the two -- so "tries" is
+		// what this code backs on every path it covers. What is lost in both
+		// halves is a `status` run made WHILE the VM is up, the very window
+		// this poll exists to serve.
 		if err := recordVMIP(p.Store, res.IP); err != nil {
-			writef(p.Stderr, "warning: the VM address was not recorded, so `kairos-lab status` will not show it while this VM is running: %s\n         this run writes the address to the state file again when the VM exits.\n", planValue(err.Error()))
+			writef(p.Stderr, "warning: the VM address was not recorded, so `kairos-lab status` will not show it while this VM is running: %s\n         this run tries to write the address to the state file again when the VM exits.\n", planValue(err.Error()))
 		}
 		return res, true
 	}

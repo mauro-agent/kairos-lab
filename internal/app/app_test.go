@@ -3192,22 +3192,196 @@ func TestStartResolvesTheAddressBesideTheVMAndLeavesItForStatus(t *testing.T) {
 	}
 }
 
-// The warning a failed recording prints is true of the window it is printed
-// in, and it says which window that is.
+// The warning a failed recording prints claims no more than BOTH of its
+// failures keep.
 //
-// The poller's own load and save is not the last word on the address.
-// runStart hands it back onto the state it is holding as soon as it joins the
-// poll goroutine, and the save after the VM exits WRITES the state file
-// rather than reading the one the poller choked on -- so the sentence this
-// warning used to carry unscoped, "`kairos-lab status` will not show it", was
-// contradicted by the same run moments later. Both halves of the scoped
-// sentence are asserted here: nothing to show at the moment of the warning,
-// and the address on record once the VM has exited.
-func TestAFailedRecordingWarnsOnlyAboutTheWindowItIsTrueIn(t *testing.T) {
+// recordVMIP is a store.Load followed by a store.Save, and the two fail into
+// different futures. A state file this process cannot PARSE is rebuilt by the
+// save runStart makes when the VM exits -- that save writes the file from the
+// state runStart is holding rather than reading the one the poller choked on
+// -- so the address lands after all. A state file this process cannot WRITE
+// fails at the same store.Save the exit will run, on the same store, so the
+// exit fails identically and nothing is ever recorded. The first line of the
+// warning holds either way: the window the poll exists to serve is the one
+// that loses the address. The second line is why this test has two halves --
+// as a promise it was false of the write half, so it says the run tries.
+//
+// Both halves produce their failure rather than simulating it, one layer
+// apart: the first corrupts the state file, the second takes the write
+// permission off the directory store.Save creates its temporary file in.
+// That second one stands in for any filesystem that will not take the write
+// -- a full disk, a quota, a read-only remount -- which fail at their own
+// syscall inside store.Save and leave the caller where this one does.
+func TestAFailedRecordingClaimsNoMoreThanBothItsFailuresKeep(t *testing.T) {
 	if runtime.GOOS != "linux" {
 		t.Skipf("this test drives the start path as Linux takes it, and %s is not Linux: on darwin -- the only other platform kairos-lab is built for -- the run needs a firmware path from `brew --prefix qemu` before it launches anything, and the PATH this test sets holds nothing but a fake qemu", runtime.GOOS)
 	}
 	const diskName = "kairos-disk0"
+	found := vm.IPResult{IP: "192.168.64.12", Source: vm.IPSourceARP}
+
+	t.Run("the state file cannot be parsed", func(t *testing.T) {
+		store := startableBridgedRun(t, diskName)
+		// Written by the poll goroutine and read after Run returns, which is
+		// after runStart has joined that goroutine.
+		var statusAtWarningTime string
+		var statusErrAtWarningTime error
+		stubIPPoll(t, func(context.Context, vm.IPLookup, time.Duration, time.Duration) (vm.IPResult, bool) {
+			// recordVMIP loads the state file itself, and this is a file it
+			// cannot parse.
+			if err := os.WriteFile(store.StatePath, []byte("not json\n"), 0o644); err != nil {
+				t.Errorf("corrupt the state file: %v", err)
+				return vm.IPResult{}, false
+			}
+			// What a `status` in another terminal met at the moment the
+			// warning was printed. It runs from this goroutine, before the
+			// answer below has reached runStart and before anything else
+			// saves.
+			var out bytes.Buffer
+			statusErrAtWarningTime = Run([]string{"status"}, strings.NewReader(""), &out, io.Discard, "test")
+			statusAtWarningTime = out.String()
+			return found, true
+		})
+
+		var stdout, stderr bytes.Buffer
+		if err := Run([]string{"start", "-name", diskName, "-no-iso", "-network", "bridged", "-yes"},
+			strings.NewReader(""), &stdout, &stderr, "test"); err != nil {
+			t.Fatalf("start returned %v; stdout:\n%s", err, stdout.String())
+		}
+		warning := stderr.String()
+		assertRecordingWarningClaimsAnAttempt(t, warning)
+		if !strings.Contains(warning, "parse state file") {
+			t.Fatalf("the warning does not name the load as what failed, so this half is not the one it is written for:\n%s", warning)
+		}
+
+		// What the user met at that moment is the corruption this test
+		// introduced: `status` loads the same file and fails on it. The
+		// assertion is on the error and not on the empty output it left
+		// behind, because "the output does not contain the address" is true
+		// of an empty string no production change could fill.
+		if statusErrAtWarningTime == nil {
+			t.Errorf("`status` succeeded on a state file it cannot parse, printing:\n%s", statusAtWarningTime)
+		} else if !strings.Contains(statusErrAtWarningTime.Error(), "parse state file") {
+			t.Errorf("`status` failed with %v, want the parse failure the corrupt file causes", statusErrAtWarningTime)
+		}
+
+		// And the half the second line is about: the exit save rebuilt the
+		// file it could not read, so the address is on record afterwards.
+		if got := loadStoredState(t).VM.IPAddress; got != found.IP {
+			t.Fatalf("state records the address %q, want %q -- the exit save did not put back what the poller could not write", got, found.IP)
+		}
+		var statusOut bytes.Buffer
+		if err := Run([]string{"status"}, strings.NewReader(""), &statusOut, io.Discard, "test"); err != nil {
+			t.Fatalf("status: %v", err)
+		}
+		if !strings.Contains(statusOut.String(), "vm ip address: "+found.IP+"\n") {
+			t.Errorf("`status` after the VM exited does not show the address the run went on to write:\n%s", statusOut.String())
+		}
+	})
+
+	t.Run("the state file cannot be written", func(t *testing.T) {
+		if os.Geteuid() == 0 {
+			t.Skip("this half needs a directory the process may not create a file in, and root may create one in any directory whatever its mode says")
+		}
+		store := startableBridgedRun(t, diskName)
+		// The mode is put back after the start below, before anything reads
+		// the state file back. This cleanup is the belt for the t.Fatal
+		// paths: the config dir lives inside a t.TempDir(), and that
+		// directory's own cleanup cannot unlink through mode 0500 either.
+		t.Cleanup(func() { _ = os.Chmod(store.ConfigDir, 0o755) })
+		var statusAtWarningTime string
+		var statusErrAtWarningTime error
+		stubIPPoll(t, func(context.Context, vm.IPLookup, time.Duration, time.Duration) (vm.IPResult, bool) {
+			// The file still parses; it is store.Save that cannot create its
+			// temporary file beside it.
+			if err := os.Chmod(store.ConfigDir, 0o500); err != nil {
+				t.Errorf("take the write permission off the config dir: %v", err)
+				return vm.IPResult{}, false
+			}
+			var out bytes.Buffer
+			statusErrAtWarningTime = Run([]string{"status"}, strings.NewReader(""), &out, io.Discard, "test")
+			statusAtWarningTime = out.String()
+			return found, true
+		})
+
+		var stdout, stderr bytes.Buffer
+		startErr := Run([]string{"start", "-name", diskName, "-no-iso", "-network", "bridged", "-yes"},
+			strings.NewReader(""), &stdout, &stderr, "test")
+		if err := os.Chmod(store.ConfigDir, 0o755); err != nil {
+			t.Fatalf("restore the config dir mode: %v", err)
+		}
+		warning := stderr.String()
+		assertRecordingWarningClaimsAnAttempt(t, warning)
+		if !strings.Contains(warning, "create temporary state file") {
+			t.Fatalf("the warning does not name the save as what failed, so this half is not exercising the save:\n%s", warning)
+		}
+
+		// A `status` at that moment reads a file that is still whole, so it
+		// succeeds -- and shows no address, which is the listing the first
+		// line of the warning describes.
+		if statusErrAtWarningTime != nil {
+			t.Errorf("`status` failed with %v, and this half leaves the state file readable", statusErrAtWarningTime)
+		} else if !strings.Contains(statusAtWarningTime, "vm ip address: none\n") {
+			t.Errorf("`status` at the moment of the warning does not report an address of none:\n%s", statusAtWarningTime)
+		}
+
+		// The exit save is the same store.Save against the same unwritable
+		// directory, so it fails too: the address is never recorded, and the
+		// start says so rather than finishing quietly. This is the
+		// measurement the second line of the warning is worded for -- a
+		// promise to write the address later would be false here.
+		if startErr == nil {
+			t.Fatalf("the start succeeded although no save could be written; stdout:\n%s", stdout.String())
+		}
+		if !strings.Contains(startErr.Error(), "create temporary state file") {
+			t.Errorf("the start failed with %v, want the save failure the unwritable config dir causes", startErr)
+		}
+		if got := loadStoredState(t).VM.IPAddress; got != "" {
+			t.Errorf("state records the address %q after a run that could write nothing", got)
+		}
+		var statusOut bytes.Buffer
+		if err := Run([]string{"status"}, strings.NewReader(""), &statusOut, io.Discard, "test"); err != nil {
+			t.Fatalf("status: %v", err)
+		}
+		if !strings.Contains(statusOut.String(), "vm ip address: none\n") {
+			t.Errorf("`status` after the VM exited shows an address the run never managed to write:\n%s", statusOut.String())
+		}
+	})
+}
+
+// assertRecordingWarningClaimsAnAttempt checks the text both halves above
+// share: the failure is announced, the loss is scoped to the window the VM is
+// running in, and the later write is offered as an attempt.
+//
+// The last two checks are a pair. The unscoped "will not show it: " was
+// contradicted by the same run moments later on the parse half; "this run
+// writes the address ... again" was contradicted on the write half, where the
+// exit save fails exactly as the poller's did. Both are rejected by name, so
+// re-strengthening either sentence reddens both halves.
+func assertRecordingWarningClaimsAnAttempt(t *testing.T, warning string) {
+	t.Helper()
+	if !strings.Contains(warning, "warning: the VM address was not recorded") {
+		t.Fatalf("the failed recording said nothing:\n%s", warning)
+	}
+	if !strings.Contains(warning, "will not show it while this VM is running") {
+		t.Errorf("the warning does not scope its claim to the window it holds in:\n%s", warning)
+	}
+	if strings.Contains(warning, "will not show it: ") {
+		t.Errorf("the warning claims `status` will not show the address at all, which a run whose exit save succeeds goes on to contradict:\n%s", warning)
+	}
+	if !strings.Contains(warning, "tries to write the address to the state file again when the VM exits") {
+		t.Errorf("the warning does not say what the run does next:\n%s", warning)
+	}
+	if strings.Contains(warning, "run writes the address to the state file again") {
+		t.Errorf("the warning promises the later write, which a run whose config dir cannot be written does not keep:\n%s", warning)
+	}
+}
+
+// startableBridgedRun is the setup the halves above share: a Linux bridged
+// start that reaches command.Wait() with a fake QEMU on PATH and the host
+// bridge preparation stubbed out, and the store whose state file the run
+// writes.
+func startableBridgedRun(t *testing.T, diskName string) *state.Store {
+	t.Helper()
 	t.Setenv("KAIROS_LAB_CONFIG_DIR", t.TempDir())
 	t.Setenv("KAIROS_LAB_CACHE_DIR", t.TempDir())
 	fakeQEMUOnPath(t)
@@ -3226,63 +3400,7 @@ func TestAFailedRecordingWarnsOnlyAboutTheWindowItIsTrueIn(t *testing.T) {
 	if err != nil {
 		t.Fatalf("DefaultStore: %v", err)
 	}
-
-	found := vm.IPResult{IP: "192.168.64.12", Source: vm.IPSourceARP}
-	// Written by the poll goroutine and read after Run returns, which is
-	// after runStart has joined that goroutine.
-	var statusAtWarningTime string
-	stubIPPoll(t, func(context.Context, vm.IPLookup, time.Duration, time.Duration) (vm.IPResult, bool) {
-		// The failure is produced rather than simulated: recordVMIP loads
-		// the state file itself, and this is a file it cannot parse.
-		if err := os.WriteFile(store.StatePath, []byte("not json\n"), 0o644); err != nil {
-			t.Errorf("corrupt the state file: %v", err)
-			return vm.IPResult{}, false
-		}
-		// What a `status` in another terminal would show at the moment the
-		// warning is printed. It runs from this goroutine, before the answer
-		// below has reached runStart and before anything else saves.
-		var out bytes.Buffer
-		_ = Run([]string{"status"}, strings.NewReader(""), &out, io.Discard, "test")
-		statusAtWarningTime = out.String()
-		return found, true
-	})
-
-	var stdout, stderr bytes.Buffer
-	if err := Run([]string{"start", "-name", diskName, "-no-iso", "-network", "bridged", "-yes"},
-		strings.NewReader(""), &stdout, &stderr, "test"); err != nil {
-		t.Fatalf("start returned %v; stdout:\n%s", err, stdout.String())
-	}
-
-	warning := stderr.String()
-	if !strings.Contains(warning, "warning: the VM address was not recorded") {
-		t.Fatalf("the failed recording said nothing:\n%s", warning)
-	}
-	if !strings.Contains(warning, "will not show it while this VM is running") {
-		t.Errorf("the warning does not scope its claim to the window it holds in:\n%s", warning)
-	}
-	if strings.Contains(warning, "will not show it: ") {
-		t.Errorf("the warning claims `status` will not show the address at all, which this run goes on to contradict:\n%s", warning)
-	}
-	if !strings.Contains(warning, "writes the address to the state file again when the VM exits") {
-		t.Errorf("the warning does not say what the run does next:\n%s", warning)
-	}
-
-	// Half one: at the moment of the warning there was indeed nothing for
-	// `status` to show.
-	if strings.Contains(statusAtWarningTime, found.IP) {
-		t.Errorf("`status` showed the address the warning said it could not, while the recording was still broken:\n%s", statusAtWarningTime)
-	}
-	// Half two: the run put it back, so a `status` afterwards does show it.
-	if got := loadStoredState(t).VM.IPAddress; got != found.IP {
-		t.Fatalf("state records the address %q, want %q -- the exit save did not put back what the poller could not write", got, found.IP)
-	}
-	var statusOut bytes.Buffer
-	if err := Run([]string{"status"}, strings.NewReader(""), &statusOut, io.Discard, "test"); err != nil {
-		t.Fatalf("status: %v", err)
-	}
-	if !strings.Contains(statusOut.String(), "vm ip address: "+found.IP+"\n") {
-		t.Errorf("`status` after the VM exited does not show the address, so the warning's second line is not true:\n%s", statusOut.String())
-	}
+	return store
 }
 
 // What the child process writes through, per stream, and why the sudo branch
