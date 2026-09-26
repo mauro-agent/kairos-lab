@@ -83,13 +83,14 @@ This will:
 - Boot the VM with the ISO attached
 - Use shared networking (VM gets a real address on a NAT subnet you can SSH to)
 - Open a graphical window
-- Poll for the VM's address for up to 45s, which ends one of three ways: a
-  usable address prints a WebUI URL and an SSH command; a link-local one
-  (169.254.x.x, what a guest assigns itself when no DHCP server answers it)
-  prints the same two lines under a heading saying the address is link-local,
-  with what to check, since those URLs will not reach the VM; and a poll that
-  runs out of time says it has stopped looking. The VM keeps running in all
-  three cases
+- Poll for the VM's address for up to 45s. While the VM is running that ends
+  one of three ways: a usable address prints a WebUI URL and an SSH command; a
+  link-local one (169.254.x.x, what a guest assigns itself when no DHCP server
+  answers it) prints the same two lines under a heading saying the address is
+  link-local, with what to check, since those URLs will not reach the VM; and a
+  poll that runs out of time says it has stopped looking. The VM keeps running
+  in all three. Quit the VM before any of them and the poll simply stops,
+  saying nothing
 
 **Exit the VM with `Ctrl-a x`**
 
