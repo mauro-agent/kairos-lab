@@ -3,6 +3,8 @@ package app
 import (
 	"bytes"
 	"errors"
+	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -598,4 +600,332 @@ func TestRemovalEchoAndItsErrorAreBothInert(t *testing.T) {
 	assertPlanIsInert(t, stdout.String())
 	assertPlanIsInert(t, stderr.String())
 	assertPlanIsInert(t, err.Error())
+}
+
+// --- network mode ---------------------------------------------------------
+
+// The accepted set has exactly one home, and this is what "exactly one" buys:
+// a mode is either in networkModes or it is not, and the flag, the reviewer
+// prompt and both rejection messages all ask the same function. The case and
+// whitespace rows are a deliberate decision, not an accident of the
+// implementation: matching stays exact, the way the display mode and the
+// subcommand names are matched, because a folded near-miss would be stored in
+// state.json and then compared exactly by internal/vm, whose BuildQEMUCommand
+// falls back to user networking for anything it does not recognise. A guest
+// silently on the wrong network is worse than a rejected typo.
+func TestNetworkModeValid(t *testing.T) {
+	cases := []struct {
+		mode string
+		want bool
+	}{
+		{"shared", true},
+		{"bridged", true},
+		{"user", true},
+		{"", false},
+		{"nonsense", false},
+		{"Shared", false},
+		{"SHARED", false},
+		{" shared", false},
+	}
+	for _, tc := range cases {
+		t.Run("mode="+strconv.Quote(tc.mode), func(t *testing.T) {
+			if got := networkModeValid(tc.mode); got != tc.want {
+				t.Errorf("networkModeValid(%q) = %v, want %v", tc.mode, got, tc.want)
+			}
+		})
+	}
+}
+
+// The empty string deserves its own reason, separate from the table above.
+// reviewVMConfig treats an empty answer at prompt 7 as "leave the mode as it
+// is" and prints nothing, and it does that by asking networkModeValid first
+// and only then filtering "" out of the rejection branch. If "" ever became
+// valid, an empty answer would blank the mode instead of keeping it.
+func TestNetworkModeValidRejectsTheEmptyString(t *testing.T) {
+	if networkModeValid("") {
+		t.Fatal(`networkModeValid("") is true, so an empty answer at the reviewer's prompt would set the mode to ""`)
+	}
+}
+
+// Shared is the default because it is the mode that gives a guest a usable
+// address without bridging onto the host's LAN: internal/vm notes that it
+// works over Wi-Fi where bridged cannot, and unlike user mode -- which is a
+// port-forwarded NAT behind QEMU, with no address of the guest's own and so no
+// way for two VMs to form a cluster -- it leaves the guests able to see each
+// other. This is the one place in the tests the literal is written down, on
+// purpose: changing the default should be a deliberate edit here rather than a
+// silent change in behaviour.
+func TestDefaultNetworkModeIsShared(t *testing.T) {
+	if defaultNetworkMode != "shared" {
+		t.Errorf("defaultNetworkMode = %q, want %q", defaultNetworkMode, "shared")
+	}
+	// A default the validator rejects would fail every start that passes no
+	// -network at all, which is the common case.
+	if !networkModeValid(defaultNetworkMode) {
+		t.Errorf("networkModeValid(%q) is false, so the default mode cannot be started", defaultNetworkMode)
+	}
+}
+
+// The declared default of the -network flag, asserted through the flag rather
+// than by re-reading the constant: the value is observed where the user would
+// see it, on the config review's Network row, after a `start` that passed no
+// -network. Repeating "shared" here instead would pass even if the flag
+// declaration still said "bridged", which is exactly the wiring this exists to
+// check.
+func TestStartWithNoNetworkFlagUsesTheDefaultMode(t *testing.T) {
+	t.Setenv("KAIROS_LAB_CONFIG_DIR", t.TempDir())
+	t.Setenv("KAIROS_LAB_CACHE_DIR", t.TempDir())
+	seedStartableState(t, "kairos-disk0")
+
+	var stdout, stderr bytes.Buffer
+	// -no-iso and an existing disk keep this out of the ISO resolver, and the
+	// single newline answers the review's menu and then runs out, so the
+	// "Press Enter to start" read hits EOF and the run is cancelled before
+	// anything is created or executed. The error is therefore not the subject
+	// here; the bytes printed on the way to it are.
+	_ = Run([]string{"start", "-name", "kairos-disk0", "-no-iso"}, scriptedInput("\n"), &stdout, &stderr, "test")
+
+	want := fmt.Sprintf("  7) Network:      %s\n", defaultNetworkMode)
+	if !strings.Contains(stdout.String(), want) {
+		t.Fatalf("the config review does not show %q, so the -network flag's default is not defaultNetworkMode; got:\n%s", want, stdout.String())
+	}
+}
+
+// Every mode the CLI documents has to get past validation, and nothing else
+// may. These all stop at requireSetup on a fresh config dir -- the same seam
+// TestRunAcceptsSubcommandsWithoutPositionalArguments uses -- which is proof
+// they cleared the mode check without a VM, a disk or a host network being
+// touched.
+func TestStartAcceptsEveryDocumentedNetworkMode(t *testing.T) {
+	for _, mode := range []string{"shared", "bridged", "user"} {
+		t.Run(mode, func(t *testing.T) {
+			t.Setenv("KAIROS_LAB_CONFIG_DIR", t.TempDir())
+			t.Setenv("KAIROS_LAB_CACHE_DIR", t.TempDir())
+
+			var stdout, stderr bytes.Buffer
+			err := Run([]string{"start", "-network", mode, "-iso", "/tmp/kairos.iso"}, strings.NewReader(""), &stdout, &stderr, "test")
+			if !errors.Is(err, errSetupRequired) {
+				t.Fatalf("-network %s: got %v, want %v", mode, err, errSetupRequired)
+			}
+		})
+	}
+}
+
+// The rejection is user-facing text and is asserted whole: "invalid network
+// mode: %s" is what the CLI has always said, and the value is echoed back so
+// the user can see the typo. The case variants are here to pin the exactness
+// decision at the CLI boundary too, not only on the helper.
+func TestStartRejectsAnUnknownNetworkMode(t *testing.T) {
+	for _, mode := range []string{"nonsense", "Shared", "SHARED"} {
+		t.Run(mode, func(t *testing.T) {
+			t.Setenv("KAIROS_LAB_CONFIG_DIR", t.TempDir())
+			t.Setenv("KAIROS_LAB_CACHE_DIR", t.TempDir())
+
+			var stdout, stderr bytes.Buffer
+			err := Run([]string{"start", "-network", mode}, strings.NewReader(""), &stdout, &stderr, "test")
+			if err == nil {
+				t.Fatalf("-network %s was accepted, want an error", mode)
+			}
+			want := "invalid network mode: " + mode
+			if err.Error() != want {
+				t.Fatalf("got %q, want %q", err.Error(), want)
+			}
+		})
+	}
+}
+
+// The issue driving this work: a mode the flag accepts that the reviewer does
+// not is a mode nobody who opens the config review can keep. Both halves are
+// checked here -- the mode is actually changed, and the prompt offers all
+// three by name, since a prompt that still reads "(bridged or user)" is how a
+// user learns the set.
+func TestReviewVMConfigAcceptsSharedNetworkMode(t *testing.T) {
+	cfg := reviewableConfig(t)
+	cfg.NetworkMode = "bridged"
+
+	var stdout bytes.Buffer
+	got, err := reviewVMConfig(cfg, scriptedInput("7\nshared\n\n"), &stdout)
+	if err != nil {
+		t.Fatalf("reviewVMConfig: %v", err)
+	}
+	if got.NetworkMode != "shared" {
+		t.Errorf("NetworkMode = %q, want %q", got.NetworkMode, "shared")
+	}
+	if !strings.Contains(stdout.String(), "Enter network mode (shared, bridged or user)") {
+		t.Errorf("the prompt does not offer shared, so the user cannot discover it:\n%s", stdout.String())
+	}
+	if strings.Contains(stdout.String(), invalidNetworkModeMessage) {
+		t.Errorf("a valid mode was rejected:\n%s", stdout.String())
+	}
+}
+
+// invalidNetworkModeMessage is the reviewer's rejection line. It names all
+// three modes: the message is the only place a user who typed a typo is told
+// what the alternatives are.
+const invalidNetworkModeMessage = "Invalid network mode, use 'shared', 'bridged' or 'user'"
+
+func TestReviewVMConfigRejectsAnUnknownNetworkMode(t *testing.T) {
+	cfg := reviewableConfig(t)
+	cfg.NetworkMode = "bridged"
+
+	var stdout bytes.Buffer
+	got, err := reviewVMConfig(cfg, scriptedInput("7\nnonsense\n\n"), &stdout)
+	if err != nil {
+		t.Fatalf("reviewVMConfig: %v", err)
+	}
+	// Unchanged, not blanked and not set to the typo: a rejected answer must
+	// leave the configuration the user already had.
+	if got.NetworkMode != "bridged" {
+		t.Errorf("NetworkMode = %q after a rejected answer, want it left at %q", got.NetworkMode, "bridged")
+	}
+	if !strings.Contains(stdout.String(), invalidNetworkModeMessage) {
+		t.Errorf("the rejection does not list all three modes; got:\n%s", stdout.String())
+	}
+}
+
+// Pressing Enter at prompt 7 means "I did not want to change this". It has to
+// stay silent: printing a rejection for an answer the user never gave teaches
+// them that Enter is an error, when it is the way out of the sub-prompt.
+func TestReviewVMConfigLeavesTheModeAloneOnAnEmptyAnswer(t *testing.T) {
+	cfg := reviewableConfig(t)
+	cfg.NetworkMode = "bridged"
+
+	var stdout bytes.Buffer
+	got, err := reviewVMConfig(cfg, scriptedInput("7\n\n\n"), &stdout)
+	if err != nil {
+		t.Fatalf("reviewVMConfig: %v", err)
+	}
+	if got.NetworkMode != "bridged" {
+		t.Errorf("NetworkMode = %q after an empty answer, want it unchanged at %q", got.NetworkMode, "bridged")
+	}
+	if strings.Contains(stdout.String(), invalidNetworkModeMessage) {
+		t.Errorf("an empty answer printed a rejection:\n%s", stdout.String())
+	}
+}
+
+// shared attaches to no host interface -- on macOS vmnet-shared takes no
+// ifname at all, and on Linux the bridge it builds has no uplink to enslave --
+// so menu entry 8 has nothing to offer in that mode and says so. The wording
+// matters because the old one ("only available for bridged mode") read as a
+// platform limitation to a user who had just been given shared by default.
+func TestReviewVMConfigHasNoInterfaceToPickInSharedMode(t *testing.T) {
+	cfg := reviewableConfig(t)
+	cfg.NetworkMode = "shared"
+	cfg.NetworkIface = "eth0"
+
+	var stdout bytes.Buffer
+	got, err := reviewVMConfig(cfg, scriptedInput("8\n\n"), &stdout)
+	if err != nil {
+		t.Fatalf("reviewVMConfig: %v", err)
+	}
+	want := "Invalid option (a network interface applies to bridged mode only, on Linux and macOS; shared mode attaches to no host interface)"
+	if !strings.Contains(stdout.String(), want) {
+		t.Errorf("entry 8 under shared does not explain itself; want %q, got:\n%s", want, stdout.String())
+	}
+	// Nothing was prompted for, so nothing may have been stored either.
+	if got.NetworkIface != "eth0" {
+		t.Errorf("NetworkIface = %q, want it untouched at %q", got.NetworkIface, "eth0")
+	}
+}
+
+// bridgedIfaceSelectable is the gate that keeps shared out of interface
+// detection: runStart only probes the host for an uplink when the mode is
+// bridged, and the reviewer only offers entry 8 when this returns true. It was
+// already correct before shared existed, and adding a mode is exactly the kind
+// of change that would quietly widen it -- a gate that answered true for
+// shared would send a shared start looking for an uplink it does not use, and
+// fail on a Wi-Fi-only host with an error about bridged networking.
+func TestBridgedIfaceSelectableOnlyForBridged(t *testing.T) {
+	for _, mode := range []string{"shared", "user", "", "nonsense"} {
+		if bridgedIfaceSelectable(mode) {
+			t.Errorf("bridgedIfaceSelectable(%q) is true, so %q would reach interface detection", mode, mode)
+		}
+	}
+	// The other half: the gate still opens for the mode that needs it,
+	// otherwise the assertions above would pass with the function hardwired to
+	// false.
+	wantBridged := runtime.GOOS == "linux" || runtime.GOOS == "darwin"
+	if got := bridgedIfaceSelectable("bridged"); got != wantBridged {
+		t.Errorf("bridgedIfaceSelectable(%q) = %v, want %v on %s", "bridged", got, wantBridged, runtime.GOOS)
+	}
+}
+
+// seedStartableState writes a state.json that `start` will run against: setup
+// complete, and one existing disk so the run resolves a disk without reaching
+// the ISO resolver or creating anything.
+func seedStartableState(t *testing.T, diskName string) {
+	t.Helper()
+	store, err := state.DefaultStore()
+	if err != nil {
+		t.Fatalf("DefaultStore: %v", err)
+	}
+	st := state.NewState(store)
+	st.Setup.CompletedAt = state.NowRFC3339()
+	st.Setup.DependencyCheckPassed = true
+	st.Disks = append(st.Disks, state.Disk{
+		Name:      diskName,
+		Path:      filepath.Join(store.CacheDir, "vm", diskName+".qcow2"),
+		Size:      "60G",
+		CreatedAt: state.NowRFC3339(),
+	})
+	if err := store.Save(st); err != nil {
+		t.Fatalf("Save: %v", err)
+	}
+}
+
+// reviewableConfig is the smallest config reviewVMConfig can render: it calls
+// freeSpaceGB on the disk path's directory (which must exist for df to answer,
+// though a 0 answer is handled), systemRAMGB, and parseSizeGB on the size
+// string. Nothing here is written to, and no disk image is created.
+func reviewableConfig(t *testing.T) *vmStartConfig {
+	t.Helper()
+	return &vmStartConfig{
+		DiskName:     "kairos-disk0",
+		DiskPath:     filepath.Join(t.TempDir(), "kairos-disk0.qcow2"),
+		DiskSize:     "60G",
+		MemoryGB:     4,
+		CPUs:         2,
+		NetworkMode:  defaultNetworkMode,
+		Display:      "window",
+		DownloadsDir: t.TempDir(),
+		TakenNames:   map[string]struct{}{},
+	}
+}
+
+// scriptedInput hands back one line per Read, the way a terminal in canonical
+// mode does.
+//
+// A plain strings.Reader cannot drive reviewVMConfig: the function builds a
+// fresh bufio.Reader for the menu on every iteration and prompt() builds
+// another for every sub-prompt, and each of those fills its 4 KiB buffer from
+// the first Read. A strings.Reader answers that with the WHOLE script, so the
+// first bufio.Reader swallows every remaining line and then goes out of scope
+// with them still in its buffer; the next prompt sees EOF and the reviewer
+// returns "no input" instead of processing line two. Reading a line at a time
+// is both what a tty actually does and the only way these tests exercise the
+// menu rather than the cancel path.
+func scriptedInput(script string) io.Reader {
+	lines := strings.SplitAfter(script, "\n")
+	out := make([]string, 0, len(lines))
+	for _, line := range lines {
+		if line != "" {
+			out = append(out, line)
+		}
+	}
+	return &lineReader{lines: out}
+}
+
+type lineReader struct{ lines []string }
+
+func (r *lineReader) Read(p []byte) (int, error) {
+	if len(r.lines) == 0 {
+		return 0, io.EOF
+	}
+	n := copy(p, r.lines[0])
+	if n < len(r.lines[0]) {
+		r.lines[0] = r.lines[0][n:]
+		return n, nil
+	}
+	r.lines = r.lines[1:]
+	return n, nil
 }

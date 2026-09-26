@@ -10,6 +10,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"runtime"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -299,7 +300,7 @@ func runStart(args []string, stdin io.Reader, stdout, stderr io.Writer, store *s
 	noISO := fs.Bool("no-iso", false, "boot without ISO (for installed systems)")
 	memory := fs.Int("memory", defaultMemoryMB()/1024, "memory in GB")
 	cpus := fs.Int("cpus", 2, "number of vCPUs")
-	network := fs.String("network", "bridged", "network mode: bridged|user")
+	network := fs.String("network", defaultNetworkMode, "network mode: shared|bridged|user")
 	display := fs.String("display", "window", "display mode: window|serial")
 	bridgeIface := fs.String("bridge-if", defaultBridgeIface(), "bridge interface (macOS vmnet or Linux uplink iface)")
 	autoYes := fs.Bool("yes", false, "auto-confirm sudo operations")
@@ -309,7 +310,7 @@ func runStart(args []string, stdin io.Reader, stdout, stderr io.Writer, store *s
 	if err := rejectPositionalArgs(fs, "pass the ISO with -iso"); err != nil {
 		return err
 	}
-	if *network != "bridged" && *network != "user" {
+	if !networkModeValid(*network) {
 		return fmt.Errorf("invalid network mode: %s", *network)
 	}
 	if *display != "serial" && *display != "window" {
@@ -1293,14 +1294,14 @@ func reviewVMConfig(cfg *vmStartConfig, stdin io.Reader, stdout io.Writer) (*vmS
 				}
 			}
 		case 7:
-			val, err := prompt(stdin, stdout, "Enter network mode (bridged or user)")
+			val, err := prompt(stdin, stdout, "Enter network mode (shared, bridged or user)")
 			if err != nil {
 				return nil, err
 			}
-			if val == "bridged" || val == "user" {
+			if networkModeValid(val) {
 				cfg.NetworkMode = val
 			} else if val != "" {
-				writeLine(stdout, "Invalid network mode, use 'bridged' or 'user'")
+				writeLine(stdout, "Invalid network mode, use 'shared', 'bridged' or 'user'")
 			}
 		case 8:
 			if bridgedIfaceSelectable(cfg.NetworkMode) {
@@ -1330,7 +1331,7 @@ func reviewVMConfig(cfg *vmStartConfig, stdin io.Reader, stdout io.Writer) (*vmS
 					}
 				}
 			} else {
-				writeLine(stdout, "Invalid option (network interface only available for bridged mode on Linux and macOS)")
+				writeLine(stdout, "Invalid option (a network interface applies to bridged mode only, on Linux and macOS; shared mode attaches to no host interface)")
 			}
 		case 9:
 			val, err := prompt(stdin, stdout, "Enter display mode (window or serial)")
@@ -1476,6 +1477,42 @@ func bridgeIfaceCandidates() []string {
 		return vm.DetectBridgeIfaceCandidates()
 	}
 	return nil
+}
+
+// defaultNetworkMode is the mode a `start` with no -network gets, and
+// networkModes is the whole set the CLI accepts. They live here, together and
+// alone, because the set used to be spelled out inline at each of the two
+// places a mode string is checked -- once in runStart against the -network
+// flag, and once in reviewVMConfig against what the user types at prompt 7 --
+// and those two drifted the moment a mode was added. Adding a mode to the flag
+// and forgetting the reviewer leaves the CLI in the state where a run can be
+// started in the new mode but the config review cannot select it back, and
+// rejects the very default the flag just handed it, which is invisible to
+// anyone who passes -yes and unavoidable for everyone who does not.
+//
+// So a fourth mode is one entry in the slice below and nothing else: the flag
+// default, the flag's validation, the reviewer's prompt and both rejection
+// messages then agree by construction.
+//
+// Matching is deliberately exact. "Shared", "SHARED" and " shared" are all
+// rejected rather than folded, both because every other enumerated value in
+// this CLI (the display mode validated right after the network one in
+// runStart, the subcommand names in Run) is matched exactly too, and because
+// a tolerated near-miss would be written to state.json and handed to
+// internal/vm, where
+// BuildQEMUCommand compares the mode exactly and quietly falls back to user
+// networking for anything it does not recognise -- a VM that boots, looks
+// healthy, and is on the wrong network.
+const defaultNetworkMode = "shared"
+
+var networkModes = []string{defaultNetworkMode, "bridged", "user"}
+
+// networkModeValid reports whether mode is one the CLI accepts. The empty
+// string is not one of them, which the reviewer relies on: an empty answer at
+// prompt 7 means "leave it alone", so it must fail this check and then be
+// filtered out ahead of the rejection message rather than being accepted here.
+func networkModeValid(mode string) bool {
+	return slices.Contains(networkModes, mode)
 }
 
 // bridgedIfaceSelectable reports whether the network interface is the user's
