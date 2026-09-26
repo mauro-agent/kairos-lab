@@ -159,11 +159,13 @@ Removes everything created by `kairos-lab`:
 
 ## Networking
 
-Three modes, picked with `-network`:
+Three modes, picked with `-network`. This CLI starts one VM at a time
+whichever you pick - what differs is what that guest can reach, and what can
+reach it:
 
 | Mode | Gets | Cannot |
 |---|---|---|
-| `shared` (default) | Internet, an address the host can reach, a subnet of its own | Be reached from other machines on your LAN, or run a second VM: this CLI starts one at a time |
+| `shared` (default) | Internet, an address the host can reach, a subnet of its own | Be reached from other machines on your LAN |
 | `bridged` | An address on your LAN that other machines can reach | Work reliably over Wi-Fi |
 | `user` | Internet, for a single VM | Be reached by another VM, or form a cluster |
 
@@ -193,9 +195,10 @@ access points and fails on others.
 **user** is QEMU's own NAT, with ports forwarded from the host - connect at
 `ssh -p 2222 kairos@localhost` and `http://localhost:8080`. It needs no
 privileges and no NetworkManager. SLIRP is a userspace NAT inside the QEMU
-process, so the guest has no address on your network at all - nothing else
-can address it. That is what keeps `user` to a single VM and out of any
-cluster, and it is a limit of the network itself, not of the CLI.
+process, so the guest has no address on your network at all and those two
+forwarded ports are the only way in. That is what keeps `user` to a single VM
+and out of any cluster, and it is a limit of the network itself, not of the
+CLI.
 
 ### macOS
 
@@ -220,13 +223,13 @@ Naming an interface yourself with `-bridge-if <iface>` skips that resolution,
 but `start` still checks the interface you named has a link, and refuses if
 it doesn't.
 
-`start` prints a warning when the interface it resolves - default-route or
-fallback - is a Wi-Fi radio, so you see that risk before the VM boots rather
-than after it fails to get a lease. `shared` has no such problem, since it
+`start` prints a warning when the interface it ends up with - default-route,
+fallback, or one you named - is a Wi-Fi radio, so you see that risk before the
+VM boots rather than after it fails to get a lease. `shared` has no such problem, since it
 attaches to no interface at all.
 
-vmnet typically puts `shared` on `192.168.64.1/24`, but treat that as an
-example, not a promise: the QEMU command line only ever asks for
+vmnet typically puts the shared subnet's gateway at `192.168.64.1/24` and
+leases guests addresses above it, but treat that as an example, not a promise: the QEMU command line only ever asks for
 `-netdev vmnet-shared,id=net0`, with no address options at all, so the guest
 lands wherever Apple's vmnet framework decides to put it. Apple documents no
 subnet policy for `VMNET_SHARED_MODE` - the maintainer of Apple's own
@@ -255,8 +258,10 @@ bridge (`kairoslab0`) and a tap device for the VM:
   takes its lease from your LAN instead. `-bridge-if` accepts a Wi-Fi device
   (`wlan*`) with no complaint, but the same Wi-Fi unreliability described
   above applies here too, and unlike macOS, nothing warns you before the VM
-  boots. Its connections autoconnect, so a NetworkManager restart brings the
-  bridge back on its own.
+  boots. Its bridge carries `ipv4.method auto` rather than `shared`, so the
+  unmanage-on-stop rule above never reaches it and a NetworkManager restart
+  leaves it up; its connections autoconnect as well, so it comes back on its
+  own if it ever does go down.
 
 If NetworkManager is not available, use `-network user` for port-forwarded
 access (`ssh -p 2222 kairos@localhost`, `http://localhost:8080`).
