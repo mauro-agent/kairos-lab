@@ -1742,11 +1742,29 @@ func printUsage(w io.Writer) {
 	writeLine(w, "  cleanup              Remove everything created by tool")
 	writeLine(w, "  version              Print CLI version")
 	writeLine(w, "")
+	// The flags listed here are the ones a first run has to decide: which
+	// disk and ISO to boot, and the two settings whose default can be the
+	// wrong one for the host in front of the user. -network, because shared
+	// is the default that works on the most hosts rather than the one a user
+	// putting the VM on the LAN wants, and -display, because window passes
+	// QEMU -display default (see internal/vm) where a user on a remote
+	// shell wants the serial console instead. The rest of what runStart
+	// declares -- -disk-size, -memory, -cpus, -bridge-if, -yes -- tunes a
+	// run whose shape is already settled, and `kairos-lab start -h` prints
+	// every flag the start flag set declares for whoever needs one.
+	//
+	// The value column is padded to line the descriptions up with the ones
+	// in the Commands block above, which leaves 19 columns for a flag and
+	// its placeholder. "-network shared|bridged|user" does not fit in that,
+	// so the modes are spelled out in the description instead of the value,
+	// and the column stays where every other row in this usage has it.
 	writeLine(w, "Start flags:")
 	writeLine(w, "  -name <name>         Use/create disk with this name")
 	writeLine(w, "  -new                 Create new disk (even if others exist)")
 	writeLine(w, "  -no-iso              Boot without ISO (installed system)")
 	writeLine(w, "  -iso <path>          Use specific ISO file")
+	writeLine(w, "  -network <mode>      Network mode: shared|bridged|user (default shared)")
+	writeLine(w, "  -display <mode>      Display mode: window|serial (default window)")
 	writeLine(w, "")
 	writeLine(w, "Exit VM with Ctrl-a x (QEMU serial console quit)")
 }

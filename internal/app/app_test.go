@@ -9,6 +9,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"regexp"
 	"runtime"
 	"slices"
 	"strconv"
@@ -951,6 +952,116 @@ func captureOSStderr(t *testing.T, fn func() error) (string, error) {
 		t.Fatalf("read captured stderr: %v", err)
 	}
 	return string(out), fnErr
+}
+
+// The no-argument usage is the other place the network modes are written
+// down, and the only one a user reaches without already knowing to ask:
+// `start -h` is pinned above, but that message exists only for someone who
+// guessed the flag was there. Nothing derived this block from the code, which
+// is how -network stayed missing from it for the whole life of the flag, so
+// the expected text is built out of networkModes and defaultNetworkMode
+// rather than copied. Adding a mode or moving the default now reddens a usage
+// block that has not kept up.
+func TestUsageListsEveryNetworkModeAndItsDefault(t *testing.T) {
+	var stdout bytes.Buffer
+	if err := Run(nil, strings.NewReader(""), &stdout, io.Discard, "test"); err != nil {
+		t.Fatalf("Run with no arguments: %v", err)
+	}
+	want := "Network mode: " + strings.Join(networkModes, "|") +
+		" (default " + defaultNetworkMode + ")"
+	if !strings.Contains(stdout.String(), want) {
+		t.Fatalf("usage printed for no arguments does not contain %q, so a mode is undocumented or the default moved; got:\n%s", want, stdout.String())
+	}
+}
+
+// Every flag the no-argument usage advertises has to be one `start` really
+// declares. The two lists are hand-written in different functions, and a
+// usage naming a flag that does not exist is worse than one missing a flag:
+// it tells the user to type something the flag set then refuses to parse.
+// What it compares against is the flag set's own printed usage, so it is the
+// declarations being read rather than a third copy of them.
+func TestUsageAdvertisesOnlyFlagsStartDeclares(t *testing.T) {
+	t.Setenv("KAIROS_LAB_CONFIG_DIR", t.TempDir())
+	t.Setenv("KAIROS_LAB_CACHE_DIR", t.TempDir())
+
+	var stdout bytes.Buffer
+	if err := Run(nil, strings.NewReader(""), &stdout, io.Discard, "test"); err != nil {
+		t.Fatalf("Run with no arguments: %v", err)
+	}
+	startUsage, err := captureOSStderr(t, func() error {
+		return Run([]string{"start", "-h"}, strings.NewReader(""), io.Discard, io.Discard, "test")
+	})
+	if !errors.Is(err, flag.ErrHelp) {
+		t.Fatalf("start -h returned %v, want flag.ErrHelp; captured:\n%s", err, startUsage)
+	}
+	for _, row := range usageBlock(t, stdout.String(), "Start flags:") {
+		name := strings.Fields(row)[0]
+		// flag prints one declaration per row as the name, then either the
+		// value type or, for a bool, nothing at all.
+		declared := regexp.MustCompile(`(?m)^\s+` + regexp.QuoteMeta(name) + `( |$)`)
+		if !declared.MatchString(startUsage) {
+			t.Fatalf("usage lists %s under \"Start flags:\" but the start flag set does not declare it, so a user who types it gets a parse error; start -h printed:\n%s", name, startUsage)
+		}
+	}
+}
+
+// Both usage lists are tables laid out by padding the first column by hand,
+// and nothing but this check holds that column: a name wider than the padding
+// pushes its own description right, and one misaligned row is invisible in a
+// diff that adds a single string. The two lists are measured together because
+// they share one column -- widening it is allowed, widening it for one row is
+// not.
+func TestUsageDescriptionsShareOneColumn(t *testing.T) {
+	var stdout bytes.Buffer
+	if err := Run(nil, strings.NewReader(""), &stdout, io.Discard, "test"); err != nil {
+		t.Fatalf("Run with no arguments: %v", err)
+	}
+	// A row is two spaces of indent, a name, and the gap that separates the
+	// name from its description; the description starts where that gap ends.
+	row := regexp.MustCompile(`^ {2}\S.*?\s{2,}(\S)`)
+	column, first := -1, ""
+	for _, header := range []string{"Commands:", "Start flags:"} {
+		for _, line := range usageBlock(t, stdout.String(), header) {
+			m := row.FindStringSubmatchIndex(line)
+			if m == nil {
+				t.Fatalf("usage row %q under %q is not an indented name followed by a padded description", line, header)
+			}
+			at := m[2]
+			if column == -1 {
+				column, first = at, line
+				continue
+			}
+			if at != column {
+				t.Fatalf("description in %q starts at column %d but %q starts its own at %d; every row in these two lists shares one column", line, at, first, column)
+			}
+		}
+	}
+}
+
+// usageBlock returns the rows printed under header, which run until the blank
+// line that ends the block. It reads the rendered usage rather than reaching
+// into printUsage, because the alignment being checked is a property of the
+// bytes the user sees and of nothing else.
+func usageBlock(t *testing.T, usage, header string) []string {
+	t.Helper()
+	var rows []string
+	inBlock := false
+	for _, line := range strings.Split(usage, "\n") {
+		switch {
+		case line == header:
+			inBlock = true
+		case !inBlock:
+		case strings.TrimSpace(line) == "":
+			if len(rows) == 0 {
+				t.Fatalf("usage block %q is empty; got:\n%s", header, usage)
+			}
+			return rows
+		default:
+			rows = append(rows, line)
+		}
+	}
+	t.Fatalf("usage has no %q block; got:\n%s", header, usage)
+	return nil
 }
 
 // Every mode the CLI documents has to get past validation, and nothing else
