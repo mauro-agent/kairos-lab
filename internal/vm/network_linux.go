@@ -60,11 +60,26 @@ func linuxNetworkPreflight(st *state.State, runtimeDir, mode string) (bridge, ta
 	// matters to the shared path too.
 	if hasStaleBridgeResources(bridge) {
 		fmt.Println("Found stale network configuration, cleaning up...")
-		// The error is discarded here and nowhere else: a stale resource that
-		// will not go is not by itself a reason to refuse a start, and the
-		// `nmcli connection add` that follows fails loudly on its own if the
-		// leftover is genuinely in the way.
-		_ = cleanupNMConnections(bridge, tap)
+		cleanupErr := cleanupNMConnections(bridge, tap)
+		// A leftover that will not go is fatal for shared and survivable for
+		// bridged, and the whole difference is the <bridge>-uplink
+		// connection. It carries `master <bridge> slave-type bridge` and
+		// autoconnect yes, both set by the bridged path, so bringing this
+		// bridge up with that connection still on the host has
+		// NetworkManager enslave the host's physical NIC to it. For bridged
+		// that is roughly what the run was going to do anyway, and the path
+		// recreates and re-modifies that connection itself a few lines
+		// later, which is why the error is dropped there. For shared the
+		// bridge carries ipv4.method shared and its only port is meant to be
+		// the tap: enslaving the NIC destroys the "no uplink" invariant the
+		// mode exists for, and takes the host's connectivity with it. That
+		// is not a start to attempt and then explain.
+		if cleanupErr != nil && mode == "shared" {
+			return "", "", fmt.Errorf("shared networking cannot start until the leftover network configuration is gone, and removing it failed: %w. "+
+				"Shared mode enslaves no host interface, so it will not bring its NAT bridge up over leftovers: a surviving %s-uplink connection carries master %s slave-type bridge, and NetworkManager would enslave the host's own NIC to that bridge. "+
+				"Remove what the failure above names (for example: sudo nmcli connection delete %s-uplink) and start again, or use -network bridged, which rebuilds these connections itself",
+				cleanupErr, bridge, bridge, bridge)
+		}
 		time.Sleep(staleCleanupSettleDelay)
 	}
 	return bridge, tap, nil
@@ -82,15 +97,17 @@ var staleCleanupSettleDelay = 2 * time.Second
 //
 // Every term matters to BOTH modes, including the -uplink one that only the
 // bridged path ever creates. cleanupNMConnections attempts every delete and
-// returns the ones that failed joined together, and the preflight's own call
-// discards that error, so a teardown can still end with the bridge connection
-// gone and the -uplink connection still on the host. That orphan carries
-// `master <bridge> slave-type bridge` and autoconnect, so the next
-// `--network shared` run brings its bridge up and NetworkManager enslaves the
-// host's physical NIC to a NAT bridge -- which destroys the "no uplink is
-// enslaved" invariant that is the entire reason shared mode exists, and takes
-// the host's connectivity with it. The bridged path survives the same orphan
-// only because it recreates and re-modifies the -uplink connection itself.
+// returns the ones that failed joined together, so a teardown can end with
+// the bridge connection gone and the -uplink connection still on the host.
+// That orphan carries `master <bridge> slave-type bridge` and autoconnect, so
+// a `--network shared` run that brought its bridge up over it would have
+// NetworkManager enslave the host's physical NIC to a NAT bridge -- which
+// destroys the "no uplink is enslaved" invariant that is the entire reason
+// shared mode exists, and takes the host's connectivity with it. A shared run
+// therefore has to SEE the orphan here, and linuxNetworkPreflight refuses the
+// start when the delete it then attempts fails. The bridged path carries on
+// over the same failure, because it recreates and re-modifies the -uplink
+// connection itself.
 //
 // linuxNetworkPreflight and HasStaleNetworkResources both call this so the
 // narrower of the two predicates cannot drift back into existence.

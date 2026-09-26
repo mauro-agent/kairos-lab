@@ -244,13 +244,14 @@ func TestPrepareLinuxSharedCleanHostSequence(t *testing.T) {
 
 // Regression test for the orphaned <bridge>-uplink connection.
 //
-// cleanupNMConnections prints a warning and carries on when a delete fails,
-// and its caller discards the result, so a host can be left with the bridge
+// cleanupNMConnections attempts every delete and reports the ones that failed
+// rather than stopping at the first, so a host can be left with the bridge
 // connection gone and <bridge>-uplink still present. The preflight used to
 // ask only about the bridge link and the bridge connection, so it saw that
 // host as clean -- and the orphan, which carries master/slave-type bridge and
 // autoconnect, would have enslaved the physical NIC to the NAT bridge the
-// shared path then brought up.
+// shared path then brought up. Seeing it is half the fix; what happens when
+// the delete that follows FAILS is the other half, one test below.
 func TestPrepareLinuxSharedDeletesOrphanedUplinkConnection(t *testing.T) {
 	h := newFakeHost(t)
 	h.conns[DefaultBridgeName+"-uplink"] = true
@@ -265,6 +266,109 @@ func TestPrepareLinuxSharedDeletesOrphanedUplinkConnection(t *testing.T) {
 
 	if h.conns[DefaultBridgeName+"-uplink"] {
 		t.Errorf("the orphaned uplink connection is still on the host after PrepareLinuxShared")
+	}
+}
+
+// The same orphan, this time one that will not go.
+//
+// Seeing a stale <bridge>-uplink connection and failing to delete it used to
+// end the same way as seeing nothing at all: the preflight discarded the
+// cleanup error, prepareLinuxSharedWithNM built the NAT bridge over the top
+// and brought it up, and NetworkManager enslaved the host's physical NIC to a
+// bridge carrying ipv4.method shared -- because that is what the orphan says
+// to do. The run succeeded, the consent prompt above it had promised "no
+// uplink interface is used", and the host lost its connectivity.
+//
+// So the delete failing is fatal for shared. Nothing may be issued after it,
+// and the error has to name the leftover and a way out, since the user is the
+// only one who can clear it.
+func TestPrepareLinuxSharedRefusesWhenAStaleUplinkWillNotGo(t *testing.T) {
+	h := newFakeHost(t)
+	h.conns[DefaultBridgeName+"-uplink"] = true
+	h.failCmd = func(argv []string) error {
+		if strings.Join(argv, " ") == "nmcli connection delete kairoslab0-uplink" {
+			return fmt.Errorf("exit status 1")
+		}
+		return nil
+	}
+	st := &state.State{}
+
+	err := PrepareLinuxShared(st, t.TempDir())
+	if err == nil {
+		t.Fatal("PrepareLinuxShared built a NAT bridge over an uplink connection it could not delete")
+	}
+
+	// The refusal is the whole of the run: the failed delete is the last
+	// thing issued, so no bridge was created, modified or brought up.
+	assertSequence(t, h.lines(), []string{"nmcli connection delete kairoslab0-uplink"})
+	if h.bridges[DefaultBridgeName] || h.links[DefaultTapName] {
+		t.Errorf("the host was changed by a refused run: bridge=%v tap=%v",
+			h.bridges[DefaultBridgeName], h.links[DefaultTapName])
+	}
+
+	// What is still on the host, and what to do about it. The wrapped error
+	// from cleanupNMConnections names the step that failed; the rest is the
+	// way out, which the user cannot work out from "exit status 1".
+	for _, want := range []string{
+		"delete connection kairoslab0-uplink",
+		"nmcli connection delete kairoslab0-uplink",
+		"-network bridged",
+	} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("the refusal does not mention %q:\n%v", want, err)
+		}
+	}
+
+	if st.Network.Mode != "" || st.Network.BridgeName != "" || st.Network.CreatedByKairosLab {
+		t.Errorf("state was written for a run that prepared nothing: %+v", st.Network)
+	}
+}
+
+// The other half of that decision: bridged carries on over exactly the same
+// failure, and must keep doing so.
+//
+// The orphan is a connection the bridged path creates itself, and it recreates
+// and re-modifies it a few commands later -- so a delete that failed leaves it
+// with a connection it is about to overwrite with the settings it wants,
+// rather than with a NIC enslaved to a NAT bridge. Refusing here would turn a
+// survivable leftover into a start the user cannot make without hand-editing
+// NetworkManager.
+func TestPrepareLinuxBridgeSurvivesAStaleUplinkThatWillNotGo(t *testing.T) {
+	h := newFakeHost(t)
+	h.links["eth0"] = true
+	h.conns[DefaultBridgeName+"-uplink"] = true
+	h.failCmd = func(argv []string) error {
+		if strings.Join(argv, " ") == "nmcli connection delete kairoslab0-uplink" {
+			return fmt.Errorf("exit status 1")
+		}
+		return nil
+	}
+	st := &state.State{}
+	st.Network.BridgeInterface = "eth0"
+
+	if err := PrepareLinuxBridge(st, t.TempDir()); err != nil {
+		t.Fatalf("PrepareLinuxBridge refused a leftover it rebuilds itself: %v", err)
+	}
+
+	uid := testUID(t)
+	// The bridged sequence, minus the `add` for the uplink connection: the
+	// delete failed, so the connection is still there and only the modify
+	// runs. That modify is the reason this is survivable -- it sets the
+	// master, the slave type and the autoconnect this run wants.
+	want := []string{
+		"nmcli connection delete kairoslab0-uplink",
+		"nmcli connection add type bridge ifname kairoslab0 con-name kairoslab0 autoconnect yes stp no",
+		"nmcli connection modify kairoslab0 connection.interface-name kairoslab0 ipv4.method auto ipv6.method auto bridge.stp no connection.autoconnect yes",
+		"nmcli connection modify kairoslab0-uplink connection.interface-name eth0 master kairoslab0 slave-type bridge connection.autoconnect yes",
+		"nmcli connection add type tun ifname kairoslab-tap0 con-name kairoslab0-tap mode tap owner " + uid + " master kairoslab0 slave-type bridge autoconnect yes",
+		"nmcli connection modify kairoslab0-tap connection.interface-name kairoslab-tap0 tun.mode tap tun.owner " + uid + " master kairoslab0 slave-type bridge connection.autoconnect yes",
+		"nmcli connection up kairoslab0",
+		"nmcli connection up kairoslab0-uplink",
+		"nmcli connection up kairoslab0-tap",
+	}
+	assertSequence(t, h.lines(), want)
+	if st.Network.Mode != "bridged" {
+		t.Errorf("Mode = %q, want %q", st.Network.Mode, "bridged")
 	}
 }
 

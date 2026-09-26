@@ -241,10 +241,9 @@ func TestResetPlanIsInertThroughTheFullFlow(t *testing.T) {
 	// business. This one is only about the bytes printed on the way there.
 	_ = Run([]string{"reset"}, strings.NewReader("y\n"), &stdout, &stderr, "test")
 	assertPlanIsInert(t, stdout.String())
-	// "shared", because that is the mode seedInjectedState records. The
-	// teardown is not bridged-only and the message no longer says it is;
-	// TestTeardownMessagesNameTheRecordedMode owns that wording.
-	if !strings.Contains(stdout.String(), "Cleaning up shared network") {
+	// The line the teardown prints when it starts work, whatever mode is
+	// recorded; TestTeardownMessagesNameNoMode owns that wording.
+	if !strings.Contains(stdout.String(), teardownStartedLine) {
 		t.Fatalf("the flow stopped before the plan was acted on, so nothing was really exercised:\n%s", stdout.String())
 	}
 }
@@ -433,10 +432,7 @@ func TestPlanIsInertThroughTheFullFlowForSiblingRows(t *testing.T) {
 			// there, and the answer given to the prompt is a real one.
 			_ = Run([]string{tt.verb}, strings.NewReader("y\n"), &stdout, &stderr, "test")
 			assertPlanIsInert(t, stdout.String())
-			// "shared", the mode seedInjectedState records: the teardown
-			// message names it now instead of saying bridged for every
-			// network kairos-lab built.
-			if !strings.Contains(stdout.String(), "Cleaning up shared network") {
+			if !strings.Contains(stdout.String(), teardownStartedLine) {
 				t.Fatalf("the flow stopped before the plan was acted on, so nothing was really exercised:\n%s", stdout.String())
 			}
 		})
@@ -550,6 +546,129 @@ func TestOrdinaryPlanRowsAreNotQuoted(t *testing.T) {
 	}
 	if strings.Contains(out, `"bridge: `) || strings.Contains(out, `"/nope/`) {
 		t.Errorf("an ordinary plan came out quoted:\n%s", out)
+	}
+}
+
+// --- the "Running:" line ---------------------------------------------------
+
+// state.disks[].path, which reaches the terminal through the "Running:" line
+// rather than through a plan: the payload erases that line and rewrites it as
+// something harmless. On macOS it is the line recording a command about to
+// run as root.
+//
+// Not a space in it anywhere, deliberately. The old quote rule fired on a
+// space, so a payload carrying one would have been quoted by the very code
+// this is a regression test for.
+const injectedDiskPath = "/nope/disk.qcow2\x1b[2K\rall-clear.qcow2"
+
+// renderCommand is a render boundary like planValue, and for the same reason:
+// the paths and the tap name on a qemu command line come out of state.json, a
+// 0644 file any process running as the user can write.
+//
+// It used to quote on " \t\n\"" alone, which is the set that keeps words
+// readable and nothing more -- ESC and CR went to the terminal raw. Its words
+// now go through planValue, which is where the C0, C1, bidi and invalid-UTF-8
+// rules already live, so there is one answer to "may this reach a terminal"
+// and not two.
+func TestRenderCommandQuotesAnythingATerminalWouldActOn(t *testing.T) {
+	cases := []struct {
+		name string
+		arg  string
+	}{
+		{"CSI erase line and a carriage return", "/tmp/k.qcow2\x1b[2K\rall-clear"},
+		{"a bare carriage return", "file=/tmp/k.qcow2\rmasked"},
+		{"a newline", "file=/tmp/a\nfile=/tmp/b"},
+		{"a tab", "file=/tmp/a\tb"},
+		{"a NUL", "file=/tmp/a\x00b"},
+		{"DEL", "file=/tmp/a\x7fb"},
+		{"8-bit CSI, which is not valid UTF-8 on its own", "file=/tmp/a\x9bK"},
+		{"a bidi override", "file=/tmp/\u202egnp.qcow2"},
+		{"a zero-width formatter", "file=/tmp/a\u200bb"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := renderCommand("qemu-system-x86_64", []string{"-drive", tc.arg})
+			if strings.Contains(got, tc.arg) {
+				t.Errorf("renderCommand passed %q through unescaped:\n%q", tc.arg, got)
+			}
+			if !strings.Contains(got, strconv.Quote(tc.arg)) {
+				t.Errorf("renderCommand(%q) = %q, want the argument quoted", tc.arg, got)
+			}
+		})
+	}
+}
+
+// The other half: a quoting rule nobody can read past is a rule that gets
+// reverted. An ordinary qemu command line is paths, numbers and
+// comma-separated option lists, and every one of them has to come out exactly
+// as it went in -- which is also what says planValue costs this line nothing.
+//
+// The space rule is renderCommand's own and stays: this is a command, so a
+// word with a space in it has to look like one word.
+func TestRenderCommandLeavesAnOrdinaryCommandLineAlone(t *testing.T) {
+	args := []string{
+		"-enable-kvm", "-cpu", "host", "-m", "4096", "-smp", "2",
+		"-chardev", "socket,path=/home/u/.cache/kairos-lab/runtime/qemu.sock,server=on,wait=off,id=qga0",
+		"-netdev", "tap,id=net0,ifname=kairoslab-tap0,script=no,downscript=no",
+		"-device", "virtio-net-pci,netdev=net0,mac=52:54:00:ab:cd:ef",
+		"-drive", "id=disk1,if=none,media=disk,file=/home/u/.cache/kairos-lab/vm/kairos-disk0.qcow2",
+	}
+	want := "qemu-system-x86_64 " + strings.Join(args, " ")
+	if got := renderCommand("qemu-system-x86_64", args); got != want {
+		t.Errorf("renderCommand quoted an ordinary command line:\n got: %s\nwant: %s", got, want)
+	}
+
+	quoted := renderCommand("qemu-system-x86_64", []string{"-bios", "/Applications/My QEMU/edk2.fd"})
+	if !strings.Contains(quoted, strconv.Quote("/Applications/My QEMU/edk2.fd")) {
+		t.Errorf("a word with a space in it is not quoted, so the command line reads as two: %s", quoted)
+	}
+}
+
+// The same thing through a whole start, since renderCommand's argument is a
+// value out of state.json and the line is printed to the user's terminal.
+//
+// user mode and an existing disk: the run reaches the launch without touching
+// the host or creating an image, prints the command, and then fails to find
+// qemu on the isolated PATH.
+func TestRunningLineIsInertForAStoredDiskPath(t *testing.T) {
+	if runtime.GOOS != "linux" {
+		t.Skipf("on %s the run needs a firmware path from `brew --prefix qemu` before it prints the command, and this test isolates itself from host binaries", runtime.GOOS)
+	}
+	t.Setenv("KAIROS_LAB_CONFIG_DIR", t.TempDir())
+	t.Setenv("KAIROS_LAB_CACHE_DIR", t.TempDir())
+	isolateFromHostBinaries(t)
+	store, err := state.DefaultStore()
+	if err != nil {
+		t.Fatalf("DefaultStore: %v", err)
+	}
+	st := state.NewState(store)
+	st.Setup.CompletedAt = state.NowRFC3339()
+	st.Setup.DependencyCheckPassed = true
+	st.Disks = append(st.Disks, state.Disk{
+		Name:      "kairos-disk0",
+		Path:      injectedDiskPath,
+		Size:      "60G",
+		CreatedAt: state.NowRFC3339(),
+	})
+	if err := store.Save(st); err != nil {
+		t.Fatalf("Save: %v", err)
+	}
+
+	var stdout, stderr bytes.Buffer
+	runErr := Run([]string{"start", "-name", "kairos-disk0", "-no-iso", "-network", "user", "-yes"},
+		strings.NewReader(""), &stdout, &stderr, "test")
+	out := stdout.String()
+	if runErr == nil || !strings.Contains(runErr.Error(), "start qemu") {
+		t.Fatalf("start returned %v, want it to have printed the command and then failed to launch it; stdout:\n%s", runErr, out)
+	}
+	if !strings.Contains(out, "Running: ") {
+		t.Fatalf("the run never printed the command line, so nothing was exercised:\n%s", out)
+	}
+	if strings.ContainsRune(out, 0x1b) || strings.ContainsRune(out, '\r') {
+		t.Errorf("the Running: line carries a raw control byte, so a stored path reached the terminal:\n%q", out)
+	}
+	if want := strconv.Quote("id=disk1,if=none,media=disk,file=" + injectedDiskPath); !strings.Contains(out, want) {
+		t.Errorf("the disk argument is not printed in escaped form:\n%q", out)
 	}
 }
 
@@ -700,25 +819,26 @@ func TestNetworkModesAreExactlyTheDocumentedModes(t *testing.T) {
 // can form a cluster.
 //
 // -bridge-if is passed for one reason, and it is not the interface. It keeps
-// the test off the host: networkIface in runStart starts out as this flag's
-// value, and both interface-detection blocks only run when it is empty, so a
-// non-empty one skips vm.DetectUplinkCandidates on Linux and
-// vm.DetectBridgeIfaceCandidates on macOS. Without it a run in bridged mode
-// shells out to `ip route show default` or `ifconfig` and fails wherever the
-// answer is unhelpful -- a container whose only default-route device is one
-// of the filtered virtual ones (docker*, br-*, veth*, virbr*, cni*, podman*),
-// or a macOS runner with no interface reporting an active link -- and
-// runStart returns "no suitable uplink interface found for bridged
-// networking" before the config review is ever printed, which looks exactly
-// like the default having moved.
+// the test off the host: runStart hands this flag's value to
+// resolveBridgeUplink, which asks the host for a candidate only when it
+// arrives empty, so a non-empty one skips the probe. Without it a run in
+// bridged mode shells out to `ip route show default` or `ifconfig` and fails
+// wherever the answer is unhelpful -- a container whose only default-route
+// device is one of the filtered virtual ones (docker*, br-*, veth*, virbr*,
+// cni*, podman*), or a macOS runner with no interface reporting an active
+// link -- and runStart returns "no suitable uplink interface found for
+// bridged networking" before the config review is ever printed, which looks
+// exactly like the default having moved.
 //
-// Under the shared default those blocks are gated out (both ask for bridged),
-// so the flag is redundant today and is kept anyway: it costs nothing, the
-// value is never used -- the run is cancelled at the Enter prompt, long
-// before networking is prepared -- and it is what stops this test from
-// becoming host-dependent the moment the default moves back or that gate
-// widens. A redundant flag is the cheaper of the two mistakes. That shared
-// ignores it is asserted directly, by the "(n/a)" on row 8.
+// Under the shared default the probe is gated out anyway (it asks for
+// bridged), so the flag is redundant today and is kept anyway: it costs
+// nothing, the value is never used -- the run is cancelled at the Enter
+// prompt, long before networking is prepared -- and it is what stops this
+// test from becoming host-dependent the moment the default moves back or
+// that gate widens. A redundant flag is the cheaper of the two mistakes.
+// That shared ignores it is asserted directly, by the "(n/a)" on row 8.
+// (Tests that need a KNOWN answer from the probe use
+// stubBridgeIfaceCandidates instead; this one needs no interface at all.)
 func TestStartWithNoNetworkFlagUsesTheDefaultMode(t *testing.T) {
 	t.Setenv("KAIROS_LAB_CONFIG_DIR", t.TempDir())
 	t.Setenv("KAIROS_LAB_CACHE_DIR", t.TempDir())
@@ -1260,6 +1380,294 @@ func TestStartAsksForSudoBeforePreparingLinuxNetworking(t *testing.T) {
 	}
 }
 
+// stubBridgeIfaceCandidates answers the uplink probe with a fixed list for
+// the duration of one test.
+//
+// The real bridgeIfaceCandidates shells out -- `ip route show default` on
+// Linux, the vmnet interface list on macOS -- so what it returns is whatever
+// the machine running the suite is plugged into. A container whose only
+// default route is one of the filtered virtual devices answers "nothing", and
+// so does a macOS runner with no active link, which is how a test that asks
+// the host comes to pass on a laptop and fail on a CI leg. Every assertion
+// below is about which interface the run names and records, so the answer has
+// to be one this file chose.
+func stubBridgeIfaceCandidates(t *testing.T, candidates ...string) {
+	t.Helper()
+	saved := bridgeIfaceCandidates
+	t.Cleanup(func() { bridgeIfaceCandidates = saved })
+	bridgeIfaceCandidates = func() []string { return candidates }
+}
+
+// stubPrepareLinuxBridge puts a recording double in place of the host-side
+// bridge preparation. The real one needs an active NetworkManager and issues
+// sudo nmcli commands, so a test that let it run would either fail on the CI
+// host or reconfigure it.
+func stubPrepareLinuxBridge(t *testing.T, prepare func(st *state.State, runtimeDir string) error) {
+	t.Helper()
+	saved := prepareLinuxBridge
+	t.Cleanup(func() { prepareLinuxBridge = saved })
+	prepareLinuxBridge = prepare
+}
+
+// A bridged run consents to enslaving a named interface, even when the mode
+// was chosen inside the config review rather than on the command line.
+//
+// This is the pairing the default flip broke. Uplink detection used to be
+// keyed on the FLAG's mode and the sudo consent on the REVIEWED one, which
+// agreed for exactly as long as the flag defaulted to bridged. Once it
+// defaulted to shared, a `start` with no -network that answered "bridged" at
+// prompt 7 skipped detection entirely: the prompt read "(uplink: )", and
+// answering y handed the job to vm.PrepareLinuxBridge, which detects an
+// uplink of its own and enslaves it -- the host's own NIC, named to nobody.
+//
+// Row 8 of the review is asserted as well as the prompt. They are two
+// different resolutions -- the review fills the row in as soon as the mode
+// changes, so the user can see and change the interface at entry 8, and
+// runStart resolves again on the way out -- and a blank row is how a user
+// learns of the interface only from the sudo prompt.
+func TestStartNamesTheUplinkWhenTheReviewChoosesBridged(t *testing.T) {
+	if runtime.GOOS != "linux" {
+		t.Skipf("the bridge and tap are prepared by NetworkManager, which is Linux-only; on %s the vmnet modes ask for sudo at the QEMU launch instead", runtime.GOOS)
+	}
+	t.Setenv("KAIROS_LAB_CONFIG_DIR", t.TempDir())
+	t.Setenv("KAIROS_LAB_CACHE_DIR", t.TempDir())
+	isolateFromHostBinaries(t)
+	seedStartableState(t, "kairos-disk0")
+	stubNetworkPrivilege(t, func(string) error { return nil })
+	stubBridgeIfaceCandidates(t, "kairos-fake-uplink0", "kairos-fake-uplink1")
+
+	// No -network and no -bridge-if: the run arrives in the default mode,
+	// picks bridged at prompt 7, leaves the menu, presses Enter to start and
+	// then refuses the sudo prompt, so nothing is prepared.
+	var stdout, stderr bytes.Buffer
+	err := Run([]string{"start", "-name", "kairos-disk0", "-no-iso"},
+		scriptedInput("7\nbridged\n\n\nn\n"), &stdout, &stderr, "test")
+
+	if err == nil || err.Error() != "sudo permission denied" {
+		t.Fatalf("start returned %v, want %q; stdout:\n%s", err, "sudo permission denied", stdout.String())
+	}
+	out := stdout.String()
+	want := "bridged networking needs sudo to prepare bridge/tap (uplink: kairos-fake-uplink0)"
+	if !strings.Contains(out, want) {
+		t.Errorf("the sudo prompt is not %q; got:\n%s", want, out)
+	}
+	if strings.Contains(out, "(uplink: )") {
+		t.Errorf("the sudo prompt names no interface, so it consents to whatever the prepare detects:\n%s", out)
+	}
+	if wantRow := "8) Net interface: kairos-fake-uplink0"; !strings.Contains(out, wantRow) {
+		t.Errorf("the review does not show %q after the mode became bridged, so the interface is invisible until the sudo prompt:\n%s", wantRow, out)
+	}
+}
+
+// The other end of the same resolution: a host with no candidate has to stop
+// the run, not carry an empty interface into the sudo prompt.
+//
+// The review cannot raise this error itself -- an error inside the menu
+// throws away every other edit made in it -- so it leaves the row empty and
+// runStart refuses on the way out. Without that second resolution the run
+// reaches the consent prompt with nothing to name, which is the failure
+// above wearing a different hat.
+func TestStartRefusesBridgedChosenAtTheReviewWithNoUplinkAvailable(t *testing.T) {
+	if runtime.GOOS != "linux" && runtime.GOOS != "darwin" {
+		t.Skipf("bridged networking has no host side on %s", runtime.GOOS)
+	}
+	t.Setenv("KAIROS_LAB_CONFIG_DIR", t.TempDir())
+	t.Setenv("KAIROS_LAB_CACHE_DIR", t.TempDir())
+	isolateFromHostBinaries(t)
+	seedStartableState(t, "kairos-disk0")
+	stubNetworkPrivilege(t, func(string) error { return nil })
+	stubBridgeIfaceCandidates(t)
+
+	var stdout, stderr bytes.Buffer
+	err := Run([]string{"start", "-name", "kairos-disk0", "-no-iso"},
+		scriptedInput("7\nbridged\n\n\nn\n"), &stdout, &stderr, "test")
+
+	if err == nil || !strings.Contains(err.Error(), "-bridge-if") {
+		t.Fatalf("start returned %v, want the refusal naming a way out; stdout:\n%s", err, stdout.String())
+	}
+	if strings.Contains(stdout.String(), "needs sudo to prepare bridge/tap") {
+		t.Errorf("the run asked for sudo before finding out it had no interface to enslave:\n%s", stdout.String())
+	}
+}
+
+// What is recorded is the interface the prepare actually used.
+//
+// vm.PrepareLinuxBridge writes the uplink it enslaved onto st.Network, and it
+// has a detection path of its own for when the field arrives empty. The
+// recording block used to overwrite that answer with a value re-derived from
+// the -bridge-if flag, so a run that auto-detected and enslaved a real NIC
+// stored an empty interface -- and `status` and the teardown read that field.
+// The double below returns a different name from the one the run resolved,
+// which is what a detection inside the prepare looks like from here.
+func TestStartRecordsTheUplinkThePrepareUsed(t *testing.T) {
+	if runtime.GOOS != "linux" {
+		t.Skipf("vm.PrepareLinuxBridge only does anything on linux; on %s it returns nil without touching state", runtime.GOOS)
+	}
+	t.Setenv("KAIROS_LAB_CONFIG_DIR", t.TempDir())
+	t.Setenv("KAIROS_LAB_CACHE_DIR", t.TempDir())
+	isolateFromHostBinaries(t)
+	seedStartableState(t, "kairos-disk0")
+	stubNetworkPrivilege(t, func(string) error { return nil })
+	stubBridgeIfaceCandidates(t, "kairos-fake-uplink0")
+
+	var asked string
+	stubPrepareLinuxBridge(t, func(st *state.State, _ string) error {
+		asked = st.Network.BridgeInterface
+		// The fields vm.PrepareLinuxBridge writes on success, with an uplink
+		// of its own choosing.
+		st.Network.Mode = "bridged"
+		st.Network.BridgeName = vm.DefaultBridgeName
+		st.Network.TapName = vm.DefaultTapName
+		st.Network.BridgeInterface = "kairos-prepared-uplink0"
+		st.Network.CleanupRequired = true
+		st.Network.CreatedByKairosLab = true
+		return nil
+	})
+
+	var stdout, stderr bytes.Buffer
+	err := Run([]string{"start", "-name", "kairos-disk0", "-no-iso", "-network", "bridged", "-yes"},
+		strings.NewReader(""), &stdout, &stderr, "test")
+	// The state is written at "[2/3] Recording VM state", one step before the
+	// launch that PATH isolation makes fail.
+	if err == nil || !strings.Contains(err.Error(), "start qemu") {
+		t.Fatalf("start returned %v, want it to have recorded the VM and then failed to launch it; stdout:\n%s", err, stdout.String())
+	}
+	if asked != "kairos-fake-uplink0" {
+		t.Errorf("the prepare was asked about %q, want the interface the run resolved and named in its prompt", asked)
+	}
+
+	st := loadStoredState(t)
+	if st.Network.BridgeInterface != "kairos-prepared-uplink0" {
+		t.Errorf("state records uplink %q, want %q -- the one the prepare enslaved, which is what `status` and the teardown read",
+			st.Network.BridgeInterface, "kairos-prepared-uplink0")
+	}
+	if st.Network.Mode != "bridged" {
+		t.Errorf("state records mode %q, want %q", st.Network.Mode, "bridged")
+	}
+	// And the run really did go through the bridged arm: the guest is on the
+	// tap the prepare reported, not on user networking.
+	wantNetdev := "tap,id=net0,ifname=" + vm.DefaultTapName + ",script=no,downscript=no"
+	if !slices.Contains(st.VM.QemuArgs, wantNetdev) {
+		t.Errorf("the recorded qemu command line has no %q:\n%q", wantNetdev, st.VM.QemuArgs)
+	}
+}
+
+// resolveBridgeUplink is the single answer to "which interface does a bridged
+// run attach to", and it is asked twice: once against the mode the -network
+// flag carried in, once against the mode the config review settled on. One
+// call is not enough, because those are different values -- that is the whole
+// bug -- and two calls only work because the second is a no-op once the first
+// has answered.
+func TestResolveBridgeUplink(t *testing.T) {
+	if runtime.GOOS != "linux" && runtime.GOOS != "darwin" {
+		t.Skipf("bridged networking has no host side on %s", runtime.GOOS)
+	}
+	cases := []struct {
+		name       string
+		mode       string
+		iface      string
+		candidates []string
+		want       string
+		wantErr    bool
+	}{
+		{"bridged with nothing chosen takes the first candidate", "bridged", "", []string{"eth0", "eth1"}, "eth0", false},
+		{"bridged keeps what the user chose", "bridged", "eth9", []string{"eth0"}, "eth9", false},
+		{"bridged with no candidate is an error, not an empty answer", "bridged", "", nil, "", true},
+		{"shared asks the host nothing", "shared", "", nil, "", false},
+		{"user asks the host nothing", "user", "", nil, "", false},
+		{"shared keeps -bridge-if for bridgeInterfaceForMode to drop", "shared", "eth9", nil, "eth9", false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			stubBridgeIfaceCandidates(t, tc.candidates...)
+			got, err := resolveBridgeUplink(tc.mode, tc.iface)
+			if (err != nil) != tc.wantErr {
+				t.Fatalf("resolveBridgeUplink(%q, %q) error = %v, want error: %v", tc.mode, tc.iface, err, tc.wantErr)
+			}
+			if got != tc.want {
+				t.Errorf("resolveBridgeUplink(%q, %q) = %q, want %q", tc.mode, tc.iface, got, tc.want)
+			}
+		})
+	}
+}
+
+// Both platforms' "no interface to attach to" messages, pinned from either CI
+// leg. The sentences differ because the failures do -- no default route
+// through anything physical on Linux, no interface reporting a link on macOS
+// -- and each has to carry the two ways out, since a user who reads it on the
+// platform it belongs to has no other listing of them.
+func TestNoBridgeUplinkErrorSpeaksForEachPlatform(t *testing.T) {
+	cases := []struct {
+		goos string
+		want string
+	}{
+		{"linux", "no suitable uplink interface found for bridged networking (use -bridge-if to specify one, or -network user for port-forwarded access)"},
+		{"darwin", "no host interface has a link, so bridged networking would leave the VM without an address (use -bridge-if to specify one, or -network user for port-forwarded access)"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.goos, func(t *testing.T) {
+			err := noBridgeUplinkError(tc.goos)
+			if err == nil || err.Error() != tc.want {
+				t.Errorf("noBridgeUplinkError(%q) = %v, want %q", tc.goos, err, tc.want)
+			}
+		})
+	}
+}
+
+// Launching QEMU itself as root is a macOS-only thing, and it covers BOTH
+// vmnet modes.
+//
+// shared is -netdev vmnet-shared and needs root exactly as vmnet-bridged
+// does; launched unprivileged, QEMU exits with a vmnet error and no VM. The
+// pair is the same one vm.RequireNetworkPrivilege's darwinRootModes names, so
+// the two agree about which modes need root. On Linux nothing here runs as
+// root: the bridge and tap are prepared beforehand and QEMU opens a tap that
+// already belongs to the user.
+//
+// goos is a parameter for the sake of this table. The branch in runStart is
+// GOOS-gated, so narrowing it back to bridged alone -- which is what it said
+// before shared was wired up -- survived the whole suite on the Linux leg.
+func TestVmnetNeedsSudo(t *testing.T) {
+	cases := []struct {
+		goos string
+		mode string
+		want bool
+	}{
+		{"darwin", "bridged", true},
+		{"darwin", "shared", true},
+		{"darwin", "user", false},
+		{"darwin", "", false},
+		{"linux", "bridged", false},
+		{"linux", "shared", false},
+		{"linux", "user", false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.goos+"/"+tc.mode, func(t *testing.T) {
+			if got := vmnetNeedsSudo(tc.goos, tc.mode); got != tc.want {
+				t.Errorf("vmnetNeedsSudo(%q, %q) = %v, want %v", tc.goos, tc.mode, got, tc.want)
+			}
+		})
+	}
+}
+
+// And what that consent says, which is the other half nothing could see: the
+// prompt is printed from the same GOOS-gated branch, so replacing it wholesale
+// survived the suite too. It names the mode, because that is what tells the
+// user which of their two vmnet choices is about to run as root.
+func TestVmnetSudoPromptNamesTheMode(t *testing.T) {
+	cases := map[string]string{
+		"bridged": "bridged vmnet mode runs qemu with sudo",
+		"shared":  "shared vmnet mode runs qemu with sudo",
+	}
+	for mode, want := range cases {
+		t.Run(mode, func(t *testing.T) {
+			if got := vmnetSudoPrompt(mode); got != want {
+				t.Errorf("vmnetSudoPrompt(%q) = %q, want %q", mode, got, want)
+			}
+		})
+	}
+}
+
 // bridgeInterfaceForMode is the single answer to "what host interface does
 // this run attach to", and both places runStart records one ask it: the
 // st.Network.BridgeInterface field that `status` prints and the teardown
@@ -1301,6 +1709,9 @@ func TestBridgeInterfaceForModeAnswersOnlyForBridged(t *testing.T) {
 // user holds for shared by construction -- one function answers for both, and
 // the table above covers the other rows.
 func TestStartRecordsNoUplinkForAModeThatAttachesToNone(t *testing.T) {
+	if runtime.GOOS != "linux" {
+		t.Skipf("on %s the run needs a firmware path from `brew --prefix qemu` before it records anything, and this test isolates itself from host binaries", runtime.GOOS)
+	}
 	t.Setenv("KAIROS_LAB_CONFIG_DIR", t.TempDir())
 	t.Setenv("KAIROS_LAB_CACHE_DIR", t.TempDir())
 	isolateFromHostBinaries(t)
@@ -1343,6 +1754,9 @@ func TestStartRecordsNoUplinkForAModeThatAttachesToNone(t *testing.T) {
 // the next start, and a disk recorded before the field existed simply gets one
 // filled in.
 func TestStartGivesEachDiskItsOwnStickyMAC(t *testing.T) {
+	if runtime.GOOS != "linux" {
+		t.Skipf("on %s the run needs a firmware path from `brew --prefix qemu` before it records anything, and this test isolates itself from host binaries", runtime.GOOS)
+	}
 	const diskName = "kairos-disk0"
 	const storedMAC = "52:54:00:ab:cd:ef"
 	tests := []struct {
@@ -1352,6 +1766,14 @@ func TestStartGivesEachDiskItsOwnStickyMAC(t *testing.T) {
 	}{
 		{"derived when the disk carries none", "", vm.MACForDisk(diskName)},
 		{"kept when the disk already carries one", storedMAC, storedMAC},
+		// Whitespace is not an address, and the check here has to agree with
+		// internal/vm about that. netDeviceArg trims before deciding a value
+		// is unset, so a stored "   " that got past an untrimmed check here
+		// was handed to QEMU as a bare device with no mac= at all: the guest
+		// took QEMU's single default address -- the collision the derived one
+		// exists to prevent -- and the whitespace was persisted, so the next
+		// start did it again.
+		{"derived when the stored address is only whitespace", "   ", vm.MACForDisk(diskName)},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -1407,6 +1829,83 @@ func TestStartGivesEachDiskItsOwnStickyMAC(t *testing.T) {
 	}
 }
 
+// The address is derived from the name the review settled on, not from the
+// one the run started with.
+//
+// The derivation sits AFTER the disk is materialized and re-fetched from
+// state, and that placement is the whole of it: a new disk arrives as a
+// pending struct carrying the name from -name, the review's entry 1 renames
+// it on vmConfig only, and the struct that comes back out of state after
+// creation is the one with the final name. Deriving any earlier reads the
+// pre-rename name, and the VM boots on an address belonging to a disk that no
+// longer exists -- which nothing else in this file can see, because every
+// other MAC test drives a disk that is never renamed.
+func TestStartDerivesTheMACFromTheRenamedDisk(t *testing.T) {
+	if runtime.GOOS != "linux" {
+		t.Skipf("on %s the run needs a firmware path from `brew --prefix qemu` before it records anything, and this test isolates itself from host binaries", runtime.GOOS)
+	}
+	const finalName = "renamed-disk"
+	t.Setenv("KAIROS_LAB_CONFIG_DIR", t.TempDir())
+	t.Setenv("KAIROS_LAB_CACHE_DIR", t.TempDir())
+	onlyFakeQemuImgOnPath(t)
+	seedStartableState(t, "kairos-disk0")
+	stubNetworkPrivilege(t, func(string) error { return nil })
+
+	// A disk name that does not exist yet, so this is a new disk and entry 1
+	// is editable. The script renames it, leaves the menu, and presses Enter
+	// to start. user mode, because it is the one that reaches the recording
+	// step without preparing anything on the host.
+	var stdout, stderr bytes.Buffer
+	err := Run([]string{"start", "-name", "original-disk", "-iso", localISO(t), "-network", "user"},
+		scriptedInput("1\n"+finalName+"\n\n\n"), &stdout, &stderr, "test")
+	if err == nil || !strings.Contains(err.Error(), "start qemu") {
+		t.Fatalf("start returned %v, want it to have recorded the VM and then failed to launch it; stdout:\n%s", err, stdout.String())
+	}
+
+	st := loadStoredState(t)
+	if state.FindDiskByName(st, "original-disk") != nil {
+		t.Fatalf("the rename did not take, so the ordering is not being exercised:\n%+v", st.Disks)
+	}
+	disk := state.FindDiskByName(st, finalName)
+	if disk == nil {
+		t.Fatalf("no disk named %q in state:\n%+v", finalName, st.Disks)
+	}
+	want := vm.MACForDisk(finalName)
+	if disk.MAC != want {
+		t.Errorf("state records MAC %q for %s, want %q (%q derives to %q)",
+			disk.MAC, finalName, want, "original-disk", vm.MACForDisk("original-disk"))
+	}
+	wantArg := "virtio-net-pci,netdev=net0,mac=" + want
+	if !slices.Contains(st.VM.QemuArgs, wantArg) {
+		t.Errorf("the recorded qemu command line has no %q:\n%q", wantArg, st.VM.QemuArgs)
+	}
+}
+
+// onlyFakeQemuImgOnPath puts a single executable on PATH: a qemu-img that
+// creates the empty file it is asked to create.
+//
+// isolateFromHostBinaries is the right tool almost everywhere in this file,
+// but a test about a NEW disk cannot use it: runStart removes any stale image
+// and calls vm.EnsureDisk, which shells out to qemu-img, and a failure there
+// ends the run several steps before the address is derived or anything is
+// recorded. A double is what makes the rest of the run reachable, and it is
+// still the same isolation -- the directory holds nothing else, so qemu-img
+// is the only binary any lookup finds, and no real disk image is written.
+//
+// /bin/sh rather than a compiled helper: the interpreter is named absolutely
+// in the shebang, so the kernel finds it whatever PATH says, and the script
+// body is one redirection, which is a shell builtin and needs no PATH either.
+func onlyFakeQemuImgOnPath(t *testing.T) {
+	t.Helper()
+	dir := t.TempDir()
+	// `qemu-img create -f qcow2 <path> <size>`, so $4 is the image path.
+	script := "#!/bin/sh\n: > \"$4\"\n"
+	if err := os.WriteFile(filepath.Join(dir, "qemu-img"), []byte(script), 0o755); err != nil {
+		t.Fatalf("write fake qemu-img: %v", err)
+	}
+	t.Setenv("PATH", dir)
+}
+
 // A derived address is not the same address for two disks, which is the reason
 // the field exists at all. vm.MACForDisk owns the derivation and is tested
 // there; this is about the wiring handing it the disk's own name.
@@ -1416,59 +1915,49 @@ func TestStartDerivesADifferentMACForADifferentDisk(t *testing.T) {
 	}
 }
 
-// teardownNetworkLabel names what reset and cleanup are about to tear down.
+// teardownStartedLine is what reset and cleanup print when they begin taking
+// the network apart, and it names no mode on purpose.
 //
-// It reads the recorded mode because the teardown is not bridged-only:
-// vm.PrepareLinuxShared sets CreatedByKairosLab exactly as
-// vm.PrepareLinuxBridge does, and both commands gate on that flag rather than
-// on the mode, so a user who ran shared used to be told their shared bridge
-// was a bridged one.
+// It used to name st.Network.Mode. That field is written by EVERY start,
+// including `-network user`, while the branch that prints this line gates on
+// st.Network.CreatedByKairosLab -- which only the two modes that build a
+// bridge ever set. A bridged run followed by `start -network user` therefore
+// had `reset` announce "Cleaning up user network..." over the bridge and tap
+// the bridged run had left, and user mode never builds either. Nothing in
+// state records which mode PREPARED the network, so the mode is not a sound
+// source for this sentence and no amount of validating it makes it one.
 //
-// An unrecognised stored value is dropped rather than echoed. state.json is
-// the tool's own 0644 file and these lines go straight to a terminal, so a
-// mode of "bridged\n  - /etc/hosts (will be REMOVED)" would forge a row in the
-// plan printed above them, which is the attack the planValue escaping exists
-// for. Nothing real is lost: every mode that can legitimately be recorded is
-// one of the three.
-func TestTeardownNetworkLabelOnlyEchoesAKnownMode(t *testing.T) {
-	cases := []struct {
-		mode string
-		want string
-	}{
-		{"shared", "shared network"},
-		{"bridged", "bridged network"},
-		{"user", "user network"},
-		{"", "network"},
-		{"nonsense", "network"},
-		{injectedNetworkMode, "network"},
-	}
-	for _, tc := range cases {
-		t.Run("mode="+strconv.Quote(tc.mode), func(t *testing.T) {
-			if got := teardownNetworkLabel(tc.mode); got != tc.want {
-				t.Errorf("teardownNetworkLabel(%q) = %q, want %q", tc.mode, got, tc.want)
-			}
-		})
-	}
-}
+// Saying only that the network is kairos-lab's own is true of shared and
+// bridged alike, and it is the thing the user needs from this line: the plan
+// printed above it already names the bridge and the tap.
+const teardownStartedLine = "Cleaning up the network kairos-lab created..."
 
-// The same thing through both commands, because the message is what the user
-// reads while their network is being taken apart.
+// The message is the one the user reads while their network is being taken
+// apart, and it may not describe it by a mode state cannot vouch for.
+//
+// "user" is the row that matters most: a stored mode of user with the
+// teardown branch taken is exactly the state a bridged run followed by a user
+// run leaves behind, and it used to produce a sentence about a "user network"
+// that has never existed. The two real modes are here because the old wording
+// was right for one of them and wrong for the other, and the injected one
+// because a mode read out of state.json was printed into a terminal at all.
 //
 // The malformed bridge name makes the cleanup refuse before it probes or
 // touches anything, exactly as the tests above it do, so what is asserted is
 // the line printed on the way there and nothing on the host is involved.
-func TestTeardownMessagesNameTheRecordedMode(t *testing.T) {
+func TestTeardownMessagesNameNoMode(t *testing.T) {
 	if runtime.GOOS != "linux" {
 		t.Skip("the network teardown only runs on linux")
 	}
 	modes := []struct {
 		name string
 		mode string
-		want string
 	}{
-		{"shared", "shared", "Cleaning up shared network..."},
-		{"bridged", "bridged", "Cleaning up bridged network..."},
-		{"a stored mode no version of this CLI accepts", injectedNetworkMode, "Cleaning up network..."},
+		{"shared", "shared"},
+		{"bridged", "bridged"},
+		{"user, which builds no network at all", "user"},
+		{"nothing recorded", ""},
+		{"a stored mode no version of this CLI accepts", injectedNetworkMode},
 	}
 	for _, verb := range []string{"reset", "cleanup"} {
 		for _, tc := range modes {
@@ -1485,10 +1974,24 @@ func TestTeardownMessagesNameTheRecordedMode(t *testing.T) {
 				// TestResetReportsAFailedNetworkCleanup and its cleanup
 				// sibling; this one is about the line above it.
 				_ = Run([]string{verb, "-yes"}, strings.NewReader(""), &stdout, &stderr, "test")
-				if !strings.Contains(stdout.String(), tc.want) {
-					t.Errorf("%s does not announce %q; got:\n%s", verb, tc.want, stdout.String())
+				out := stdout.String()
+				if !strings.Contains(out, teardownStartedLine) {
+					t.Errorf("%s does not announce %q; got:\n%s", verb, teardownStartedLine, out)
 				}
-				assertPlanIsInert(t, stdout.String())
+				// No mode, by any spelling. The stored one is the only value
+				// that could put a mode in this line, so each of these is a
+				// sentence the tool would be making up.
+				for _, forbidden := range []string{
+					"Cleaning up shared network",
+					"Cleaning up bridged network",
+					"Cleaning up user network",
+					"Cleaning up network...",
+				} {
+					if strings.Contains(out, forbidden) {
+						t.Errorf("%s described the teardown as %q, which state cannot vouch for:\n%s", verb, forbidden, out)
+					}
+				}
+				assertPlanIsInert(t, out)
 			})
 		}
 	}

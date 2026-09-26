@@ -279,11 +279,13 @@ func buildMacOS(cfg StartConfig) (string, []string, error) {
 		//
 		// It will be the LAST resort there, though, behind the DHCP lease file
 		// and the ARP cache: on macOS -- and only on macOS -- QEMU is launched
-		// under sudo for bridged networking (internal/app/app.go, the
-		// cmdName = "sudo" branch). In that mode QEMU creates this socket as
-		// root, and connecting to a unix socket needs write permission, so a
-		// resolver running as the user gets EACCES. M4 should treat QGA on
-		// macOS as best-effort, not a source to depend on.
+		// under sudo, for BOTH vmnet modes, bridged and shared
+		// (internal/app/app.go, the vmnetNeedsSudo branch). vmnet-shared needs
+		// root exactly as vmnet-bridged does, so the socket is root-owned in
+		// either of them, and connecting to a unix socket needs write
+		// permission: a resolver running as the user gets EACCES. Only user
+		// mode escapes it. M4 should treat QGA on macOS as best-effort, not a
+		// source to depend on.
 		//
 		// "virtio-serial" is an alias that qdev resolves to virtio-serial-pci
 		// on QEMU_ARCH_ARM, so it is valid on the aarch64 virt machine.

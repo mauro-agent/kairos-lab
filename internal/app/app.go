@@ -303,6 +303,16 @@ func selectOrCreateDisk(st *state.State, vmDir, downloadsDir, diskSize string, s
 // tree that had never called it at all.
 var requireNetworkPrivilege = vm.RequireNetworkPrivilege
 
+// prepareLinuxBridge is vm.PrepareLinuxBridge behind the same kind of seam,
+// and for a reason of its own: runStart reads st.Network.BridgeInterface back
+// after this call, because the prepare decides which interface is enslaved and
+// can detect one itself. Nothing in a test can otherwise reach that read. The
+// real function needs an active NetworkManager and issues sudo nmcli
+// commands, so a test driving it for real would either fail on the CI host or
+// reconfigure it, and stubbing vm.PrepareLinuxBridge is the only way to
+// observe what runStart does with the answer it gives back.
+var prepareLinuxBridge = vm.PrepareLinuxBridge
+
 func runStart(args []string, stdin io.Reader, stdout, stderr io.Writer, store *state.Store) error {
 	fs := flag.NewFlagSet("start", flag.ContinueOnError)
 	isoPath := fs.String("iso", "", "path to ISO file")
@@ -429,23 +439,13 @@ func runStart(args []string, stdin io.Reader, stdout, stderr io.Writer, store *s
 		isoLocal = ""
 	}
 
-	// Determine network interface for bridged mode
-	networkIface := *bridgeIface
-	if *network == "bridged" && runtime.GOOS == "linux" && networkIface == "" {
-		candidates := vm.DetectUplinkCandidates()
-		if len(candidates) == 0 {
-			return fmt.Errorf("no suitable uplink interface found for bridged networking (use -bridge-if to specify one, or -network user for port-forwarded access)")
-		}
-		// With several candidates the first one wins and the config review
-		// lets the user change it.
-		networkIface = candidates[0]
-	}
-	if *network == "bridged" && runtime.GOOS == "darwin" && networkIface == "" {
-		candidates := vm.DetectBridgeIfaceCandidates()
-		if len(candidates) == 0 {
-			return fmt.Errorf("no host interface has a link, so bridged networking would leave the VM without an address (use -bridge-if to specify one, or -network user for port-forwarded access)")
-		}
-		networkIface = candidates[0]
+	// Determine network interface for bridged mode. This is the first of two
+	// resolutions: the flag's mode is not the final one, so the review below
+	// resolves again for a run that arrives in another mode and leaves as
+	// bridged. See resolveBridgeUplink.
+	networkIface, err := resolveBridgeUplink(*network, *bridgeIface)
+	if err != nil {
+		return err
 	}
 
 	// For existing disks, seed memory/CPU from the disk's saved settings so
@@ -491,6 +491,25 @@ func runStart(args []string, stdin io.Reader, stdout, stderr io.Writer, store *s
 		networkIface = vmConfig.NetworkIface
 		*display = vmConfig.Display
 		isoLocal = vmConfig.ISOPath
+
+		// The review is the last writer of the mode, so the uplink is
+		// resolved once more against what it settled on. A run that arrives
+		// in any other mode -- which is every run that passes no -network at
+		// all, since the flag defaults to shared -- skipped the resolution
+		// above, and prompt 7 can still turn it into a bridged one. Without
+		// this the interface stays empty: the sudo prompt a few steps down
+		// would name nothing while vm.PrepareLinuxBridge went and detected an
+		// uplink of its own, so the user would consent to enslaving an
+		// interface nobody named.
+		//
+		// It is a second call and not a move, because a run that came in as
+		// bridged has to see its interface on row 8 of the review it is being
+		// shown. When that call already answered, this one returns the same
+		// value without asking the host again.
+		networkIface, err = resolveBridgeUplink(*network, networkIface)
+		if err != nil {
+			return err
+		}
 	}
 
 	// Refuse a mode this host cannot give the privilege for, here and nowhere
@@ -600,7 +619,12 @@ func runStart(args []string, stdin io.Reader, stdout, stderr io.Writer, store *s
 		// st.Network.BridgeInterface for the same reason. A prompt naming an
 		// interface would be asking the user to consent to something this
 		// mode never does, and `status` would then report a stale uplink as
-		// this VM's.
+		// this VM's. The parenthesis is a promise about what the next step
+		// does, and vm.PrepareLinuxShared is what keeps it: its pre-flight
+		// refuses the run when a leftover <bridge>-uplink connection from an
+		// earlier bridged run cannot be deleted, because that connection
+		// carries master/slave-type bridge and would have NetworkManager
+		// enslave the host NIC to this NAT bridge when it comes up.
 		ok, err := confirm(stdin, stdout, *autoYes, "shared networking needs sudo to prepare a NAT bridge/tap (no uplink interface is used)")
 		if err != nil {
 			return err
@@ -613,6 +637,12 @@ func runStart(args []string, stdin io.Reader, stdout, stderr io.Writer, store *s
 		}
 	}
 	if *network == "bridged" && runtime.GOOS == "linux" {
+		// networkIface is resolved by now: resolveBridgeUplink ran against
+		// the mode this run settled on, and returned an error rather than an
+		// empty string if the host offered no candidate. So this prompt names
+		// the interface that is about to be enslaved, which is the only form
+		// of it worth asking -- "(uplink: )" asks the user to agree to
+		// whatever vm.PrepareLinuxBridge goes on to detect for itself.
 		st.Network.BridgeInterface = networkIface
 		ok, err := confirm(stdin, stdout, *autoYes, fmt.Sprintf("bridged networking needs sudo to prepare bridge/tap (uplink: %s)", st.Network.BridgeInterface))
 		if err != nil {
@@ -621,9 +651,16 @@ func runStart(args []string, stdin io.Reader, stdout, stderr io.Writer, store *s
 		if !ok {
 			return fmt.Errorf("sudo permission denied")
 		}
-		if err := vm.PrepareLinuxBridge(st, runtimeDir); err != nil {
+		if err := prepareLinuxBridge(st, runtimeDir); err != nil {
 			return err
 		}
+		// Read back what the prepare enslaved instead of trusting what it was
+		// asked for. vm.PrepareLinuxBridge writes the uplink it used onto the
+		// state, and it has a detection path of its own that runs when the
+		// field arrives empty; taking its answer here is what keeps the
+		// command line, the recorded state and the prompt above describing
+		// one and the same interface.
+		networkIface = st.Network.BridgeInterface
 	}
 
 	// The guest NIC address is per-disk and sticky. A disk that already
@@ -638,8 +675,21 @@ func runStart(args []string, stdin io.Reader, stdout, stderr io.Writer, store *s
 	// a corrupt one by name, which is an error the user can act on; quietly
 	// replacing it with a derived address would start the VM on an address
 	// state.json does not record.
+	//
+	// "Blank" has to mean the same thing here as it does there, which is why
+	// this trims. netDeviceArg treats a whitespace-only value as unset and
+	// emits a bare device, so a stored "   " that got past an untrimmed check
+	// here handed the guest QEMU's single default address -- the collision
+	// the derived one exists to avoid -- and then persisted the whitespace
+	// below, so the next start did it again.
+	//
+	// disk.Name and not vmConfig.DiskName: the disk was re-fetched from state
+	// after the review, so this is the name the image was created under. The
+	// two differ whenever the review renamed a new disk, and deriving from
+	// the pre-rename name would give the VM an address that no longer belongs
+	// to the disk it boots.
 	macAddress := disk.MAC
-	if macAddress == "" {
+	if strings.TrimSpace(macAddress) == "" {
 		macAddress = vm.MACForDisk(disk.Name)
 	}
 
@@ -672,13 +722,8 @@ func runStart(args []string, stdin io.Reader, stdout, stderr io.Writer, store *s
 
 	cmdName := binary
 	cmdArgs := qemuArgs
-	// Both vmnet modes, not just bridged: shared is -netdev vmnet-shared and
-	// needs root exactly as vmnet-bridged does (vm.RequireNetworkPrivilege's
-	// darwinRootModes is the same pair). Launched unprivileged, QEMU exits
-	// non-zero with a vmnet error and no VM. The prompt names the mode the
-	// user actually chose, so consent is asked for the run they asked for.
-	if runtime.GOOS == "darwin" && (*network == "bridged" || *network == "shared") {
-		ok, err := confirm(stdin, stdout, *autoYes, fmt.Sprintf("%s vmnet mode runs qemu with sudo", *network))
+	if vmnetNeedsSudo(runtime.GOOS, *network) {
+		ok, err := confirm(stdin, stdout, *autoYes, vmnetSudoPrompt(*network))
 		if err != nil {
 			return err
 		}
@@ -944,13 +989,13 @@ func runReset(args []string, stdin io.Reader, stdout io.Writer, store *state.Sto
 	// happened by carrying this error into it.
 	var networkCleanupErr error
 	if runtime.GOOS == "linux" && st.Network.CreatedByKairosLab {
-		writef(stdout, "Cleaning up %s...\n", teardownNetworkLabel(st.Network.Mode))
+		writeLine(stdout, "Cleaning up the network kairos-lab created...")
 		if err := vm.CleanupLinuxBridge(st); err != nil {
 			writef(stdout, "warning: bridge cleanup failed: %v\n", err)
 			networkCleanupErr = err
 		}
 	} else if hasStaleNetwork {
-		writef(stdout, "Cleaning up stale %s resources...\n", teardownNetworkLabel(st.Network.Mode))
+		writeLine(stdout, "Cleaning up stale network resources...")
 		if err := vm.CleanupStaleNetworkResources(st); err != nil {
 			writef(stdout, "warning: stale network cleanup failed: %v\n", err)
 			networkCleanupErr = err
@@ -1073,13 +1118,13 @@ func runCleanup(args []string, stdin io.Reader, stdout io.Writer, store *state.S
 	// happened by carrying this error into it.
 	var networkCleanupErr error
 	if runtime.GOOS == "linux" && st.Network.CreatedByKairosLab {
-		writef(stdout, "Cleaning up %s...\n", teardownNetworkLabel(st.Network.Mode))
+		writeLine(stdout, "Cleaning up the network kairos-lab created...")
 		if err := vm.CleanupLinuxBridge(st); err != nil {
 			writef(stdout, "warning: bridge cleanup failed: %v\n", err)
 			networkCleanupErr = err
 		}
 	} else if hasStaleNetwork {
-		writef(stdout, "Cleaning up stale %s resources...\n", teardownNetworkLabel(st.Network.Mode))
+		writeLine(stdout, "Cleaning up stale network resources...")
 		if err := vm.CleanupStaleNetworkResources(st); err != nil {
 			writef(stdout, "warning: stale network cleanup failed: %v\n", err)
 			networkCleanupErr = err
@@ -1376,6 +1421,21 @@ func reviewVMConfig(cfg *vmStartConfig, stdin io.Reader, stdout io.Writer) (*vmS
 			switch {
 			case networkModeValid(val):
 				cfg.NetworkMode = val
+				// A mode chosen here is a mode the run did not arrive in,
+				// so entry 8 can have nothing to show: a start that came
+				// in as shared or user never resolved an interface. Fill
+				// one in now, so the row above reads as the interface the
+				// run is going to enslave rather than as a blank the user
+				// has to know to go and set.
+				//
+				// A host that offers none is not an error here. runStart
+				// resolves again after the review and reports it there;
+				// refusing inside the menu would throw away every other
+				// edit made in it, and the row simply stays empty until
+				// then.
+				if iface, err := resolveBridgeUplink(cfg.NetworkMode, cfg.NetworkIface); err == nil {
+					cfg.NetworkIface = iface
+				}
 			case val != "":
 				writeLine(stdout, "Invalid network mode, use 'shared', 'bridged' or 'user'")
 			}
@@ -1545,7 +1605,16 @@ func bridgeIfaceLinkNote(iface string) string {
 // bridgeIfaceCandidates lists the host interfaces bridged networking can use,
 // most likely first. Linux bridges through a NetworkManager uplink, macOS
 // through vmnet, so the two enumerate different things.
-func bridgeIfaceCandidates() []string {
+//
+// It is a var rather than a func so a test can answer for the host. Both
+// implementations shell out -- `ip route show default` on Linux, the vmnet
+// interface list on macOS -- and the answer is whatever the machine running
+// the suite happens to be plugged into: a container whose only default route
+// is a filtered virtual device, or a macOS runner with no active link, both
+// answer "nothing". Every assertion about which interface a bridged run names
+// and records needs a known answer, and asking the host for one is how a test
+// comes to pass on a laptop and fail on a CI leg.
+var bridgeIfaceCandidates = func() []string {
 	switch runtime.GOOS {
 	case "linux":
 		return vm.DetectUplinkCandidates()
@@ -1553,6 +1622,81 @@ func bridgeIfaceCandidates() []string {
 		return vm.DetectBridgeIfaceCandidates()
 	}
 	return nil
+}
+
+// resolveBridgeUplink answers which host interface a bridged run attaches to,
+// filling in a candidate from the host when the user named none.
+//
+// It is called twice by runStart, before and after the config review, and
+// that is the point of it being a function: the mode is not final until the
+// review returns, so a gate on the flag's mode and a gate on the reviewed one
+// are two different gates. They used to be exactly that -- detection keyed on
+// the flag, the sudo consent prompt keyed on the reviewed mode -- which
+// agreed only for as long as the flag defaulted to bridged. Once the default
+// moved to shared, a user who chose bridged at prompt 7 got a consent prompt
+// naming no interface at all, and vm.PrepareLinuxBridge then picked one and
+// enslaved it.
+//
+// Calling it a second time costs nothing when the first already answered: a
+// non-empty interface is returned unchanged, and the host is asked only when
+// there is nothing to return.
+//
+// The gate is bridgedIfaceSelectable, the same predicate the review's entry 8
+// uses to decide whether an interface is the user's to choose. shared and
+// user attach to no interface, so for them the flag's value is passed through
+// untouched and dropped later by bridgeInterfaceForMode.
+func resolveBridgeUplink(mode, iface string) (string, error) {
+	if !bridgedIfaceSelectable(mode) || iface != "" {
+		return iface, nil
+	}
+	candidates := bridgeIfaceCandidates()
+	if len(candidates) == 0 {
+		return "", noBridgeUplinkError(runtime.GOOS)
+	}
+	// With several candidates the first one wins and the config review lets
+	// the user change it at entry 8.
+	return candidates[0], nil
+}
+
+// noBridgeUplinkError is what a bridged run is told when the host offers no
+// interface to attach to. The two platforms fail differently enough to be
+// worth different sentences: on Linux there is no default route through
+// anything physical, on macOS no interface reports an active link, and vmnet
+// would happily bridge onto the dead one (kairos-io/kairos#4431).
+//
+// goos is a parameter rather than runtime.GOOS so that both messages are
+// reachable from either CI leg. A GOOS-gated string is a string only one leg
+// can pin, and this one tells the user their two ways out of the failure.
+func noBridgeUplinkError(goos string) error {
+	if goos == "darwin" {
+		return fmt.Errorf("no host interface has a link, so bridged networking would leave the VM without an address (use -bridge-if to specify one, or -network user for port-forwarded access)")
+	}
+	return fmt.Errorf("no suitable uplink interface found for bridged networking (use -bridge-if to specify one, or -network user for port-forwarded access)")
+}
+
+// vmnetNeedsSudo reports whether QEMU itself has to be launched as root.
+//
+// Both vmnet modes, not just bridged: shared is -netdev vmnet-shared and
+// needs root exactly as vmnet-bridged does (vm.RequireNetworkPrivilege's
+// darwinRootModes is the same pair). Launched unprivileged, QEMU exits
+// non-zero with a vmnet error and no VM. On Linux nothing here runs as root:
+// the bridge and the tap are prepared beforehand by NetworkManager, and QEMU
+// opens a tap that already belongs to the user.
+//
+// goos is a parameter and not runtime.GOOS because the decision is otherwise
+// pinnable on one CI leg only -- narrowing it back to bridged alone, which is
+// what it said before shared was wired up, survived the entire suite.
+func vmnetNeedsSudo(goos, mode string) bool {
+	return goos == "darwin" && (mode == "bridged" || mode == "shared")
+}
+
+// vmnetSudoPrompt is what that consent asks. It names the mode the user
+// actually chose, so consent is asked for the run they asked for, and it is
+// built here rather than inline for the same reason as above: the branch it
+// is printed from runs on darwin only, so this is the only place a test on
+// either leg can read it.
+func vmnetSudoPrompt(mode string) string {
+	return fmt.Sprintf("%s vmnet mode runs qemu with sudo", mode)
 }
 
 // networkModes is the whole set of modes the CLI accepts, and it lives here,
@@ -1607,29 +1751,6 @@ func networkModeValid(mode string) bool {
 	return slices.Contains(networkModes, mode)
 }
 
-// teardownNetworkLabel names the network a teardown is about to remove, for
-// the messages reset and cleanup print before they act.
-//
-// The mode is read from state rather than hardcoded because the teardown is
-// not bridged-only: vm.PrepareLinuxShared records CreatedByKairosLab the same
-// way vm.PrepareLinuxBridge does, and the branches in runReset and runCleanup
-// gate on that flag and not on the mode, so "Cleaning up bridged network" was
-// what a user who ran shared was told about their shared bridge.
-//
-// The stored value is checked against networkModes before it is printed, and
-// an unrecognised one is simply left out. state.json is the tool's own 0644
-// file, so anything in it is a value a process running as the user can
-// choose, and these lines go to a terminal: printing the field raw is how a
-// stored mode of "bridged\n  - /etc/hosts (will be REMOVED)" forges a row in
-// the plan above it. Every mode that can legitimately be recorded here passes
-// the check, so nothing real is lost by dropping the rest.
-func teardownNetworkLabel(mode string) string {
-	if networkModeValid(mode) {
-		return mode + " network"
-	}
-	return "network"
-}
-
 // bridgeInterfaceForMode answers what host interface this run attaches to, and
 // it exists because the answer has to be the same in the two places runStart
 // records it: on st.Network, which is what `status` prints and what the
@@ -1642,6 +1763,14 @@ func teardownNetworkLabel(mode string) string {
 // needs none. So the flag's value is dropped for both rather than carried:
 // `start -network shared -bridge-if eth0` otherwise records an uplink the run
 // never used, which is a lie state.json keeps until the next bridged start.
+//
+// What it answers for bridged is only as good as what it is handed, and the
+// caller is careful about that. On Linux, iface is what vm.PrepareLinuxBridge
+// reported having enslaved, not what it was asked for: re-deriving the
+// recorded value from the flag instead is how a run that auto-detected and
+// enslaved a real NIC came to record an empty interface. On macOS nothing
+// prepares a bridge -- vmnet does that inside QEMU -- so there iface is the
+// interface the run resolved, which is the only answer there is.
 func bridgeInterfaceForMode(mode, iface string) string {
 	if mode == "bridged" {
 		return iface
@@ -1681,17 +1810,43 @@ func macOSFirmwarePath() (string, error) {
 	return path, nil
 }
 
+// renderCommand renders the command line a start is about to run, for the
+// "Running:" line printed just above the launch.
+//
+// Its words are not all the tool's own. The disk path, the ISO path and the
+// tap name come out of state.json, a 0644 file any process running as the
+// user can write, so this line carries untrusted text to a terminal exactly
+// as the reset and cleanup plans do -- and on macOS it is the line recording
+// a command about to run as root. It used to quote on " \t\n\"" alone, which
+// let an ESC or a CR through raw: a stored path of "/tmp/k.qcow2<CSI>2K<CR>"
+// printed a line that erased and rewrote itself.
+//
+// So every word goes through planValue, the same boundary the plans use. It
+// costs ordinary output nothing: planValue returns an all-printable value
+// unchanged, and a qemu command line is paths, numbers and comma-separated
+// option lists.
+//
+// The space rule is renderCommand's own and stays on top of that, because
+// planValue does not quote a space and this line is a command: a word with a
+// space in it has to look like one word. \t and \n are no longer named here
+// only because planValue already quotes them.
 func renderCommand(name string, args []string) string {
 	parts := make([]string, 0, len(args)+1)
-	parts = append(parts, name)
+	parts = append(parts, renderCommandWord(name))
 	for _, a := range args {
-		if strings.ContainsAny(a, " \t\n\"") {
-			parts = append(parts, fmt.Sprintf("%q", a))
-			continue
-		}
-		parts = append(parts, a)
+		parts = append(parts, renderCommandWord(a))
 	}
 	return strings.Join(parts, " ")
+}
+
+func renderCommandWord(word string) string {
+	if rendered := planValue(word); rendered != word {
+		return rendered
+	}
+	if strings.ContainsAny(word, " \"") {
+		return strconv.Quote(word)
+	}
+	return word
 }
 
 func splitRemovalPaths(paths []string, st *state.State) ([]string, map[string]string) {
