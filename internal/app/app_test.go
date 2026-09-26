@@ -681,8 +681,9 @@ func TestNetworkModesAreExactlyTheDocumentedModes(t *testing.T) {
 //
 // The mode is bridged and not shared on purpose. shared is accepted by the
 // flag everywhere, but nothing in this package prepares its host side yet --
-// vm.PrepareLinuxShared has no call site here -- so on Linux runStart refuses
-// the mode outright rather than let a start reuse the tap a previous bridged
+// vm.PrepareLinuxShared has no call site here -- so on Linux the mode is
+// refused at both places it can be chosen, the -network flag and the config
+// review's prompt 7, rather than let a start reuse the tap a previous bridged
 // run left in state.json and put the guest on the LAN. The milestone that
 // wires the preparation drops that refusal and flips the flag to shared, and
 // this test is what will catch the flip: wantMode below is meant to be
@@ -851,9 +852,14 @@ func TestStartAcceptsEveryDocumentedNetworkMode(t *testing.T) {
 // that adds the vm.PrepareLinuxShared call, which is also the commit that
 // makes this test wrong on purpose.
 //
-// bridged and user are exercised alongside it because the guard is a single
-// condition, and a condition widened by one word would take the working modes
-// down with it.
+// bridged and user are exercised alongside it because the refusal is a single
+// condition inside networkModeUnavailable, and a condition widened by one word
+// would take the working modes down with it -- here and, since both call it,
+// at the config review's prompt 7 as well.
+//
+// This test owns the flag path only. The reviewer path is the other writer of
+// the mode and has its own, in
+// TestReviewVMConfigRefusesSharedNetworkModeOnLinux.
 func TestStartRefusesSharedNetworkModeOnLinux(t *testing.T) {
 	if runtime.GOOS != "linux" {
 		t.Skipf("the refusal is Linux-only on purpose: on %s shared means -netdev vmnet-shared, which fails visibly for want of root, and the privilege pre-flight is where that is handled", runtime.GOOS)
@@ -926,7 +932,20 @@ func TestStartRejectsAnUnknownNetworkMode(t *testing.T) {
 // checked here -- the mode is actually changed, and the prompt offers all
 // three by name, since a prompt that still reads "(bridged or user)" is how a
 // user learns the set.
+//
+// Linux is skipped, and only because shared cannot be run there yet: the
+// reviewer asks networkModeUnavailable and turns the answer away, which
+// TestReviewVMConfigRefusesSharedNetworkModeOnLinux owns. That leaves the
+// flag and the reviewer agreeing about shared on every host, which is what
+// this test is really about -- they simply agree to refuse it on one of them.
+// The skip is keyed on the GOOS rather than on the refusal existing, so the
+// commit that adds the vm.PrepareLinuxShared call has to drop it; the
+// networkModeUnavailable comment says so.
 func TestReviewVMConfigAcceptsSharedNetworkMode(t *testing.T) {
+	if runtime.GOOS == "linux" {
+		t.Skip("shared is refused by the reviewer on Linux until vm.PrepareLinuxShared has a call site; TestReviewVMConfigRefusesSharedNetworkModeOnLinux covers it there")
+	}
+
 	cfg := reviewableConfig(t)
 	cfg.NetworkMode = "bridged"
 
@@ -950,6 +969,67 @@ func TestReviewVMConfigAcceptsSharedNetworkMode(t *testing.T) {
 // three modes: the message is the only place a user who typed a typo is told
 // what the alternatives are.
 const invalidNetworkModeMessage = "Invalid network mode, use 'shared', 'bridged' or 'user'"
+
+// unavailableNetworkModeMessage is the reviewer's other refusal: the mode is
+// spelled correctly and is a member of networkModes, but this host cannot run
+// it yet. Pinned whole, because it is the only thing a user who picked shared
+// at prompt 7 is told, and half of it -- the two modes that do work -- is the
+// only part they can act on.
+const unavailableNetworkModeMessage = "Network mode unavailable: shared networking is not wired up on Linux yet, use 'bridged' or 'user'"
+
+// The refusal of shared reached the other way. runStart has two writers of
+// the network mode and the -network flag is only one of them: a user who
+// passes no -network at all takes the default, opens the config review and
+// answers 7 with "shared", and reviewVMConfig hands that back to runStart,
+// which assigns it over the flag's value 160-odd lines after the flag was
+// checked. While only the flag was guarded that path reproduced the leak in
+// full -- a -netdev tap QEMU command built against the tap a previous bridged
+// run left in state.json, "mode": "shared" written back, and no sudo
+// confirmation shown -- which is why the availability question now lives in
+// networkModeUnavailable and is asked at both writers rather than inline at
+// one.
+//
+// The refusal is a reviewer message and not an error on purpose: the user is
+// nine menu entries into editing a configuration, so the mode is left as it
+// was and the menu comes round again, the same way a typo at this prompt is
+// handled.
+func TestReviewVMConfigRefusesSharedNetworkModeOnLinux(t *testing.T) {
+	if runtime.GOOS != "linux" {
+		t.Skipf("the refusal is Linux-only on purpose: on %s shared means -netdev vmnet-shared, which fails visibly for want of root, and the privilege pre-flight is where that is handled", runtime.GOOS)
+	}
+
+	cfg := reviewableConfig(t)
+	cfg.NetworkMode = "bridged"
+
+	var stdout bytes.Buffer
+	got, err := reviewVMConfig(cfg, scriptedInput("7\nshared\n\n\n"), &stdout)
+	if err != nil {
+		t.Fatalf("reviewVMConfig: %v", err)
+	}
+	// This is the value runStart assigns over the flag's and then writes to
+	// state.json as the run's mode, so "shared" here is the leak: the guest
+	// would be handed the tap a previous bridged run left behind. A refused
+	// answer leaves the configuration the user already had, exactly as a
+	// rejected typo does.
+	if got.NetworkMode != "bridged" {
+		t.Errorf("NetworkMode = %q after answering shared on linux, want it left at %q; stdout:\n%s", got.NetworkMode, "bridged", stdout.String())
+	}
+	if !strings.Contains(stdout.String(), unavailableNetworkModeMessage) {
+		t.Errorf("the refusal is not printed, so the user is not told why their answer did not take; want %q, got:\n%s", unavailableNetworkModeMessage, stdout.String())
+	}
+	// Not the typo message: shared IS a documented mode, and telling the user
+	// to "use 'shared'" for an answer of shared is the drift this milestone
+	// exists to remove.
+	if strings.Contains(stdout.String(), invalidNetworkModeMessage) {
+		t.Errorf("shared was refused as if it were an unknown mode:\n%s", stdout.String())
+	}
+	// Membership is still membership: the prompt names shared because the
+	// mode exists and macOS can use it, and the refusal is what says this
+	// host cannot.
+	if !strings.Contains(stdout.String(), "Enter network mode (shared, bridged or user)") {
+		t.Errorf("the prompt no longer offers shared:\n%s", stdout.String())
+	}
+}
 
 func TestReviewVMConfigRejectsAnUnknownNetworkMode(t *testing.T) {
 	cfg := reviewableConfig(t)

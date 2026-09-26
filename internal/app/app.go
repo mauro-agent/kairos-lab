@@ -313,36 +313,14 @@ func runStart(args []string, stdin io.Reader, stdout, stderr io.Writer, store *s
 	if !networkModeValid(*network) {
 		return fmt.Errorf("invalid network mode: %s", *network)
 	}
-	// TEMPORARY, and deliberately Linux-only. What deletes this block is the
-	// commit that adds the vm.PrepareLinuxShared call to the "[1/3] Preparing
-	// networking" block further down; whoever writes that commit should check
-	// that the reason below is actually gone rather than drop a guard whose
-	// purpose is no longer visible.
-	//
-	// The reason: nothing in this package prepares the host side of shared on
-	// Linux yet. There is no vm.PrepareLinuxShared call site, so no bridge, no
-	// tap and no dnsmasq are created, st.Network.TapName keeps whatever the
-	// previous run left in it, and runStart passes that name straight on as
-	// StartConfig.LinuxTapName. internal/vm's buildLinux takes shared and
-	// bridged through one arm and accepts any non-empty tap name, so on a host
-	// that has ever run bridged the guest is handed the bridged tap -- a
-	// bridge with the host's physical NIC enslaved, that is, the LAN -- while
-	// state.json records "mode": "shared" and no sudo prompt is shown. Those
-	// NetworkManager connections are created with autoconnect on and only
-	// reset and cleanup delete them, so the stale tap long outlives the run
-	// that made it. On a host that has never run bridged the same start
-	// instead dies inside buildLinux with "shared linux mode requires tap
-	// name", which tells the user nothing they can act on. Refusing the mode
-	// up front therefore costs no working behaviour and closes the silent
-	// LAN attach.
-	//
-	// macOS is not guarded here, on purpose: shared there is -netdev
-	// vmnet-shared, which needs root, so QEMU exits non-zero with the reason
-	// in its log instead of quietly attaching the guest to anything. That is a
-	// privilege problem, and the next milestone's privilege pre-flight is
-	// where it belongs.
-	if *network == "shared" && runtime.GOOS == "linux" {
-		return fmt.Errorf("shared networking is not wired up on Linux yet: use -network bridged to put the VM on your LAN (needs sudo), or -network user for port-forwarded access")
+	// Membership is not availability: networkModeValid above accepts shared on
+	// every host, and this is where a mode that cannot be run on this one is
+	// turned away -- before the state is loaded, so the run ends before it can
+	// read the tap name a previous bridged run left behind. The reason, the
+	// other call site and what deletes both are written out on
+	// networkModeUnavailable.
+	if err := networkModeUnavailable(*network); err != nil {
+		return fmt.Errorf("%w: use -network bridged to put the VM on your LAN (needs sudo), or -network user for port-forwarded access", err)
 	}
 	if *display != "serial" && *display != "window" {
 		return fmt.Errorf("invalid display mode: %s", *display)
@@ -1329,10 +1307,23 @@ func reviewVMConfig(cfg *vmStartConfig, stdin io.Reader, stdout io.Writer) (*vmS
 			if err != nil {
 				return nil, err
 			}
-			if networkModeValid(val) {
+			// Three outcomes, not two. An answer can be no mode at all, a
+			// mode this host cannot run, or a mode it can; only the last
+			// writes cfg.NetworkMode. The middle one prints why and falls
+			// through to the menu, exactly as a typo does, so the user
+			// answers again inside the review instead of losing it to a
+			// hard error -- the review is where the rest of the config
+			// they just edited lives.
+			unavailable := networkModeUnavailable(val)
+			switch {
+			case !networkModeValid(val):
+				if val != "" {
+					writeLine(stdout, "Invalid network mode, use 'shared', 'bridged' or 'user'")
+				}
+			case unavailable != nil:
+				writef(stdout, "Network mode unavailable: %v, use 'bridged' or 'user'\n", unavailable)
+			default:
 				cfg.NetworkMode = val
-			} else if val != "" {
-				writeLine(stdout, "Invalid network mode, use 'shared', 'bridged' or 'user'")
 			}
 		case 8:
 			if bridgedIfaceSelectable(cfg.NetworkMode) {
@@ -1524,17 +1515,19 @@ func bridgeIfaceCandidates() []string {
 // flag's validation, the reviewer's prompt and both rejection messages then
 // agree by construction.
 //
-// Membership is not availability. Which of these the -network flag defaults
-// to is a separate decision, taken at the flag declaration in runStart, and it
-// is still bridged; and shared, though it is a member here, is refused on
-// Linux by the temporary guard runStart applies right after the mode check.
-// Both exist for the same missing piece: nothing in this package calls
-// vm.PrepareLinuxShared yet, so a shared start on Linux would prepare no
-// bridge, no tap and no dnsmasq, and BuildQEMUCommand would hand the guest
-// whatever st.Network.TapName still holds -- the bridged tap a previous run
-// left behind, which puts the guest on the LAN under the one mode that exists
-// to keep it off. The guard goes and the default moves once the preparation
-// is wired; the guard's own comment is where that reasoning is written out.
+// Membership is not availability, and the second question has a home of its
+// own: networkModeUnavailable. Which of these the -network flag defaults to is
+// a separate decision, taken at the flag declaration in runStart, and it is
+// still bridged; and shared, though it is a member here, is unavailable on
+// Linux, where that helper refuses it at both places a mode is chosen -- the
+// -network flag and the config review's prompt 7. Both exist for the same
+// missing piece: nothing in this package calls vm.PrepareLinuxShared yet, so a
+// shared start on Linux would prepare no bridge, no tap and no dnsmasq, and
+// BuildQEMUCommand would hand the guest whatever st.Network.TapName still
+// holds -- the bridged tap a previous run left behind, which puts the guest on
+// the LAN under the one mode that exists to keep it off. The refusal goes and
+// the default moves once the preparation is wired; networkModeUnavailable's
+// own comment is where that reasoning is written out.
 //
 // Matching is deliberately exact. "Shared", "SHARED" and " shared" are all
 // rejected rather than folded, both because every other enumerated value in
@@ -1552,6 +1545,68 @@ var networkModes = []string{"shared", "bridged", "user"}
 // filtered out ahead of the rejection message rather than being accepted here.
 func networkModeValid(mode string) bool {
 	return slices.Contains(networkModes, mode)
+}
+
+// unavailableSharedOnLinux is the single authoritative statement of why the
+// mode is refused. Both call sites word the advice that follows it
+// differently -- one names flags, the other names what to type at a prompt --
+// but neither gets to invent its own reason.
+const unavailableSharedOnLinux = "shared networking is not wired up on Linux yet"
+
+// networkModeUnavailable returns a non-nil error when mode is one the CLI
+// accepts but this host cannot actually run yet; nil means the mode is ready
+// to use. It single-sources availability the way networkModeValid
+// single-sources membership, and for the same reason: the question is asked
+// at two call sites, and a question spelled out twice drifts.
+//
+// TEMPORARY, and deliberately Linux-only. What deletes this function and both
+// of its call sites is the commit that adds the vm.PrepareLinuxShared call to
+// the "[1/3] Preparing networking" block in runStart; whoever writes that
+// commit should check that the reason below is actually gone rather than drop
+// a refusal whose purpose is no longer visible.
+//
+// The reason: nothing in this package prepares the host side of shared on
+// Linux yet. There is no vm.PrepareLinuxShared call site, so no bridge, no
+// tap and no dnsmasq are created, st.Network.TapName keeps whatever the
+// previous run left in it, and runStart passes that name straight on as
+// StartConfig.LinuxTapName. internal/vm's buildLinux takes shared and
+// bridged through one arm and accepts any non-empty tap name, so on a host
+// that has ever run bridged the guest is handed the bridged tap -- a bridge
+// with the host's physical NIC enslaved, that is, the LAN -- while state.json
+// records "mode": "shared" and no sudo prompt is shown. Those NetworkManager
+// connections are created with autoconnect on, and only three things delete
+// them: reset, cleanup, and the stale-resource branch of the preflight
+// PrepareLinuxBridge runs -- which recreates them in the same call, so it
+// never leaves the host without them. The stale tap therefore long outlives
+// the run that made it. On a host that has never run bridged the same start instead
+// dies inside buildLinux with "shared linux mode requires tap name", which
+// tells the user nothing they can act on.
+//
+// Both places a mode is chosen ask this, because either one alone leaves the
+// leak open: runStart checks the -network flag, and reviewVMConfig checks the
+// answer to prompt 7, which is the other writer of the mode runStart goes on
+// to start with. While only the flag was guarded, a user who passed no
+// -network at all and answered "shared" at prompt 7 reproduced the silent LAN
+// attach above in full. Refusing the mode at both therefore costs no working
+// behaviour and closes it.
+//
+// The deleting commit has a second thing to remove, and nothing goes red to
+// remind it: TestStartAcceptsEveryDocumentedNetworkMode's shared branch is
+// keyed on the mode and the GOOS rather than on this refusal existing, so
+// left alone it keeps returning early and shared is never again held to
+// errors.Is(err, errSetupRequired) the way bridged and user are. The Linux
+// skip in TestReviewVMConfigAcceptsSharedNetworkMode is keyed the same way
+// and goes with it.
+//
+// macOS is not guarded, on purpose: shared there is -netdev vmnet-shared,
+// which needs root, so QEMU exits non-zero with the reason in its log instead
+// of quietly attaching the guest to anything. That is a privilege problem,
+// and the next milestone's privilege pre-flight is where it belongs.
+func networkModeUnavailable(mode string) error {
+	if mode == "shared" && runtime.GOOS == "linux" {
+		return errors.New(unavailableSharedOnLinux)
+	}
+	return nil
 }
 
 // bridgedIfaceSelectable reports whether the network interface is the user's
