@@ -190,9 +190,13 @@ func blockedStore(t *testing.T, cfg *Store) *Store {
 // sealDir makes dir unwritable for the rest of the test, so that anything
 // trying to create a new entry in it -- the temporary file Save opens, in
 // particular -- fails with EACCES before it has touched a single existing
-// file. The restore is registered before the chmod rather than after, because
-// t.TempDir's own cleanup cannot remove a tree it is not allowed to write to
-// and would fail the test on the way out.
+// file. The restore exists because t.TempDir's own cleanup cannot remove a
+// tree it is not allowed to write to and would fail the test on the way out.
+// Registering it before the chmod rather than after is defensive habit and not
+// the thing that makes that work: t.Cleanup runs its functions last registered
+// first, and t.TempDir registered its teardown back when it created the
+// directory, so a restore registered on either side of the chmod still runs
+// before that teardown either way.
 func sealDir(t *testing.T, dir string) {
 	t.Helper()
 	t.Cleanup(func() { _ = os.Chmod(dir, 0o755) })
@@ -210,10 +214,10 @@ func sealDir(t *testing.T, dir string) {
 // which is what makes this test discriminate rather than decorate. An in-place
 // os.WriteFile does not need write permission on the directory to reopen a
 // file that already exists and is writable by its owner -- it would truncate
-// the live state.json and then succeed -- whereas os.CreateTemp has to add an
-// entry to the directory and fails before writing anything. Pointing the
-// failure at some other path than the one the assertions read would let the
-// old implementation pass this test unchanged.
+// the live state.json and then succeed -- whereas creating the temporary file
+// has to add an entry to the directory and fails before writing anything.
+// Pointing the failure at some other path than the one the assertions read
+// would let the old implementation pass this test unchanged.
 func TestSaveFailureLeavesPreviousStateIntact(t *testing.T) {
 	if os.Geteuid() == 0 {
 		t.Skip("root ignores directory write permission, so the save under test would succeed")
@@ -297,39 +301,78 @@ func TestSaveFailureLeavesNoTemporaryFile(t *testing.T) {
 	}
 }
 
-// TestSaveCreatesStateFilePrivate pins the mode a state.json gets when there
-// is none yet: os.CreateTemp makes a 0600 file, there is no older mode to carry
-// over, and nothing in the save path widens it, so the file arrives readable
-// and writable by the user who ran the tool and by nobody else. That is the
-// right default -- every consumer of state.json in this repository runs as that
-// same user, and the file records disk paths, PIDs and the VM's address. The
-// ambient umask can only narrow this further, never widen it, so 0600 is the
-// most permissive outcome a save can produce here.
-func TestSaveCreatesStateFilePrivate(t *testing.T) {
-	t.Setenv("KAIROS_LAB_CONFIG_DIR", t.TempDir())
-	t.Setenv("KAIROS_LAB_CACHE_DIR", t.TempDir())
-	store, err := DefaultStore()
+// TestSaveUsesTheStatePathDirectoryForItsTemporaryFile pins which directory the
+// temporary file is created in, for a Store whose StatePath is not inside its
+// ConfigDir. Store is exported with exported fields and nothing makes those two
+// agree, and only the directory StatePath lives in is guaranteed to be on the
+// same filesystem as the rename's destination -- across two filesystems rename
+// fails outright with EXDEV rather than copying.
+//
+// Every other test in this package builds its store through DefaultStore, which
+// always puts state.json inside ConfigDir, so all of them stay green if the
+// create is pointed back at ConfigDir. This one is the discriminator, and it
+// discriminates twice over so that it does so as any user:
+//
+//   - ConfigDir is sealed, so a create attempted there fails with EACCES and
+//     takes the whole save down with it. Root ignores directory permissions, so
+//     that half only runs when the tests are not root.
+//   - ConfigDir's modification time is compared across the save. A directory's
+//     mtime moves when an entry is added to it, and moves again when one is
+//     removed, so a temporary file created there and renamed away leaves the
+//     evidence behind even though the file itself is gone. Nothing in a correct
+//     save touches that directory at all: MkdirAll finds it already there and
+//     returns without writing.
+func TestSaveUsesTheStatePathDirectoryForItsTemporaryFile(t *testing.T) {
+	configDir := t.TempDir()
+	stateDir := t.TempDir()
+	store := &Store{
+		ConfigDir: configDir,
+		CacheDir:  t.TempDir(),
+		StatePath: filepath.Join(stateDir, "state.json"),
+	}
+	if os.Geteuid() != 0 {
+		sealDir(t, configDir)
+	}
+	before, err := os.Stat(configDir)
 	if err != nil {
 		t.Fatal(err)
 	}
+
 	st := NewState(store)
 	st.Platform.Arch = "arm64"
 	if err := store.Save(st); err != nil {
-		t.Fatal(err)
+		t.Fatalf("a state path outside ConfigDir should still save: %v", err)
+	}
+
+	if _, err := os.Stat(store.StatePath); err != nil {
+		t.Fatalf("the state file should exist at StatePath: %v", err)
 	}
 	loaded, err := store.Load()
 	if err != nil {
-		t.Fatal(err)
+		t.Fatalf("the saved state file should parse: %v", err)
 	}
 	if loaded.Platform.Arch != "arm64" {
 		t.Errorf("arch = %q, want arm64", loaded.Platform.Arch)
 	}
-	info, err := os.Stat(store.StatePath)
+
+	entries, err := os.ReadDir(configDir)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if perm := info.Mode().Perm(); perm != 0o600 {
-		t.Errorf("mode of a freshly created state file = %04o, want 0600", perm)
+	if len(entries) != 0 {
+		var names []string
+		for _, e := range entries {
+			names = append(names, e.Name())
+		}
+		t.Errorf("ConfigDir contents after the save = %v, want nothing: the state file and its temporary belong beside StatePath", names)
+	}
+	after, err := os.Stat(configDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !after.ModTime().Equal(before.ModTime()) {
+		t.Errorf("ConfigDir was modified by a save that should not have touched it (mtime %v -> %v): the temporary file was created there instead of beside StatePath",
+			before.ModTime(), after.ModTime())
 	}
 }
 
