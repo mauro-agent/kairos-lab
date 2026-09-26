@@ -159,14 +159,13 @@ Removes everything created by `kairos-lab`:
 
 ## Networking
 
-Three modes, picked with `-network`, and they trade off differently enough
-that the choice matters:
+Three modes, picked with `-network`:
 
 | Mode | Gets | Cannot |
 |---|---|---|
-| `shared` (default) | Internet, an address the host can reach, a subnet of its own | Be reached from other machines on your LAN |
+| `shared` (default) | Internet, an address the host can reach, a subnet of its own | Be reached from other machines on your LAN, or run a second VM: this CLI starts one at a time |
 | `bridged` | An address on your LAN that other machines can reach | Work reliably over Wi-Fi |
-| `user` | Internet, for a single VM | Reach another VM, or form a cluster |
+| `user` | Internet, for a single VM | Be reached by another VM, or form a cluster |
 
 **shared** (the default) attaches no physical interface at all - it puts the
 VM on a private NAT subnet instead. That's also why it works over Wi-Fi,
@@ -174,12 +173,12 @@ where `bridged` often can't: no guest frame leaves the host with a MAC the
 access point never saw associate. The VM still gets a real address on that
 subnet, not just forwarded ports. That subnet could carry more than one
 guest, but this CLI does not claim a cluster: nothing here asks for a second
-VM, and neither way around that is supported either. `start` refuses outright
-while this config dir's VM is already running, and pointing a second run at
-another config dir resolves the same bridge and tap names, since no flag
-sets them - which on Linux is what the pre-flight in `internal/vm` treats as
-stale and removes, taking the running VM's network with it. The limit today
-is the CLI's, not the subnet's.
+VM, and neither way around that is supported. `start` refuses outright while
+this config dir's VM is already running, on either platform; and pointing a
+second run at another config dir resolves the same bridge and tap names,
+since no flag sets them - which on Linux is what the pre-flight in
+`internal/vm` treats as stale and removes, taking the running VM's network
+with it. The limit today is the CLI's, not the subnet's.
 
 **bridged** puts the VM on your LAN with a real LAN address, at the cost of
 enslaving a physical interface to the bridge. Bridging onto Wi-Fi is
@@ -191,12 +190,12 @@ never associated. 4-address/WDS mode is the exception, and it's
 implementation-specific, which is why bridging onto Wi-Fi works on some
 access points and fails on others.
 
-**user** is QEMU's own NAT with ports forwarded to localhost
-(`ssh localhost:2222`, `http localhost:8080`). It needs no privileges and no
-NetworkManager, but the guest has no address on your network at all: SLIRP is
-a userspace NAT running inside the QEMU process, so a user-mode guest can
-neither reach nor be reached by any other VM. `user` supports a single VM and
-cannot form a cluster - a limit of the network itself, not of the CLI.
+**user** is QEMU's own NAT, with ports forwarded from the host - connect at
+`ssh -p 2222 kairos@localhost` and `http://localhost:8080`. It needs no
+privileges and no NetworkManager. SLIRP is a userspace NAT inside the QEMU
+process, so the guest has no address on your network at all - nothing else
+can address it. That is what keeps `user` to a single VM and out of any
+cluster, and it is a limit of the network itself, not of the CLI.
 
 ### macOS
 
@@ -207,21 +206,26 @@ before anything is built (no disk image, no bridge, no tap), and refuses if
 you can't get it - not in the admin or wheel group, or no sudo binary at all -
 rather than fail midway through.
 
-`bridged`'s interface defaults to the one holding the host's default route
-(`route -n get default`); when that interface has no link, or there's no
-default route to ask about, it falls back to the first active interface
-`ifconfig -l` lists instead, so the resolved interface isn't always the
-default-route one. `start` refuses to run when the resolved interface has no
-link, because vmnet builds the bridge anyway and the VM then boots with no
-DHCP lease and no error. Pass `-bridge-if <iface>` to choose a different one,
-or use `-network shared` or `-network user` instead.
+`bridged` only considers physical interfaces: tunnels (including a VPN's
+`utun`), bridges, AirDrop and the other virtual devices are skipped whether
+or not they hold the default route or have a link. Among what's left, the
+interface holding the host's default route (`route -n get default`) is
+preferred; otherwise it falls back to the first active one `ifconfig -l`
+lists.
+
+When nothing on the host qualifies, `start` refuses rather than bridge onto a
+dead port, because vmnet builds the bridge anyway and the VM then boots with
+no DHCP lease and no error; use `-network shared` or `-network user` instead.
+Naming an interface yourself with `-bridge-if <iface>` skips that resolution,
+but `start` still checks the interface you named has a link, and refuses if
+it doesn't.
 
 `start` prints a warning when the interface it resolves - default-route or
 fallback - is a Wi-Fi radio, so you see that risk before the VM boots rather
 than after it fails to get a lease. `shared` has no such problem, since it
 attaches to no interface at all.
 
-`shared`'s subnet is typically `192.168.64.0/24`, but treat that as an
+vmnet typically puts `shared` on `192.168.64.1/24`, but treat that as an
 example, not a promise: the QEMU command line only ever asks for
 `-netdev vmnet-shared,id=net0`, with no address options at all, so the guest
 lands wherever Apple's vmnet framework decides to put it. Apple documents no
@@ -241,12 +245,12 @@ bridge (`kairoslab0`) and a tap device for the VM:
   `x` increments only to avoid NetworkManager's own concurrently active
   shared reservations - a second shared connection gets `10.42.1.1/24` while
   the first keeps `10.42.0.1/24` - it is not conflict-detection against your
-  existing network or routes. kairos-lab runs one VM at a time, so in the
-  usual case it's `10.42.0.1/24`. Its connections are created with
-  autoconnect off, so `systemctl restart NetworkManager` while a shared VM is
-  running takes the bridge and tap down with it, and they only come back on
-  the next `start` - the trade for not running a DHCP server, DNS forwarder
-  and NAT rule on every boot of a host that has no VM up at all.
+  existing network or routes. It's `10.42.0.1/24` when no other shared
+  connection is active on the host. NetworkManager unmanages IPv4-shared
+  connections when it stops, so a restart takes the bridge and tap down with
+  it, and because these are created with autoconnect off they only come back
+  on the next `start` - the trade for not running a DHCP server, DNS
+  forwarder and NAT rule on every boot of a host that has no VM up at all.
 - **bridged** also enslaves your physical interface to the bridge, so the VM
   takes its lease from your LAN instead. `-bridge-if` accepts a Wi-Fi device
   (`wlan*`) with no complaint, but the same Wi-Fi unreliability described
@@ -255,7 +259,7 @@ bridge (`kairoslab0`) and a tap device for the VM:
   bridge back on its own.
 
 If NetworkManager is not available, use `-network user` for port-forwarded
-access (`ssh localhost:2222`, `http localhost:8080`).
+access (`ssh -p 2222 kairos@localhost`, `http://localhost:8080`).
 
 ## State and Paths
 
