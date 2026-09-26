@@ -131,9 +131,10 @@ Flags:
 - `-bridge-if <iface>` - Uplink for `bridged`, dropped if the run ends up in
   `shared` or `user` (default: resolved from the host's interfaces at run time)
 - `-disk-size 60G` - Disk size for new disks
-- `-memory <GB>` / `-cpus <n>` - VM resources (memory is in GB, not MB). A
-  new disk gets 2 vCPUs and 8 GB of memory on Apple Silicon, 4 GB elsewhere;
-  an existing one reuses what it was last started with unless you pass the flag
+- `-memory <GB>` / `-cpus <n>` - VM resources (memory is in GB, not MB). Pass
+  neither and a new disk gets 2 vCPUs and 8 GB of memory on Apple Silicon, 4 GB
+  elsewhere, while an existing one reuses what it was last started with - or
+  those same defaults, if it has none recorded
 - `-yes` - Auto-confirm prompts
 
 ### `status`
