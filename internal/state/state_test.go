@@ -4,6 +4,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 )
 
@@ -168,5 +169,198 @@ func TestStateJSONKeysForMACAndIP(t *testing.T) {
 		if !strings.Contains(string(raw), key) {
 			t.Errorf("state.json should carry the %s key once it has a value, got:\n%s", key, raw)
 		}
+	}
+}
+
+// blockedStore returns a store that shares cfg's directories but whose state
+// path is an existing directory. os.Rename can never take over a directory
+// name, so a Save through the returned store is guaranteed to fail at exactly
+// the point this package cares about -- after the temporary file exists --
+// without mocking the filesystem out from under it.
+func blockedStore(t *testing.T, cfg *Store) *Store {
+	t.Helper()
+	blocked := filepath.Join(cfg.ConfigDir, "blocked-state.json")
+	if err := os.MkdirAll(blocked, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	return &Store{ConfigDir: cfg.ConfigDir, CacheDir: cfg.CacheDir, StatePath: blocked}
+}
+
+// TestSaveFailureLeavesPreviousStateIntact is the whole point of writing
+// through a rename: a save that cannot complete must leave the file that was
+// already on disk byte-for-byte as it was, still parseable by the next reader,
+// rather than the truncated stump a failed in-place write would leave behind.
+func TestSaveFailureLeavesPreviousStateIntact(t *testing.T) {
+	t.Setenv("KAIROS_LAB_CONFIG_DIR", t.TempDir())
+	t.Setenv("KAIROS_LAB_CACHE_DIR", t.TempDir())
+	store, err := DefaultStore()
+	if err != nil {
+		t.Fatal(err)
+	}
+	st := NewState(store)
+	st.Platform.OS = "linux"
+	st.VM.IPAddress = "192.168.64.7"
+	if err := store.Save(st); err != nil {
+		t.Fatal(err)
+	}
+	before, err := os.ReadFile(store.StatePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	doomed := blockedStore(t, store)
+	st.Platform.OS = "darwin"
+	if err := doomed.Save(st); err == nil {
+		t.Fatal("saving onto a directory should fail")
+	}
+
+	after, err := os.ReadFile(store.StatePath)
+	if err != nil {
+		t.Fatalf("the previous state file should still be readable: %v", err)
+	}
+	if string(after) != string(before) {
+		t.Errorf("a failed save rewrote the previous state file:\nbefore:\n%s\nafter:\n%s", before, after)
+	}
+	loaded, err := store.Load()
+	if err != nil {
+		t.Fatalf("the previous state file should still parse: %v", err)
+	}
+	if loaded.Platform.OS != "linux" || loaded.VM.IPAddress != "192.168.64.7" {
+		t.Errorf("previous state changed: os = %q, ip = %q", loaded.Platform.OS, loaded.VM.IPAddress)
+	}
+}
+
+// TestSaveFailureLeavesNoTemporaryFile pins the cleanup half of the rename
+// dance. The temporary file is created in the config dir, so forgetting to
+// remove it on failure would slowly fill a directory the user actually looks
+// at with state.json.tmp-* debris.
+func TestSaveFailureLeavesNoTemporaryFile(t *testing.T) {
+	t.Setenv("KAIROS_LAB_CONFIG_DIR", t.TempDir())
+	t.Setenv("KAIROS_LAB_CACHE_DIR", t.TempDir())
+	store, err := DefaultStore()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Save(NewState(store)); err != nil {
+		t.Fatal(err)
+	}
+
+	doomed := blockedStore(t, store)
+	for i := 0; i < 3; i++ {
+		if err := doomed.Save(NewState(store)); err == nil {
+			t.Fatal("saving onto a directory should fail")
+		}
+	}
+
+	entries, err := os.ReadDir(store.ConfigDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var names []string
+	for _, e := range entries {
+		names = append(names, e.Name())
+	}
+	want := []string{"blocked-state.json", "state.json"}
+	if strings.Join(names, ",") != strings.Join(want, ",") {
+		t.Errorf("config dir contents = %v, want %v", names, want)
+	}
+}
+
+// TestSaveLoadRoundTripKeepsFileMode guards the mode the rename path has to
+// restore by hand: os.CreateTemp makes a 0600 file, while state.json has
+// always been 0644.
+func TestSaveLoadRoundTripKeepsFileMode(t *testing.T) {
+	t.Setenv("KAIROS_LAB_CONFIG_DIR", t.TempDir())
+	t.Setenv("KAIROS_LAB_CACHE_DIR", t.TempDir())
+	store, err := DefaultStore()
+	if err != nil {
+		t.Fatal(err)
+	}
+	st := NewState(store)
+	st.Platform.Arch = "arm64"
+	if err := store.Save(st); err != nil {
+		t.Fatal(err)
+	}
+	loaded, err := store.Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if loaded.Platform.Arch != "arm64" {
+		t.Errorf("arch = %q, want arm64", loaded.Platform.Arch)
+	}
+	info, err := os.Stat(store.StatePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if perm := info.Mode().Perm(); perm != 0o644 {
+		t.Errorf("state file mode = %04o, want 0644", perm)
+	}
+	// A second save renames a fresh temporary file over the first one, so the
+	// mode has to survive the replacement too, not just the initial create.
+	if err := store.Save(st); err != nil {
+		t.Fatal(err)
+	}
+	info, err = os.Stat(store.StatePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if perm := info.Mode().Perm(); perm != 0o644 {
+		t.Errorf("state file mode after re-save = %04o, want 0644", perm)
+	}
+}
+
+// TestConcurrentSaveAndLoad reproduces the situation the rename exists for: a
+// reader (`kairos-lab status` in another terminal) hitting state.json while a
+// writer is replacing it. Every Load must return a fully parsed state -- never
+// a parse error from a truncated file. The saved payload changes length from
+// iteration to iteration so that a partially written file would be visibly
+// malformed rather than accidentally valid JSON.
+func TestConcurrentSaveAndLoad(t *testing.T) {
+	t.Setenv("KAIROS_LAB_CONFIG_DIR", t.TempDir())
+	t.Setenv("KAIROS_LAB_CACHE_DIR", t.TempDir())
+	store, err := DefaultStore()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Save(NewState(store)); err != nil {
+		t.Fatal(err)
+	}
+
+	const saves = 50
+	const loads = 200
+	saveErrs := make(chan error, saves)
+	loadErrs := make(chan error, loads)
+
+	var wg sync.WaitGroup
+	wg.Add(2)
+	go func() {
+		defer wg.Done()
+		for i := 0; i < saves; i++ {
+			st := NewState(store)
+			st.VM.LastError = strings.Repeat("x", i*8)
+			if err := store.Save(st); err != nil {
+				saveErrs <- err
+				return
+			}
+		}
+	}()
+	go func() {
+		defer wg.Done()
+		for i := 0; i < loads; i++ {
+			if _, err := store.Load(); err != nil {
+				loadErrs <- err
+				return
+			}
+		}
+	}()
+	wg.Wait()
+	close(saveErrs)
+	close(loadErrs)
+
+	for err := range saveErrs {
+		t.Errorf("concurrent save failed: %v", err)
+	}
+	for err := range loadErrs {
+		t.Errorf("concurrent load could not read the state file: %v", err)
 	}
 }

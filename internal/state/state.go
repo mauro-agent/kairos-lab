@@ -154,9 +154,56 @@ func (s *Store) Save(st *State) error {
 	if err != nil {
 		return fmt.Errorf("serialize state: %w", err)
 	}
-	if err := os.WriteFile(s.StatePath, append(b, '\n'), 0o644); err != nil {
+	// The state file is published by renaming a complete temporary file over
+	// it, not by writing into it in place. Writing in place truncates first, so
+	// another process reading state.json at that moment -- a `kairos-lab
+	// status` in a second terminal, say, while a running VM's IP address is
+	// being recorded -- sees an empty or half-written file and fails to parse
+	// it. A rename swaps the name onto already-complete contents in one step,
+	// so every reader sees either the whole old file or the whole new one and
+	// never something in between. That is also why the temporary file is
+	// created in ConfigDir rather than the system temp dir: rename is only
+	// atomic within a single filesystem, and /tmp is routinely a different one.
+	tmp, err := os.CreateTemp(s.ConfigDir, "state.json.tmp-*")
+	if err != nil {
+		return fmt.Errorf("create temporary state file: %w", err)
+	}
+	tmpPath := tmp.Name()
+	closed := false
+	renamed := false
+	// Any failure below must leave no trace: the previous state.json is still
+	// the live one, and a half-written temporary file next to it would be
+	// nothing but litter in the user's config dir.
+	defer func() {
+		if !closed {
+			_ = tmp.Close()
+		}
+		if !renamed {
+			_ = os.Remove(tmpPath)
+		}
+	}()
+	if _, err := tmp.Write(append(b, '\n')); err != nil {
 		return fmt.Errorf("write state file: %w", err)
 	}
+	// Flush before the rename, so the name can never be published pointing at
+	// contents the kernel has not yet put on disk.
+	if err := tmp.Sync(); err != nil {
+		return fmt.Errorf("sync state file: %w", err)
+	}
+	// os.CreateTemp makes the file 0600, but state.json has always been 0644
+	// and is read by the user outside this tool; the mode is part of the
+	// existing behaviour, so restore it rather than quietly tightening it.
+	if err := tmp.Chmod(0o644); err != nil {
+		return fmt.Errorf("set state file mode: %w", err)
+	}
+	if err := tmp.Close(); err != nil {
+		return fmt.Errorf("close state file: %w", err)
+	}
+	closed = true
+	if err := os.Rename(tmpPath, s.StatePath); err != nil {
+		return fmt.Errorf("replace state file: %w", err)
+	}
+	renamed = true
 	return nil
 }
 
