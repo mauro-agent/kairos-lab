@@ -475,6 +475,16 @@ func TestAcquireLockRestartsAfterThePathIsReplacedBetweenOpenAndFlock(t *testing
 // TestAcquireLockRestartsAfterThePathIsReplacedBetweenOpenAndFlock is what
 // exercises case 3, separately, and nothing here pins that the two count
 // against the same counter rather than each having its own.
+//
+// The error assertion checks for "restart bound (lockOpenAttempts) was
+// spent" specifically, not the more general "kept being replaced or
+// removed" both give-up messages share: acquireLock returns two distinct
+// give-up errors, one when lockOpenAttempts is spent (this test's own
+// scenario) and a separate one when lockAcquireTimeout elapses instead, and
+// a substring present in both pins neither -- it would still pass against a
+// mutant that made this test hit the wrong one of the two. Only the
+// restart-bound phrasing is unique to the message this scenario actually
+// produces.
 func TestAcquireLockGivesUpWhenThePathNeverStopsBeingReplaced(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "state.lock")
@@ -497,8 +507,8 @@ func TestAcquireLockGivesUpWhenThePathNeverStopsBeingReplaced(t *testing.T) {
 	if err == nil {
 		t.Fatal("acquireLock should give up rather than succeed against a path that never stops being replaced")
 	}
-	if !strings.Contains(err.Error(), "kept being replaced or removed") {
-		t.Errorf("error %q does not describe giving up on a churning path", err)
+	if !strings.Contains(err.Error(), "restart bound (lockOpenAttempts) was spent") {
+		t.Errorf("error %q does not describe the restart bound being spent -- it should not be the deadline (lockAcquireTimeout) give-up message instead", err)
 	}
 	if calls != lockOpenAttempts {
 		t.Errorf("linkLockFile succeeded %d time(s), want exactly lockOpenAttempts (%d): the restart bound did not stop the loop where expected", calls, lockOpenAttempts)
@@ -550,15 +560,22 @@ func TestAcquireLockOnceRetriesWhenLockFileDeletedAfterOpen(t *testing.T) {
 	}
 }
 
-// TestAcquireLockOnceRefusesAHardLinkedFile pins the Nlink > 1 branch as the
-// other half of the same fstat check TestAcquireLockOnceRetriesWhen
-// LockFileDeletedAfterOpen pins: unlike a deleted file, a hard-linked one is
-// a real, persistent problem with whatever is at path, so it is refused
-// with retry == false and a distinct message, not folded into the same
-// retryable bucket as Nlink == 0. TestUpdateRefusesAHardLinkAtTheLockPath
-// above already pins this end-to-end through Update; this is the same
-// check, exercised directly and paired with its Nlink == 0 sibling so the
-// two distinct messages are asserted side by side.
+// TestAcquireLockOnceRefusesAHardLinkedFile pins the Nlink > 1 branch this
+// scenario reaches: path is already a hard link to victim before this call
+// ever runs, so linkLockFile's own link(2) fails EEXIST and this call takes
+// the reopen branch -- the same branch case 4 in lockOpenAttempts's own
+// comment describes another kairos-lab process's own mid-publish as
+// reaching. A single attempt cannot tell the two apart (chown never runs on
+// this branch either way, which is exactly why it is the persistent case's
+// only remaining target), so it is retry == true here, same as that
+// transient case -- not retry == false, which used to be this test's own
+// assertion until the design changed to fix spurious non-retryable refusals
+// during an ordinary concurrent publish. The persistent case this test
+// actually sets up is still refused in the end: TestUpdateRefusesAHardLinkAt
+// TheLockPath pins that end-to-end through Update, where acquireLock's
+// restart bound converts a hard link that never resolves into its own
+// give-up error once the bound is spent, rather than acquireLockOnce ever
+// calling it non-retryable on the first attempt.
 func TestAcquireLockOnceRefusesAHardLinkedFile(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "state.lock")
@@ -577,11 +594,19 @@ func TestAcquireLockOnceRefusesAHardLinkedFile(t *testing.T) {
 		}
 		t.Fatal("acquireLockOnce should refuse a hard-linked lock file, not succeed")
 	}
-	if retry {
-		t.Errorf("a hard-linked file is a persistent problem, not a transient one -- got retry = true, err = %v", err)
+	if !retry {
+		t.Errorf("a single attempt reaching a hard link via the reopen branch cannot yet tell it apart from another kairos-lab process mid-publish -- got retry = false, err = %v", err)
 	}
 	if !strings.Contains(err.Error(), "hard links") {
 		t.Errorf("error %q does not name the hard-link refusal", err)
+	}
+
+	body, err := os.ReadFile(victim)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(body) != "victim\n" {
+		t.Errorf("the hard link's target was modified: contents = %q", body)
 	}
 }
 
@@ -589,9 +614,19 @@ func TestAcquireLockOnceRefusesAHardLinkedFile(t *testing.T) {
 // chown-precondition's parse-failure branch. geteuid is faked to 0 rather
 // than run as real root -- see openLockFile/geteuid's own comment for why
 // that is enough to drive this branch without the test process needing
-// root -- and confirms the lock file is removed rather than left behind
-// root-"owned" (in the sense this run believed itself to be root) with an
-// unresolved identity to hand it to.
+// root -- and confirms the temporary file is removed rather than left
+// behind root-"owned" (in the sense this run believed itself to be root)
+// with an unresolved identity to hand it to.
+//
+// The directory, not path itself, is what this asserts against: this
+// branch fires before linkLockFile ever runs, so path is never created in
+// the first place, and an os.Stat(path) NotExist assertion used to hold
+// unconditionally -- true whether or not cleanupTmp ran at all.
+// Demonstrated: removing the cleanupTmp() call from this branch in
+// production code left a state.lock.tmp-* behind and this test still
+// passed, because it was asserting something about path that this branch
+// never touches. A ReadDir of the directory is what actually depends on the
+// temporary file's removal.
 func TestAcquireLockOnceRejectsUnparsableSudoIDsAsRoot(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "state.lock")
@@ -615,8 +650,12 @@ func TestAcquireLockOnceRejectsUnparsableSudoIDsAsRoot(t *testing.T) {
 	if !strings.Contains(err.Error(), "could not be parsed") {
 		t.Errorf("error %q does not name the parse failure", err)
 	}
-	if _, serr := os.Stat(path); !os.IsNotExist(serr) {
-		t.Errorf("the lock file should have been removed rather than left behind, stat returned: %v", serr)
+	entries, derr := os.ReadDir(dir)
+	if derr != nil {
+		t.Fatalf("read dir: %v", derr)
+	}
+	if len(entries) != 0 {
+		t.Errorf("the temporary file should have been removed rather than left behind, directory contains: %v", entries)
 	}
 }
 
@@ -629,6 +668,12 @@ func TestAcquireLockOnceRejectsUnparsableSudoIDsAsRoot(t *testing.T) {
 // suite is ever run as real root, targetUID's real fchown would succeed
 // instead of failing -- the same reason state_test.go's
 // TestSaveFailureLeavesPreviousStateIntact guards itself the same way.
+//
+// The directory, not path itself, is what this asserts against -- see
+// TestAcquireLockOnceRejectsUnparsableSudoIDsAsRoot's own comment for why an
+// os.Stat(path) assertion here was a tautology (path is never created
+// before this branch fires) rather than a pin on cleanupTmp actually
+// running.
 func TestAcquireLockOnceRejectsAChownFailureAsRoot(t *testing.T) {
 	if os.Geteuid() == 0 {
 		t.Skip("root can chown to any uid, so the chown under test would succeed")
@@ -656,7 +701,11 @@ func TestAcquireLockOnceRejectsAChownFailureAsRoot(t *testing.T) {
 	if !strings.Contains(err.Error(), "could not be chowned") {
 		t.Errorf("error %q does not name the chown failure", err)
 	}
-	if _, serr := os.Stat(path); !os.IsNotExist(serr) {
-		t.Errorf("the lock file should have been removed rather than left root-owned, stat returned: %v", serr)
+	entries, derr := os.ReadDir(dir)
+	if derr != nil {
+		t.Fatalf("read dir: %v", derr)
+	}
+	if len(entries) != 0 {
+		t.Errorf("the temporary file should have been removed rather than left root-owned, directory contains: %v", entries)
 	}
 }
