@@ -270,13 +270,17 @@ func TestBuildLinuxPadsStrippedMAC(t *testing.T) {
 // this file calls buildLinuxFor directly with an explicit arch, so a
 // hardcoded binding (e.g. always "amd64") left the suite green while an
 // arm64 host silently lost -machine and -bios again, exactly the 59c6949
-// regression this file otherwise guards against. No runtime.GOOS/GOARCH skip
-// is needed: cfg is chosen to succeed on either arch, since arm64 now
-// requires a non-empty BiosPath that amd64 simply ignores.
+// regression this file otherwise guards against.
+//
+// It carries no GOOS skip, and that is load-bearing rather than tidiness.
+// On an amd64 host the "amd64" hardcode is an EQUIVALENT mutant -- it is
+// literally the same call as buildLinuxFor(runtime.GOARCH, cfg) there, so no
+// test can distinguish it. macos-latest is this repo's only arm64 CI leg, so
+// a GOOS skip would leave the very mutation named above surviving every leg.
+// Nothing stops it running there: buildLinux is pure, and cfg is chosen to
+// succeed on either arch, since arm64 needs the non-empty BiosPath that
+// amd64 simply ignores.
 func TestBuildLinuxBindsToTheHostArchitecture(t *testing.T) {
-	if runtime.GOOS != "linux" {
-		t.Skip("linux-only test")
-	}
 	cfg := StartConfig{
 		DiskPath:      "/tmp/kairos.qcow2",
 		QGASocketPath: "/tmp/kairos.sock",
@@ -286,6 +290,12 @@ func TestBuildLinuxBindsToTheHostArchitecture(t *testing.T) {
 		BiosPath:      "/usr/share/AAVMF/QEMU_EFI.fd",
 	}
 	wantBinary, wantArgs, wantErr := buildLinuxFor(runtime.GOARCH, cfg)
+	// Without this the test passes vacuously whenever BOTH sides fail: two
+	// identical errors compare equal, so a future required-field guard on a
+	// field this cfg leaves blank would silently disarm the comparison below.
+	if wantErr != nil {
+		t.Fatalf("buildLinuxFor(%q) must succeed for this comparison to mean anything: %v", runtime.GOARCH, wantErr)
+	}
 	gotBinary, gotArgs, gotErr := buildLinux(cfg)
 	if gotBinary != wantBinary {
 		t.Errorf("buildLinux binary = %q, want %q (buildLinuxFor(runtime.GOARCH, cfg))", gotBinary, wantBinary)
