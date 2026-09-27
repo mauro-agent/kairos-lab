@@ -444,14 +444,14 @@ func acquireLock(path string) (unlock func(), err error) {
 				}
 				return nil, giveUp
 			}
-			giveUp := fmt.Errorf("gave up after %d attempt(s) trying to get a stable lock on %s: the restart bound (lockOpenAttempts) was spent -- the file kept being replaced or removed out from under this process; if this persists, another process may be repeatedly recreating it; try again (%w)", attempt+1, path, lastErr)
+			giveUp := fmt.Errorf("gave up after %d attempt(s) trying to get a stable lock on %s: the restart bound (lockOpenAttempts) was spent, and the last attempt found the file replaced or removed out from under this process; if this persists, another process may be repeatedly recreating it; try again (%w)", attempt+1, path, lastErr)
 			if sib != "" {
-				giveUp = fmt.Errorf("%w -- found %q next to it, a leftover temporary file from an unfinished publish; removing that by hand is likely what clears this", giveUp, sib)
+				giveUp = fmt.Errorf("%w -- found %q next to it, of the shape an unfinished publish leaves behind; removing that by hand is likely what clears this", giveUp, sib)
 			}
 			return nil, giveUp
 		}
 		if !time.Now().Before(deadline) {
-			return nil, fmt.Errorf("timed out after %s trying to get a stable lock on %s: the file kept being replaced or removed out from under this process -- if this persists, another process may be repeatedly recreating it; try again (%w)", lockAcquireTimeout, path, lastErr)
+			return nil, fmt.Errorf("timed out after %s trying to get a stable lock on %s: the last attempt found the file replaced or removed out from under this process -- if this persists, another process may be repeatedly recreating it; try again (%w)", lockAcquireTimeout, path, lastErr)
 		}
 		// Sleep before restarting, the same lockRetryInterval the flock-wait
 		// loop inside acquireLockOnce already sleeps between LOCK_NB

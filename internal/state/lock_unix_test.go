@@ -790,8 +790,13 @@ func TestAcquireLockOnceRefusalQuotesAnAttackerControlledTempSibling(t *testing.
 		t.Fatal("acquireLockOnce should refuse when its own just-published file gains a second link before the fstat, not succeed")
 	}
 	msg := err.Error()
-	if !strings.Contains(msg, "leftover temporary file") {
-		t.Errorf("error %q does not name the leftover temporary sibling", msg)
+	// On the sibling's quoted NAME rather than on the prose around it: the
+	// name is what the hint exists to deliver and what the quoting has to
+	// cover, and an assertion on the wording breaks whenever the wording is
+	// corrected without the behaviour changing -- which is how this line was
+	// found.
+	if !strings.Contains(msg, strconv.Quote(sibling)) {
+		t.Errorf("error %q does not name the leftover temporary sibling %q", msg, sibling)
 	}
 	if strings.ContainsAny(msg, "\x1b\r\n") {
 		t.Errorf("error message contains raw control bytes from the attacker-named sibling, want them quoted: %q", msg)
@@ -833,8 +838,13 @@ func TestAcquireLockGiveUpQuotesAnAttackerControlledTempSibling(t *testing.T) {
 		t.Fatal("acquireLock should give up against a path that never stops being replaced")
 	}
 	msg := err.Error()
-	if !strings.Contains(msg, "leftover temporary file") {
-		t.Errorf("error %q does not name the leftover temporary sibling", msg)
+	// On the sibling's quoted NAME rather than on the prose around it: the
+	// name is what the hint exists to deliver and what the quoting has to
+	// cover, and an assertion on the wording breaks whenever the wording is
+	// corrected without the behaviour changing -- which is how this line was
+	// found.
+	if !strings.Contains(msg, strconv.Quote(sibling)) {
+		t.Errorf("error %q does not name the leftover temporary sibling %q", msg, sibling)
 	}
 	if strings.ContainsAny(msg, "\x1b\r\n") {
 		t.Errorf("error message contains raw control bytes from the attacker-named sibling, want them quoted: %q", msg)
