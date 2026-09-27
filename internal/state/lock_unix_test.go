@@ -849,11 +849,10 @@ func TestAcquireLockGiveUpQuotesAnAttackerControlledTempSibling(t *testing.T) {
 // recognises -- on every call, which routes this call through the
 // O_CREATE|O_EXCL-at-path branch rather than the ordinary
 // temp-file-and-link one. SUDO_UID/SUDO_GID are set to this process's own
-// real uid/gid, and geteuid is faked to 0 (see its own comment for why that
-// alone is enough: the real fchown still runs, chowning the file to its own
-// already-current owner, which succeeds without real root), so the
-// fallback's own chownToInvokingUser call is exercised for real rather than
-// skipped.
+// real uid/gid, and geteuid is faked to 0, so the fallback's chown runs and
+// succeeds without real root by asking for the ownership the file already
+// has. That makes this the SUCCESS shape of the branch; what it can and
+// cannot assert about the chown is spelled out at the assertion itself.
 func TestAcquireLockOnceFallsBackWhenLinkIsUnsupported(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "state.lock")
@@ -889,11 +888,27 @@ func TestAcquireLockOnceFallsBackWhenLinkIsUnsupported(t *testing.T) {
 	if serr := syscall.Stat(path, &st); serr != nil {
 		t.Fatal(serr)
 	}
-	// Still chowns: the fake geteuid + real SUDO_UID/SUDO_GID above must have
-	// driven a real fchown against the file the fallback actually created.
-	if int(st.Uid) != os.Geteuid() || int(st.Gid) != os.Getegid() {
-		t.Errorf("lock file owner = uid %d gid %d, want uid %d gid %d -- chownToInvokingUser did not run against the fallback-created file", st.Uid, st.Gid, os.Geteuid(), os.Getegid())
-	}
+	// Deliberately NOT asserted here: that the fallback's own chown ran.
+	// SUDO_UID/SUDO_GID above are this process's own ids, so the fchown is a
+	// no-op and the resulting ownership is identical whether
+	// chownToInvokingUser was called or skipped -- deleting that call from the
+	// fallback entirely reddens nothing here. An assertion that cannot fail is
+	// worse than no assertion, because it reads like a guarantee.
+	//
+	// Nor is it pinned anywhere else, and that is a property of the code
+	// rather than a gap in the tests: chownToInvokingUser has already run once
+	// in this same call, against the temporary file, with identical
+	// preconditions -- same euid, same SUDO_UID, same SUDO_GID -- and a
+	// failure there returns before the link is ever attempted. So any
+	// configuration that would make the fallback's chown fail has already made
+	// the earlier one fail, and the fallback's failure branch (with the
+	// os.Remove(path) that is this function's one exception to leaving the
+	// lock path alone) is unreachable by construction. It is kept as defence
+	// in depth against a future edit that reorders or removes the earlier
+	// call; an attempt to test it here observed only the earlier chown
+	// failing, which is the tautology this comment exists to stop someone
+	// rediscovering.
+	_ = st
 	// Still checks Nlink: an ordinary, single-link file is what the Nlink
 	// check is required to accept, and did -- acquireLockOnce returned
 	// success rather than refusing or retrying.
@@ -902,6 +917,53 @@ func TestAcquireLockOnceFallsBackWhenLinkIsUnsupported(t *testing.T) {
 	}
 	// Still runs the post-flock identity check: unlock succeeding (deferred
 	// above) with no error already proves this call reached and passed it.
+}
+
+// TestAcquireLockGiveUpNamesASiblingThatIsTheSecondLink pins the sibling hint
+// on the HARD-LINK give-up, which is a different branch from the churn
+// give-up the sibling test above covers.
+//
+// It exists because an earlier version of this code looked for a sibling only
+// on the churn branch, reasoning that this call's own temporary name is always
+// gone by the time a reopen observes a hard link -- true -- and generalising
+// from that to every sibling, which is false. The fixture below is the
+// counterexample: a publish killed between its own link(tmp, path) and its own
+// os.Remove(tmpPath) leaves the temporary name pointing at the very inode now
+// at path, so the sibling IS the second link. Nlink stays at 2 for good, every
+// attempt is spent, and removing that file by hand is precisely what clears
+// it -- so the message has to name it.
+func TestAcquireLockGiveUpNamesASiblingThatIsTheSecondLink(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "state.lock")
+	// The state an interrupted publish leaves: the temporary name and the
+	// lock path are two names for one inode.
+	sibling := path + ".tmp-0123456789abcdef"
+	if err := os.WriteFile(sibling, nil, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Link(sibling, path); err != nil {
+		t.Fatal(err)
+	}
+
+	original := lockAcquireTimeout
+	lockAcquireTimeout = 2 * time.Second
+	t.Cleanup(func() { lockAcquireTimeout = original })
+
+	_, err := acquireLock(path)
+	if err == nil {
+		t.Fatal("acquireLock should give up against a permanently hard-linked lock path, not acquire it")
+	}
+	msg := err.Error()
+	if !strings.Contains(msg, "hard link") {
+		t.Errorf("give-up message does not report the cause it actually found: %q", msg)
+	}
+	if !strings.Contains(msg, strconv.Quote(sibling)) {
+		t.Errorf("give-up message does not name the leftover sibling %q, which is the second link and whose removal is the remedy: %q", sibling, msg)
+	}
+	// Not "every attempt": nothing records what the earlier attempts saw.
+	if strings.Contains(msg, "every attempt") {
+		t.Errorf("give-up message claims something about every attempt when only the last one's error is carried: %q", msg)
+	}
 }
 
 // TestAcquireLockOnceDoesNotFallBackOnAnUnrelatedLinkError pins

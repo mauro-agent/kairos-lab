@@ -400,33 +400,47 @@ func acquireLock(path string) (unlock func(), err error) {
 		// static hard link gets its own message rather than the "kept being
 		// replaced or removed ... try again" one that fits the other three.
 		if attempt >= lockOpenAttempts-1 {
+			// See lockTempSibling's own comment: a leftover <path>.tmp-* is a
+			// real, demonstrated cause of this give-up, and it is a cause in
+			// BOTH of the shapes below -- which is why the lookup is done
+			// once, here, rather than inside the churn branch alone.
+			//
+			// For the churn shape it is an earlier publish's temporary name
+			// outliving its own removal, or cleanup's os.RemoveAll(ConfigDir)
+			// racing this one. For the hard-link shape it can be the second
+			// link itself: a publish killed between its link(tmp, path) and
+			// its own os.Remove(tmpPath) leaves that sibling pointing at this
+			// very inode, so Nlink stays at 2 for good and removing the
+			// sibling by hand is exactly what clears it. An earlier version
+			// of this code reasoned that THIS call's own temporary name is
+			// always gone by the time the reopen observes a hard link --
+			// which is true, cleanupTmp() removed it -- and then generalised
+			// from that to every sibling, which is not. The one it cannot be
+			// is this call's own; any other call's is fair game.
+			//
+			// %q, not %s: sib comes from a glob over ConfigDir, which this
+			// file's own comments already treat as attacker-writable, and
+			// this string reaches a terminal via cmd/kairos-lab/main.go's
+			// unfiltered error printing.
+			sib := lockTempSibling(path)
 			if errors.Is(lastErr, errLockHardLinkAmbiguous) {
 				// Nothing was replaced, nothing was removed, and no process
-				// is repeatedly recreating anything -- the one true fact is
-				// that every attempt still found more than one hard link, so
-				// say that and let lastErr's own message (built where the
-				// Nlink > 1 check itself detects this) carry the remedy,
-				// rather than layering the churn narrative below on top of a
-				// cause it does not describe.
-				return nil, fmt.Errorf("gave up after %d attempt(s) trying to get a stable lock on %s: the restart bound (lockOpenAttempts) was spent, and every attempt still found more than one hard link on it -- %w", attempt+1, path, lastErr)
+				// is repeatedly recreating anything, so the churn narrative
+				// below would describe a cause this is not. What can be
+				// claimed is what lastErr is: the LAST attempt found more
+				// than one hard link. Not every attempt -- lastErr is the
+				// last attempt's error and nothing here records the others,
+				// so a run whose first attempt failed its reopen with ENOENT
+				// and whose second found the link would have been described
+				// wrongly by a sentence about all of them.
+				giveUp := fmt.Errorf("gave up after %d attempt(s) trying to get a stable lock on %s: the restart bound (lockOpenAttempts) was spent, and the last attempt still found more than one hard link on it -- %w", attempt+1, path, lastErr)
+				if sib != "" {
+					giveUp = fmt.Errorf("%w -- there is also a leftover temporary file %q next to it, from a publish that never removed its own temporary name; that file may be the second link itself, in which case removing it by hand is what clears this", giveUp, sib)
+				}
+				return nil, giveUp
 			}
 			giveUp := fmt.Errorf("gave up after %d attempt(s) trying to get a stable lock on %s: the restart bound (lockOpenAttempts) was spent -- the file kept being replaced or removed out from under this process; if this persists, another process may be repeatedly recreating it; try again (%w)", attempt+1, path, lastErr)
-			// See lockTempSibling's own comment: a leftover <path>.tmp-* is a
-			// real, demonstrated cause of exactly this give-up (an earlier
-			// publish's temporary name outliving its own removal, or
-			// cleanup's os.RemoveAll(ConfigDir) racing this one), so name it
-			// rather than leave the user with only "try again" for advice
-			// that will not help. Not checked in the hard-link branch above:
-			// that call's own cleanupTmp() already removed its temporary
-			// name before the reopen that observed the hard link, so there
-			// is structurally no sibling of THIS call's left to find there
-			// -- looking anyway would either always come up empty or, worse,
-			// name an unrelated leftover and imply it caused a problem it
-			// did not. %q, not %s: sib comes from a glob over ConfigDir,
-			// which this file's own comments already treat as
-			// attacker-writable, and this string reaches a terminal via
-			// cmd/kairos-lab/main.go's unfiltered error printing.
-			if sib := lockTempSibling(path); sib != "" {
+			if sib != "" {
 				giveUp = fmt.Errorf("%w -- found %q next to it, a leftover temporary file from an unfinished publish; removing that by hand is likely what clears this", giveUp, sib)
 			}
 			return nil, giveUp
@@ -745,7 +759,7 @@ func acquireLockOnce(path string, deadline time.Time) (unlock func(), retry bool
 			// "retrying" -- whether this attempt actually gets to retry is
 			// acquireLock's call, made after the restart budget is checked,
 			// not a fact this line is in a position to promise.
-			return nil, true, fmt.Errorf("lock file %s has %d hard links, want exactly 1 (%w): could be another kairos-lab process still mid-publish (between its own link and its own removal of its temporary name), which clears on its own within a restart or two, or could be a real hard link left at this path, which does not -- if this keeps recurring, identify and remove the second link (find %s -samefile %s, or ls -li %s)", path, st.Nlink, errLockHardLinkAmbiguous, filepath.Dir(path), path, path)
+			return nil, true, fmt.Errorf("lock file %s has %d hard links, want exactly 1 (%w): could be another kairos-lab process still mid-publish (between its own link and its own removal of its temporary name), which clears on its own within a restart or two, or could be a real hard link left at this path, which does not -- if this keeps recurring, identify and remove the second link (find %s -samefile %s, or ls -li %s and look for another name with this one's inode number)", path, st.Nlink, errLockHardLinkAmbiguous, filepath.Dir(path), path, filepath.Dir(path))
 		}
 		refusal := fmt.Errorf("lock file %s has %d hard links, want exactly 1: refusing to lock a file that may alias another path", path, st.Nlink)
 		// %q, not %s: sib comes from a glob over ConfigDir, which this
