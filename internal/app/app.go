@@ -761,7 +761,7 @@ func runStart(args []string, stdin io.Reader, stdout, stderr io.Writer, store *s
 		BridgeIface:   bridgeInterfaceForMode(*network, networkIface),
 		LinuxTapName:  st.Network.TapName,
 		MACAddress:    macAddress,
-		MacOSBiosPath: biosPath,
+		BiosPath:      biosPath,
 	})
 	if err != nil {
 		return err

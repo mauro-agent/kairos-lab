@@ -2913,7 +2913,7 @@ func TestUserModeBlockNamesThePortsQEMUIsToldToForward(t *testing.T) {
 		NetworkMode:   "user",
 		DisplayMode:   "serial",
 		MACAddress:    vm.MACForDisk("kairos-disk0"),
-		MacOSBiosPath: "/nope/edk2-aarch64-code.fd",
+		BiosPath:      "/nope/edk2-aarch64-code.fd",
 	})
 	if err != nil {
 		t.Fatalf("BuildQEMUCommand: %v", err)

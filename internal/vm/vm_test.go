@@ -10,7 +10,7 @@ func TestBuildLinuxCommandIncludesTapInBridgeMode(t *testing.T) {
 	if runtime.GOOS != "linux" {
 		t.Skip("linux-only test")
 	}
-	_, args, err := buildLinux(StartConfig{
+	_, args, err := buildLinuxFor("amd64", StartConfig{
 		ISOPath:       "/tmp/kairos.iso",
 		DiskPath:      "/tmp/kairos.qcow2",
 		QGASocketPath: "/tmp/kairos.sock",
@@ -32,7 +32,7 @@ func TestBuildLinuxCommandFailsWithoutTapInBridgeMode(t *testing.T) {
 	if runtime.GOOS != "linux" {
 		t.Skip("linux-only test")
 	}
-	_, _, err := buildLinux(StartConfig{NetworkMode: "bridged"})
+	_, _, err := buildLinuxFor("amd64", StartConfig{NetworkMode: "bridged"})
 	if err == nil {
 		t.Fatalf("expected error")
 	}
@@ -42,7 +42,7 @@ func TestBuildLinuxCommandSerialDisplayUsesNographic(t *testing.T) {
 	if runtime.GOOS != "linux" {
 		t.Skip("linux-only test")
 	}
-	_, args, err := buildLinux(StartConfig{
+	_, args, err := buildLinuxFor("amd64", StartConfig{
 		ISOPath:       "/tmp/kairos.iso",
 		DiskPath:      "/tmp/kairos.qcow2",
 		QGASocketPath: "/tmp/kairos.sock",
@@ -64,7 +64,7 @@ func TestBuildLinuxCommandWindowDisplayOmitsNographic(t *testing.T) {
 	if runtime.GOOS != "linux" {
 		t.Skip("linux-only test")
 	}
-	_, args, err := buildLinux(StartConfig{
+	_, args, err := buildLinuxFor("amd64", StartConfig{
 		ISOPath:       "/tmp/kairos.iso",
 		DiskPath:      "/tmp/kairos.qcow2",
 		QGASocketPath: "/tmp/kairos.sock",
@@ -83,8 +83,34 @@ func TestBuildLinuxCommandWindowDisplayOmitsNographic(t *testing.T) {
 	if !strings.Contains(joined, "-display default") {
 		t.Fatalf("expected explicit display backend for window display mode: %s", joined)
 	}
-	if runtime.GOARCH == "arm64" && !strings.Contains(joined, "virtio-gpu-pci") {
-		t.Fatalf("expected virtio-gpu-pci for arm64 window display mode: %s", joined)
+}
+
+// The arm64 window-display device block (virtio-gpu-pci, qemu-xhci, usb-kbd,
+// usb-tablet) used to be guarded only by a runtime.GOARCH check in the test
+// above, which keyed off the HOST arch rather than the goarch argument -- so
+// it never ran on either CI leg (ubuntu-latest is amd64, macos-latest is
+// darwin/arm64 but never calls buildLinuxFor). This is the real gate.
+func TestBuildLinuxARM64WindowDisplayAddsTheGPUAndInputDevices(t *testing.T) {
+	_, args, err := buildLinuxFor("arm64", StartConfig{
+		DiskPath:      "/tmp/kairos.qcow2",
+		QGASocketPath: "/tmp/kairos.sock",
+		CPUs:          2,
+		MemoryMB:      4096,
+		NetworkMode:   "user",
+		DisplayMode:   "window",
+		BiosPath:      "/usr/share/AAVMF/QEMU_EFI.fd",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	joined := strings.Join(args, " ")
+	for _, want := range []string{"virtio-gpu-pci", "qemu-xhci", "usb-kbd", "usb-tablet"} {
+		if !strings.Contains(joined, want) {
+			t.Errorf("expected %s for arm64 window display mode: %s", want, joined)
+		}
+	}
+	if strings.Contains(joined, "-nographic") {
+		t.Errorf("did not expect -nographic for window display mode: %s", joined)
 	}
 }
 
@@ -116,7 +142,7 @@ func TestBuildLinuxNetdevPerNetworkMode(t *testing.T) {
 			// Subtests, not a bare loop: argAfter and nicDeviceArg abort with
 			// t.Fatalf, which in a bare loop would stop the later rows from
 			// running at all and hide whatever they would have caught.
-			_, args, err := buildLinux(StartConfig{
+			_, args, err := buildLinuxFor("amd64", StartConfig{
 				ISOPath:       "/tmp/kairos.iso",
 				DiskPath:      "/tmp/kairos.qcow2",
 				QGASocketPath: "/tmp/kairos.sock",
@@ -149,7 +175,7 @@ func TestBuildLinuxSharedModeRequiresTapAndNamesItself(t *testing.T) {
 	if runtime.GOOS != "linux" {
 		t.Skip("linux-only test")
 	}
-	_, _, err := buildLinux(StartConfig{NetworkMode: "shared"})
+	_, _, err := buildLinuxFor("amd64", StartConfig{NetworkMode: "shared"})
 	if err == nil {
 		t.Fatal("expected an error for shared mode with no tap name")
 	}
@@ -169,7 +195,7 @@ func TestBuildLinuxEmptyMACOmitsMACEntirely(t *testing.T) {
 	}
 	// A caller that never sets MACAddress must degrade to QEMU's own default
 	// address, not emit a dangling "mac=" that QEMU refuses to parse.
-	_, args, err := buildLinux(StartConfig{
+	_, args, err := buildLinuxFor("amd64", StartConfig{
 		DiskPath:      "/tmp/kairos.qcow2",
 		QGASocketPath: "/tmp/kairos.sock",
 		CPUs:          2,
@@ -197,7 +223,7 @@ func TestBuildLinuxRejectsMalformedMAC(t *testing.T) {
 	// From M5 this value comes out of the user's state.json, so a corrupted or
 	// hand-edited entry must name itself here rather than reach QEMU.
 	const bad = "52:54:00:12:34:56,romfile=/tmp/evil.rom"
-	_, args, err := buildLinux(StartConfig{
+	_, args, err := buildLinuxFor("amd64", StartConfig{
 		DiskPath:      "/tmp/kairos.qcow2",
 		QGASocketPath: "/tmp/kairos.sock",
 		CPUs:          2,
@@ -221,7 +247,7 @@ func TestBuildLinuxPadsStrippedMAC(t *testing.T) {
 	// A MAC read back off macOS is zero-stripped. QEMU's parser wants the
 	// padded spelling, so the command line must carry the padded form even
 	// when the stored value is stripped.
-	_, args, err := buildLinux(StartConfig{
+	_, args, err := buildLinuxFor("amd64", StartConfig{
 		DiskPath:      "/tmp/kairos.qcow2",
 		QGASocketPath: "/tmp/kairos.sock",
 		CPUs:          2,
@@ -235,6 +261,77 @@ func TestBuildLinuxPadsStrippedMAC(t *testing.T) {
 	const want = "virtio-net-pci,netdev=net0,mac=52:54:00:0a:04:0f"
 	if got := nicDeviceArg(t, args); got != want {
 		t.Errorf("NIC device = %q, want %q", got, want)
+	}
+}
+
+// qemu-system-aarch64 has no default machine, so the arm64 command line the
+// tool used to build died with "No machine specified" before it ever read the
+// ISO (kairos-io/kairos#4858). No runtime.GOOS/GOARCH skip: buildLinuxFor is
+// pure, so this runs on every host, including the amd64 CI leg.
+func TestBuildLinuxARM64SuppliesMachineAcceleratorAndFirmware(t *testing.T) {
+	const firmware = "/usr/share/AAVMF/QEMU_EFI.fd"
+	_, args, err := buildLinuxFor("arm64", StartConfig{
+		ISOPath:     "/tmp/kairos.iso",
+		DiskPath:    "/tmp/kairos.qcow2",
+		CPUs:        2,
+		MemoryMB:    4096,
+		NetworkMode: "user",
+		BiosPath:    firmware,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	joined := strings.Join(args, " ")
+	for _, want := range []string{
+		"-machine virt,gic-version=max",
+		"-cpu host",
+		"-enable-kvm",
+		"-bios " + firmware,
+	} {
+		if !strings.Contains(joined, want) {
+			t.Errorf("arm64 args are missing %q: %s", want, joined)
+		}
+	}
+}
+
+// A machine type belongs to arm64 only: adding one on amd64 would override
+// QEMU's default q35/pc selection.
+func TestBuildLinuxAMD64KeepsTheDefaultMachine(t *testing.T) {
+	binary, args, err := buildLinuxFor("amd64", StartConfig{
+		DiskPath:    "/tmp/kairos.qcow2",
+		CPUs:        2,
+		MemoryMB:    4096,
+		NetworkMode: "user",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if binary != "qemu-system-x86_64" {
+		t.Errorf("got binary %q, want qemu-system-x86_64", binary)
+	}
+	joined := strings.Join(args, " ")
+	if strings.Contains(joined, "-machine") || strings.Contains(joined, "-bios") {
+		t.Errorf("amd64 should not carry a machine or firmware: %s", joined)
+	}
+	if !strings.Contains(joined, "-enable-kvm -cpu host") {
+		t.Errorf("amd64 lost its accelerator: %s", joined)
+	}
+}
+
+// Without firmware the guest boots to a blank screen, so refuse to build the
+// command at all -- the same refusal buildMacOS already makes.
+func TestBuildLinuxARM64RejectsAnEmptyFirmwarePath(t *testing.T) {
+	binary, args, err := buildLinuxFor("arm64", StartConfig{
+		DiskPath:    "/tmp/kairos.qcow2",
+		CPUs:        2,
+		MemoryMB:    4096,
+		NetworkMode: "user",
+	})
+	if err == nil {
+		t.Fatalf("expected an error, got %s %v", binary, args)
+	}
+	if !strings.Contains(err.Error(), "firmware") {
+		t.Errorf("error %q should name the missing firmware", err)
 	}
 }
 
