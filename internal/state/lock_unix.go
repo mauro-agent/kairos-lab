@@ -33,11 +33,21 @@ import (
 // per OPEN FILE DESCRIPTION, not per process or per path -- so a nested call
 // would try to lock the same file a second time from the same process with a
 // second descriptor, which blocks against the first exactly as it would
-// against a different process, and neither ever unlocks because both are
-// waiting on the callback that is waiting on the lock. This is not
+// against a different process. That is not a deadlock, though: the bounded
+// retry loop below (see lockAcquireTimeout) means the nested call cannot
+// succeed -- it burns the whole lockAcquireTimeout and then fails with a
+// timeout error naming the lock path -- which makes the outer call fail too,
+// since mutate's own error return propagates straight out of Update.
+// Demonstrated with lockAcquireTimeout shortened to 300ms: an inner Update
+// nested inside an outer one's mutate callback returned the timeout error,
+// the outer Update then returned that same error, and a later, unnested
+// Update acquired the lock in 6ms -- nothing was left wedged. This is not
 // theoretical for this codebase specifically: milestone 3 gives runStart's
-// IP-poller goroutine a reason to write state while the main path is
-// mid-cycle, which is exactly the shape that deadlocks here.
+// IP-poller a reason to write state from a goroutine that runs concurrently
+// with the main path holding this lock mid-cycle -- a separate goroutine
+// calling Update, not a nested call from inside mutate. Two goroutines
+// contending for this lock do not deadlock either; they serialise behind
+// whichever one gets it first, or the loser times out under contention.
 //
 // On a mutate error, the lock is released and the error is returned as-is,
 // without saving: whatever mutate half-built on the in-memory State is
@@ -111,6 +121,17 @@ const lockRetryInterval = 100 * time.Millisecond
 // production ever assigns it.
 var lockAcquireTimeout = 5 * time.Second
 
+// lockOpenAttempts bounds the retry across acquireLock's create/reopen race,
+// documented at the loop itself: a concurrent unlink of the lock path between
+// the O_EXCL attempt failing and the reopen succeeding fails the reopen with
+// ENOENT, and this is what lets the loop go back for one more O_CREATE|O_EXCL
+// attempt instead of failing the whole Update for a path that is trivially
+// creatable again an instant later. 2, not unbounded: one retry is enough for
+// the race this exists to cover (a single concurrent unlinker), and anything
+// that keeps failing past it is a path that will not stop disappearing,
+// which is a real error to surface rather than a reason to keep spinning.
+const lockOpenAttempts = 2
+
 // acquireLock opens (creating if needed) the file at path, locks it
 // exclusively with flock, and returns a function that unlocks and closes it.
 // The caller is expected to defer the returned function immediately.
@@ -170,12 +191,19 @@ func acquireLock(path string) (unlock func(), err error) {
 	// is what a non-owning user gets, and 0644's other class is r--, while
 	// this open is O_RDWR; measured directly, O_RDWR on a real root-owned
 	// 0644 file this process did not own returned "permission denied", and
-	// O_RDONLY on the same file succeeded. What 0644 actually buys, correctly
-	// stated: a *root* process (or one with the same uid the file already
-	// has) can still open it read-write regardless of mode, and a mode
-	// tighter than 0644 would gain nothing extra for the one case that
-	// matters, since the chown is what changes the owner away from root in
-	// the first place.
+	// O_RDONLY on the same file succeeded. A second version of this same
+	// comment then claimed a process with the same uid the file already has
+	// "can still open it read-write regardless of mode", which is also
+	// false: measured as the owning uid against its own file, O_RDWR
+	// succeeded at 0644 but 0444, 0400 and 0000 all failed with permission
+	// denied -- the owner-class bits bind the owner exactly as they read.
+	// Root is the only thing exempt from a file's mode altogether, and that
+	// is what a root-privileged run's own opens rely on regardless of what
+	// this mode is set to. What 0644 actually buys the one case that
+	// matters, correctly stated: nothing a tighter mode would not also buy
+	// -- the chown below is what changes the owner away from root, and the
+	// owning uid it hands the file to gets read-write from 0644's owner
+	// class either way, the same as it would from 0600's.
 	//
 	// The open itself is two-phase, not one os.OpenFile call, and that is the
 	// fix for a hard-link attack fchown lands on: `ln /etc/sudoers
@@ -200,17 +228,44 @@ func acquireLock(path string) (unlock func(), err error) {
 	// the same fix: even on the created branch, this refuses to lock (and
 	// therefore never chowns) a file that already has more than one link,
 	// which a file this call only just created cannot legitimately have.
+	//
+	// The reopen carries no O_CREATE -- it must not create a file the O_EXCL
+	// attempt just proved already exists, or it would stop being the "only
+	// case chown runs in is the one that created the file" guarantee above
+	// depends on -- but that leaves a real window open: this process's own
+	// `cleanup` (or another one running concurrently) can unlink path between
+	// the two opens, and a lock path this steady-state, no-contention run IS
+	// going to take -- the O_EXCL attempt failing EEXIST because a previous
+	// run's lock file is still there is the ordinary case, not the rare one
+	// -- would then fail the reopen with ENOENT and fail this Update
+	// entirely, for a path that is, an instant later, perfectly creatable
+	// again. lockOpenAttempts bounds a retry back to the top of this loop for
+	// exactly that one race: ENOENT on the reopen loops back to another
+	// O_CREATE|O_EXCL attempt, which this time succeeds and creates the file
+	// itself (created flips true, and the chown below now correctly applies).
+	// Bounded rather than unbounded, so a path that somehow never stops
+	// disappearing fails loudly instead of spinning forever -- not a scenario
+	// this codebase can reach, but not one this loop should trust either.
 	created := true
-	f, err := os.OpenFile(path, os.O_CREATE|os.O_EXCL|os.O_RDWR|syscall.O_NOFOLLOW, 0o644)
-	if err != nil {
+	var f *os.File
+	for attempt := 0; ; attempt++ {
+		f, err = os.OpenFile(path, os.O_CREATE|os.O_EXCL|os.O_RDWR|syscall.O_NOFOLLOW, 0o644)
+		if err == nil {
+			created = true
+			break
+		}
 		if !errors.Is(err, os.ErrExist) {
 			return nil, fmt.Errorf("open lock file %s: %w", path, err)
 		}
 		created = false
 		f, err = os.OpenFile(path, os.O_RDWR|syscall.O_NOFOLLOW, 0o644)
-		if err != nil {
-			return nil, fmt.Errorf("open lock file %s: %w", path, err)
+		if err == nil {
+			break
 		}
+		if errors.Is(err, os.ErrNotExist) && attempt < lockOpenAttempts-1 {
+			continue
+		}
+		return nil, fmt.Errorf("open lock file %s: %w", path, err)
 	}
 	closed := false
 	cleanup := func() {
@@ -245,7 +300,22 @@ func acquireLock(path string) (unlock func(), err error) {
 	// (chown never runs there at all); on the created branch it is a second,
 	// independent one, in case anything ever links to the file in the window
 	// between this open and this stat.
-	if st, ok := fi.Sys().(*syscall.Stat_t); ok && st.Nlink != 1 {
+	//
+	// The type assertion failing is treated as a refusal too, not as "the
+	// check does not apply here": failing open is what a defence is supposed
+	// to do when it cannot tell whether the thing it defends against is
+	// present, and the alternative -- ok == false silently skipping the only
+	// guard the reopen branch has -- is a fail-OPEN shape that would lock a
+	// hard-linked file the moment this assertion ever stopped holding. It is
+	// unreachable on every GOOS this //go:build unix file compiles for today
+	// (fi.Sys() is always *syscall.Stat_t on linux and darwin alike), which is
+	// exactly why it must fail closed rather than silently trust that fact
+	// forever.
+	st, ok := fi.Sys().(*syscall.Stat_t)
+	if !ok {
+		return nil, fmt.Errorf("lock file %s: could not determine its hard link count (fi.Sys() did not return *syscall.Stat_t): refusing to lock it", path)
+	}
+	if st.Nlink != 1 {
 		return nil, fmt.Errorf("lock file %s has %d hard links, want exactly 1: refusing to lock a file that may alias another path", path, st.Nlink)
 	}
 
@@ -262,15 +332,37 @@ func acquireLock(path string) (unlock func(), err error) {
 	// introduced -- nothing more. When they are absent (running as real root,
 	// not via sudo) there is no invoking user to hand the file back to, so
 	// nothing here is attempted or required.
+	//
+	// Both failure branches below unlink path before returning: created is
+	// true here, so this call is the one that just put a root-owned file at
+	// path, and leaving it there hands the very next unprivileged run (this
+	// tool never suggests running as root except for this one euid-0 path) a
+	// bare "permission denied" on that file with no remedy at all -- exactly
+	// the lockout the chown exists to prevent, self-inflicted by the attempt
+	// to prevent it. Unlinking it here is what closes the loop the previous
+	// version of this error asked the user to close by hand ("remove the
+	// file and try again"); this does that removal itself instead of asking.
 	if created && os.Geteuid() == 0 {
 		uidStr, gidStr := os.Getenv("SUDO_UID"), os.Getenv("SUDO_GID")
 		if uidStr != "" && gidStr != "" {
 			uid, uerr := strconv.Atoi(uidStr)
 			gid, gerr := strconv.Atoi(gidStr)
-			if uerr == nil && gerr == nil {
-				if cerr := f.Chown(uid, gid); cerr != nil {
-					return nil, fmt.Errorf("lock file %s was created owned by root and could not be chowned to the invoking user (uid %d, gid %d): %w -- remove the file and try again", path, uid, gid, cerr)
-				}
+			// Absent SUDO_UID/SUDO_GID is fine (real root, not via sudo --
+			// nothing to hand the file back to, above). Present but
+			// unparsable is a different case entirely: sudo did set them, so
+			// there IS an invoking user this file should belong to, and
+			// silently skipping the chown here used to take the lock anyway
+			// and leave exactly the root-owned file the chown exists to
+			// prevent -- with nothing in the error path ever telling anyone
+			// that happened, because there was no error path; this branch did
+			// not return one.
+			if uerr != nil || gerr != nil {
+				_ = os.Remove(path)
+				return nil, fmt.Errorf("lock file %s was created owned by root, but SUDO_UID=%q / SUDO_GID=%q could not be parsed as integers (%v / %v): the file has been removed rather than left root-owned -- try again", path, uidStr, gidStr, uerr, gerr)
+			}
+			if cerr := f.Chown(uid, gid); cerr != nil {
+				_ = os.Remove(path)
+				return nil, fmt.Errorf("lock file %s was created owned by root and could not be chowned to the invoking user (uid %d, gid %d): %w -- the file has been removed rather than left root-owned; try again", path, uid, gid, cerr)
 			}
 		}
 	}
@@ -289,7 +381,7 @@ func acquireLock(path string) (unlock func(), err error) {
 			return nil, fmt.Errorf("lock file %s: %w", path, flockErr)
 		}
 		if time.Now().After(deadline) {
-			return nil, fmt.Errorf("timed out after %s waiting for the lock on %s: another kairos-lab process may be holding it; if none is running, removing the file clears a wedged lock", lockAcquireTimeout, path)
+			return nil, fmt.Errorf("timed out after %s waiting for the lock on %s: another kairos-lab process is holding it -- wait for it to finish and try again", lockAcquireTimeout, path)
 		}
 		time.Sleep(lockRetryInterval)
 	}

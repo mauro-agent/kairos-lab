@@ -643,6 +643,131 @@ func TestLoadMigratesALegacyVMWithNeitherDiskNameNorDiskPath(t *testing.T) {
 	}
 }
 
+// TestValidVMName pins the rule legacyVMName runs every candidate through:
+// reject empty, ".", "..", any path separator, and any non-printable rune --
+// the same rule validDiskName (internal/app/app.go) applies to a disk name
+// typed at the prompt, duplicated here rather than shared (see validVMName's
+// own comment for why).
+func TestValidVMName(t *testing.T) {
+	valid := []string{"kairos-disk0", "vm0", "a", "disk.qcow2", "my_vm-1"}
+	for _, name := range valid {
+		if err := validVMName(name); err != nil {
+			t.Errorf("validVMName(%q) = %v, want nil", name, err)
+		}
+	}
+	invalid := []string{
+		"",
+		".",
+		"..",
+		"/",
+		"a/b",
+		`a\b`,
+		"../../etc/passwd",
+		"\x1b[2K\rowned",
+	}
+	for _, name := range invalid {
+		if err := validVMName(name); err == nil {
+			t.Errorf("validVMName(%q) = nil, want an error", name)
+		}
+	}
+}
+
+// TestLegacyVMNameRejectsAnUnsafeDerivedName pins the fix for legacyVMName
+// synthesising a name the repo's own validator rejects. Every case here was
+// measured against the pre-fix function: filepath.Base plus a trimmed
+// .qcow2 suffix, with no validation of the result at all, before
+// legacyVMName ran every candidate through validVMName and fell back to
+// syntheticVMName when a candidate failed.
+func TestLegacyVMNameRejectsAnUnsafeDerivedName(t *testing.T) {
+	cases := []struct {
+		name     string
+		diskPath string
+		want     string
+	}{
+		// filepath.Base keeps only the final path component, so this one
+		// happens to come out harmless -- included to show the fix does not
+		// change a case that was already safe.
+		{"escapes a directory but the basename is plain", "../../etc/passwd", "passwd"},
+		{"root", "/", "vm0"},
+		{"dot-dot", "..", "vm0"},
+		{"control characters", "/tmp/\x1b[2K\rowned.qcow2", "vm0"},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			st := &State{}
+			got := legacyVMName(st, &VM{DiskPath: c.diskPath})
+			if got != c.want {
+				t.Errorf("legacyVMName with disk_path %q = %q, want %q", c.diskPath, got, c.want)
+			}
+			if err := validVMName(got); err != nil {
+				t.Errorf("legacyVMName with disk_path %q returned %q, which validVMName itself rejects: %v", c.diskPath, got, err)
+			}
+		})
+	}
+}
+
+// TestLegacyVMNameFallsBackWhenDiskNameItselfIsUnsafe pins that an unsafe
+// disk_name -- not just an unsafe disk_path -- is also rejected rather than
+// used as-is: a hand-edited legacy file can set disk_name directly.
+func TestLegacyVMNameFallsBackWhenDiskNameItselfIsUnsafe(t *testing.T) {
+	st := &State{}
+	got := legacyVMName(st, &VM{DiskName: "..", DiskPath: "/home/user/disk0.qcow2"})
+	if got != "disk0" {
+		t.Errorf("legacyVMName with an unsafe disk_name = %q, want the disk_path-derived %q", got, "disk0")
+	}
+}
+
+// TestSyntheticVMNameAvoidsCollidingWithADiskOrAVM pins the fix for
+// VM.Name's former claim that a migrated record's name "is already unique
+// among disks": the fixed "vm0" fallback used to be returned unconditionally,
+// which collides head-on with a real disk already named vm0. syntheticVMName
+// must instead pick the first name in vm0, vm1, ... that is free on both
+// st.Disks and st.VMs.
+func TestSyntheticVMNameAvoidsCollidingWithADiskOrAVM(t *testing.T) {
+	st := &State{
+		Disks: []Disk{{Name: "vm0"}, {Name: "vm2"}},
+		VMs:   []VM{{Name: "vm1"}},
+	}
+	got := syntheticVMName(st)
+	if got != "vm3" {
+		t.Errorf("syntheticVMName = %q, want %q (vm0..vm2 all taken)", got, "vm3")
+	}
+}
+
+// TestLoadMigratesALegacyVMWithADiskPathThatCollidesWithAnExistingDisk pins
+// the same fix end to end through Load: a legacy record with no disk_name
+// and a disk_path of ".." must not migrate to a Name that collides with a
+// disk already recorded under the synthetic fallback's own first choice.
+func TestLoadMigratesALegacyVMWithADiskPathThatCollidesWithAnExistingDisk(t *testing.T) {
+	t.Setenv("KAIROS_LAB_CONFIG_DIR", t.TempDir())
+	t.Setenv("KAIROS_LAB_CACHE_DIR", t.TempDir())
+	store, err := DefaultStore()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(store.ConfigDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	legacy := `{"version":1,"disks":[{"name":"vm0","path":"/whatever/vm0.qcow2"}],"vm":{"pid":4321,"disk_path":".."}}`
+	if err := os.WriteFile(store.StatePath, []byte(legacy), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	st, err := store.Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(st.VMs) != 1 {
+		t.Fatalf("VMs = %+v, want exactly one entry", st.VMs)
+	}
+	if st.VMs[0].Name == "vm0" {
+		t.Errorf("migrated VM Name = %q, collides with the disk already named vm0", st.VMs[0].Name)
+	}
+	if st.VMs[0].Name != "vm1" {
+		t.Errorf("migrated VM Name = %q, want %q (vm0 taken by the disk)", st.VMs[0].Name, "vm1")
+	}
+}
+
 // TestLoadSetupOnlyLegacyFileDropsTheDeadVMKey covers the file shape every
 // setup-only run before this milestone actually wrote: the old VM field had
 // no omitempty, so state.json always carried a "vm" key even when no VM had
@@ -757,10 +882,9 @@ func TestLoadRefusesANewerSchemaVersion(t *testing.T) {
 // TestLoadRefusesTooManyVMs pins the cap on len(st.VMs): the slot domain is
 // 0..MaxSlot, so a file with more VMs than that has more entries than this
 // build can ever address, and is corrupt or hand-edited rather than merely
-// large. vm.RunningVMs does one kill(pid, 0) syscall per entry with no bound
-// of its own, so without this refusal, Load itself is the only thing standing
-// between an inflated file and an unbounded number of syscalls per status
-// check.
+// large. The refusal is deliberate even though it costs every later command
+// that calls Load -- status, start, reset and cleanup alike -- and the file
+// the error names has to be corrected by hand; there is no in-band recovery.
 func TestLoadRefusesTooManyVMs(t *testing.T) {
 	t.Setenv("KAIROS_LAB_CONFIG_DIR", t.TempDir())
 	t.Setenv("KAIROS_LAB_CACHE_DIR", t.TempDir())

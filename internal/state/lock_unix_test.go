@@ -121,31 +121,84 @@ func TestUpdateRefusesAFIFOAtTheLockPath(t *testing.T) {
 // acquireLock's open call: a symlink planted at the lock path must be
 // refused, not followed and locked (or worse, created) at whatever it points
 // to.
+//
+// The load-bearing case is the symlink pointing at an EXISTING regular file,
+// not a dangling one. A dangling target used to be all this test planted,
+// and the two-phase open defused it without O_NOFOLLOW's help: the first
+// open carries O_EXCL, which fails EEXIST on a symlink all by itself
+// (dangling or not), and the reopen has no O_CREATE, which fails ENOENT on a
+// dangling target all by itself -- so both halves of the open pass for
+// reasons that have nothing to do with O_NOFOLLOW. Demonstrated: with
+// syscall.O_NOFOLLOW removed from both opens in acquireLock, the dangling
+// case still passed. Pointing the symlink at a file that already exists
+// removes that confound: O_EXCL still fails EEXIST on the symlink name
+// itself, but the reopen would then FOLLOW the link to a real, existing
+// file and succeed, and Update would go on to lock and use it -- unless
+// O_NOFOLLOW is what stops the reopen from following it in the first place.
 func TestUpdateRefusesASymlinkAtTheLockPath(t *testing.T) {
-	t.Setenv("KAIROS_LAB_CONFIG_DIR", t.TempDir())
-	t.Setenv("KAIROS_LAB_CACHE_DIR", t.TempDir())
-	store, err := DefaultStore()
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := os.MkdirAll(store.ConfigDir, 0o755); err != nil {
-		t.Fatal(err)
-	}
-	// The symlink's target directory is its own t.TempDir() and not
-	// store.ConfigDir, so the assertion below -- that nothing was created at
-	// the target -- cannot be confused by directories Update itself is
-	// entitled to create (ConfigDir, via MkdirAll).
-	target := filepath.Join(t.TempDir(), "attacker-target")
-	if err := os.Symlink(target, store.LockPath); err != nil {
-		t.Fatal(err)
-	}
+	t.Run("target exists", func(t *testing.T) {
+		t.Setenv("KAIROS_LAB_CONFIG_DIR", t.TempDir())
+		t.Setenv("KAIROS_LAB_CACHE_DIR", t.TempDir())
+		store, err := DefaultStore()
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := os.MkdirAll(store.ConfigDir, 0o755); err != nil {
+			t.Fatal(err)
+		}
+		// The symlink's target directory is its own t.TempDir() and not
+		// store.ConfigDir, so the assertion below -- that the target's contents
+		// are untouched -- cannot be confused by anything Update itself is
+		// entitled to create (ConfigDir, via MkdirAll).
+		target := filepath.Join(t.TempDir(), "attacker-target")
+		if err := os.WriteFile(target, []byte("attacker file\n"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Symlink(target, store.LockPath); err != nil {
+			t.Fatal(err)
+		}
 
-	if _, err := store.Update(func(*State) error { return nil }); err == nil {
-		t.Fatal("Update against a symlinked lock path should fail, not follow the link")
-	}
-	if _, err := os.Lstat(target); !os.IsNotExist(err) {
-		t.Errorf("the symlink target should not exist, lstat returned: %v", err)
-	}
+		if _, err := store.Update(func(*State) error { return nil }); err == nil {
+			t.Fatal("Update against a symlinked lock path should fail, not follow the link and lock its target")
+		} else if !strings.Contains(err.Error(), "symbolic link") {
+			t.Errorf("error %q does not name the symlink refusal O_NOFOLLOW produces (ELOOP, \"too many levels of symbolic links\")", err)
+		}
+		body, err := os.ReadFile(target)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if string(body) != "attacker file\n" {
+			t.Errorf("the symlink target's contents changed: %q", body)
+		}
+	})
+
+	// Kept alongside the load-bearing case above: a dangling target is a
+	// realistic shape too (a symlink whose target was removed, or one aimed at
+	// a path that was never created), and it should still be refused even
+	// though, as the doc comment above explains, this particular case does not
+	// by itself pin O_NOFOLLOW.
+	t.Run("target does not exist", func(t *testing.T) {
+		t.Setenv("KAIROS_LAB_CONFIG_DIR", t.TempDir())
+		t.Setenv("KAIROS_LAB_CACHE_DIR", t.TempDir())
+		store, err := DefaultStore()
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := os.MkdirAll(store.ConfigDir, 0o755); err != nil {
+			t.Fatal(err)
+		}
+		target := filepath.Join(t.TempDir(), "attacker-target")
+		if err := os.Symlink(target, store.LockPath); err != nil {
+			t.Fatal(err)
+		}
+
+		if _, err := store.Update(func(*State) error { return nil }); err == nil {
+			t.Fatal("Update against a symlinked lock path should fail, not follow the link")
+		}
+		if _, err := os.Lstat(target); !os.IsNotExist(err) {
+			t.Errorf("the symlink target should not exist, lstat returned: %v", err)
+		}
+	})
 }
 
 // TestUpdateRefusesAHardLinkAtTheLockPath pins the Nlink defence against a

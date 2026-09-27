@@ -11,6 +11,7 @@ import (
 	"sort"
 	"strings"
 	"time"
+	"unicode"
 )
 
 const SchemaVersion = 2
@@ -64,11 +65,16 @@ type Disk struct {
 // name and JSON tag, so a v1 VM object decodes into this struct unchanged --
 // migrateLegacyVM is what carries it into the list.
 type VM struct {
-	// Name identifies this VM among the others in State.VMs. It is the disk
-	// name the VM boots from: that is already unique among disks (state.json
-	// has no second place two disks could share a name), and a VM has at most
-	// one disk attached for its whole life, so no separate identifier is
-	// needed. FindVM, UpsertVM and RemoveVM all key on this field.
+	// Name identifies this VM among the others in State.VMs. Normally it is
+	// the disk name the VM boots from: that is already unique among disks
+	// (state.json has no second place two disks could share a name), and a VM
+	// has at most one disk attached for its whole life, so no separate
+	// identifier is needed. A record migrated from a SchemaVersion-1 file with
+	// no usable disk name is the exception -- legacyVMName synthesises a name
+	// for it instead, chosen (via syntheticVMName) not to collide with any
+	// disk or VM already on file, so this field's uniqueness holds for a
+	// migrated record too, not only for one this build created itself.
+	// FindVM, UpsertVM and RemoveVM all key on this field.
 	Name string `json:"name,omitempty"`
 	// Slot is this VM's position in a small fixed range (0..MaxSlot) used to
 	// derive per-VM resources that collide if two VMs share one -- a tap
@@ -250,9 +256,16 @@ func (s *Store) Load() (*State, error) {
 	// MaxSlot bounds the domain a slot can address, so a vms list longer than
 	// MaxSlot+1 cannot be a file this build produced -- AllocateVMSlot refuses
 	// once every slot in 0..MaxSlot is taken, long before a 101st entry could
-	// be appended. vm.RunningVMs does one kill(pid, 0) per entry with no cap
-	// of its own, so a hand-edited or corrupted file that inflates this list
-	// would otherwise turn one Load into an unbounded number of syscalls.
+	// be appended. A file with more entries than that is corrupt or was
+	// hand-edited, not merely large.
+	//
+	// The refusal is deliberate, and its cost is real and otherwise unstated:
+	// every command that calls Load -- status, start, reset and cleanup alike,
+	// measured -- refuses right along with it, including the two commands
+	// (reset, cleanup) a user would otherwise reach for to recover. There is
+	// no in-band remedy for that trade, unlike the version guard just above,
+	// whose message says to upgrade; the file named in the error below has to
+	// be corrected by hand.
 	if len(st.VMs) > MaxSlot+1 {
 		return nil, fmt.Errorf("state file %s lists %d VMs, more than the %d slots (0..%d) this build can address: the file is corrupt or was hand-edited", s.StatePath, len(st.VMs), MaxSlot+1, MaxSlot)
 	}
@@ -289,7 +302,7 @@ func (s *Store) Load() (*State, error) {
 func migrateLegacyVM(st *State) {
 	if len(st.VMs) == 0 && st.LegacyVM != nil && legacyVMExisted(st.LegacyVM) {
 		migrated := *st.LegacyVM
-		migrated.Name = legacyVMName(st.LegacyVM)
+		migrated.Name = legacyVMName(st, st.LegacyVM)
 		migrated.Slot = 0
 		migrated.TapName = st.Network.TapName
 		migrated.NetworkMode = st.Network.Mode
@@ -317,21 +330,98 @@ func legacyVMExisted(v *VM) bool {
 // disk_name key. DiskName is preferred because it is already the unique,
 // stable identifier FindVM/UpsertVM/RemoveVM key on; DiskPath's basename with
 // the .qcow2 suffix trimmed is the next best thing, since it is what DiskName
-// itself is derived from at the point a disk is created; and a fixed
-// synthetic name is the last resort for a record with neither, so that a VM
-// this build cannot otherwise identify still gets a Name that satisfies every
-// caller who assumes VMs have one, rather than an empty string that collides
-// with every other unnamed entry.
-func legacyVMName(v *VM) string {
-	if v.DiskName != "" {
+// itself is derived from at the point a disk is created; and a collision-free
+// synthetic name (syntheticVMName) is the last resort for a record with
+// neither, so that a VM this build cannot otherwise identify still gets a
+// Name that satisfies every caller who assumes VMs have one, rather than an
+// empty string that collides with every other unnamed entry.
+//
+// Every candidate is run through validVMName before it is used, and skipped
+// in favour of the next one when it fails. Neither DiskName nor a
+// DiskPath-derived name is trustworthy just because it came off disk or
+// passed through filepath.Base: both are attacker- or typo-controlled
+// content from a state.json the user can hand-edit, and Base's own output is
+// not a validated name -- filepath.Base("..") is "..", filepath.Base("/") is
+// "/", and neither is safe to hand to a caller that is about to
+// filepath.Join it under the vm directory the way milestone 3 does. Measured
+// against this exact function before validation was added: disk_path
+// "../../etc/passwd" produced Name "passwd" (harmless here, but only by
+// accident of which path component survived Base), disk_path "/" produced
+// Name "/", disk_path ".." produced Name "..", and a disk_path ending in a
+// control-character-laden filename produced a Name carrying those same
+// control characters -- and it persists: a hand-edited v1 file with
+// `"vm":{"pid":4242,"disk_path":".."}` migrated and saved `"name": ".."`,
+// after which filepath.Join(<cache>/vm, Name) resolves one level OUT of the
+// vm directory, exactly what validDiskName in internal/app/app.go exists to
+// prevent for a disk name typed at the prompt.
+func legacyVMName(st *State, v *VM) string {
+	if validVMName(v.DiskName) == nil {
 		return v.DiskName
 	}
 	if v.DiskPath != "" {
-		if name := strings.TrimSuffix(filepath.Base(v.DiskPath), ".qcow2"); name != "" {
+		if name := strings.TrimSuffix(filepath.Base(v.DiskPath), ".qcow2"); validVMName(name) == nil {
 			return name
 		}
 	}
-	return "vm0"
+	return syntheticVMName(st)
+}
+
+// validVMName reports whether name is safe to use as VM.Name: non-empty, not
+// "." or "..", free of any path separator, and free of any non-printable
+// rune (a control character reaching a terminal via a printed VM name is the
+// same class of hazard state.json's other injection defences -- see
+// validateStoredInterfaceName and the plan-printing tests in
+// internal/app -- already guard against). This is the same rule
+// validDiskName (internal/app/app.go) applies to a disk name typed at the
+// prompt, duplicated here rather than shared: internal/app already imports
+// internal/state for the Store and State types it manipulates, so the
+// reverse import this package would need in order to call validDiskName
+// directly would be an import cycle, and internal/state must not depend on
+// internal/app.
+func validVMName(name string) error {
+	if name == "" {
+		return fmt.Errorf("vm name must not be empty")
+	}
+	if name == "." || name == ".." {
+		return fmt.Errorf("vm name %q is not allowed", name)
+	}
+	if strings.ContainsAny(name, "/\\") {
+		return fmt.Errorf("vm name %q must not contain a path separator", name)
+	}
+	for _, r := range name {
+		if !unicode.IsPrint(r) {
+			return fmt.Errorf("vm name %q contains a non-printable character", name)
+		}
+	}
+	return nil
+}
+
+// syntheticVMName returns the first name of the form "vm0", "vm1", ... that
+// collides with neither an existing disk in st.Disks nor an existing VM
+// already in st.VMs. legacyVMName's last resort used to always return the
+// fixed "vm0" unconditionally, which a migrated record with no usable disk
+// name could hand out even when a real disk was already named vm0 -- nothing
+// in state.json stops a disk and a migrated VM from sharing a name, so
+// VM.Name's own former claim that it "is already unique among disks" was not
+// actually enforced by anything for a migrated record. st.VMs is checked too
+// even though migrateLegacyVM only ever calls this while st.VMs is still
+// empty (its own gate requires len(st.VMs) == 0): checking it costs nothing
+// and keeps this function correct if it is ever reused somewhere that gate
+// does not hold.
+func syntheticVMName(st *State) string {
+	taken := make(map[string]struct{}, len(st.Disks)+len(st.VMs))
+	for _, d := range st.Disks {
+		taken[d.Name] = struct{}{}
+	}
+	for _, v := range st.VMs {
+		taken[v.Name] = struct{}{}
+	}
+	for i := 0; ; i++ {
+		name := fmt.Sprintf("vm%d", i)
+		if _, ok := taken[name]; !ok {
+			return name
+		}
+	}
 }
 
 // Save publishes st at s.StatePath, by writing a complete temporary file

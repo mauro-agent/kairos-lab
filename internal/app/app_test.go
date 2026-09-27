@@ -1597,6 +1597,47 @@ func TestStartRefusesWhenARecordedVMIsActuallyRunning(t *testing.T) {
 	}
 }
 
+// TestStartRefusesWhenALegacyStateFileRecordsALiveVM is the test that would
+// have caught the round-1 regression itself, which neither existing test
+// above it does: TestLoadMigratesAlpha1ShapedLegacyVM (internal/state)
+// pins the migration against an in-memory state, never against a file on
+// disk that `start` is then run against, and
+// TestStartRefusesWhenARecordedVMIsActuallyRunning pins the refusal against
+// a state file already in the v2, "vms"-list shape -- so neither one runs
+// `start` against an actual v0.0.0-alpha1-shaped state.json, which is
+// exactly the file shape the round-1 defect (migrateLegacyVM's gate at
+// DiskName != "") silently dropped on the floor. This test writes that exact
+// shape straight to disk -- a "vm" object with pid, disk_path, log_path,
+// qga_socket_path and started_at, and no disk_name key at all -- the same
+// way an alpha1 binary itself would have left it, and drives `start` against
+// it end to end through Run, the way a real invocation would.
+func TestStartRefusesWhenALegacyStateFileRecordsALiveVM(t *testing.T) {
+	t.Setenv("KAIROS_LAB_CONFIG_DIR", t.TempDir())
+	t.Setenv("KAIROS_LAB_CACHE_DIR", t.TempDir())
+	isolateFromHostBinaries(t)
+
+	store, err := state.DefaultStore()
+	if err != nil {
+		t.Fatalf("DefaultStore: %v", err)
+	}
+	if err := os.MkdirAll(store.ConfigDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	pid := os.Getpid()
+	legacy := fmt.Sprintf(`{"version":1,"setup":{"completed_at":"2025-01-01T00:00:00Z","dependency_check_passed":true},"vm":{"pid":%d,"disk_path":"/home/user/.cache/kairos-lab/vm/kairos-disk0.qcow2","log_path":"/home/user/.cache/kairos-lab/vm/kairos-disk0.log","qga_socket_path":"/home/user/.cache/kairos-lab/vm/kairos-disk0.qga.sock","started_at":"2026-03-18T00:00:00Z"}}`, pid)
+	if err := os.WriteFile(store.StatePath, []byte(legacy), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	var stdout, stderr bytes.Buffer
+	runErr := Run([]string{"start"}, strings.NewReader(""), &stdout, &stderr, "test")
+
+	want := fmt.Sprintf("a vm is already running with pid %d", pid)
+	if runErr == nil || runErr.Error() != want {
+		t.Fatalf("start against an alpha1-shaped legacy state file with a live recorded PID = %v, want error %q", runErr, want)
+	}
+}
+
 // The privilege pre-flight is asked about the run's mode, and its refusal ends
 // the run before anything has been built.
 //
