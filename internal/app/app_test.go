@@ -1992,9 +1992,9 @@ func TestStartStopsWhenPreparingSharedNetworkingFails(t *testing.T) {
 // Swallowing the error (biosPath, _ := firmwarePathFor(...)) also reddens
 // this, but by a route worth writing down, because the obvious guess is
 // wrong. It does NOT die on buildLinuxFor's arm64 message: only
-// firmwareHostPlatform is stubbed, while vm.BuildQEMUCommand's own arch
-// switch binds to the real runtime.GOARCH, so on the amd64 CI leg
-// buildLinuxFor never enters the arm64 case at all. It dies on
+// firmwareHostPlatform is stubbed, while buildLinux -- one frame below
+// vm.BuildQEMUCommand -- binds buildLinuxFor to the real runtime.GOARCH, so
+// on the amd64 CI leg it never enters the arm64 case at all. It dies on
 // "<mode> linux mode requires tap name" instead -- the message is %s-formatted
 // from cfg.NetworkMode, so each row gets its own -- from the stubbed prepare
 // leaving TapName empty; caught by the FIRST error-content check below, which
@@ -2002,7 +2002,7 @@ func TestStartStopsWhenPreparingSharedNetworkingFails(t *testing.T) {
 // is caught, but not by the assertion that looks like it would.
 func TestStartChecksFirmwareBeforePreparingLinuxNetworking(t *testing.T) {
 	if runtime.GOOS != "linux" {
-		t.Skipf("the NAT bridge and tap vm.PrepareLinuxShared/vm.PrepareLinuxBridge build are Linux-only, and so is the branch under test; on %s neither is reached", runtime.GOOS)
+		t.Skipf("the firmware check this pins runs everywhere, but the prepares it must run BEFORE -- vm.PrepareLinuxShared and vm.PrepareLinuxBridge -- are Linux-only; on %s there is no ordering left to pin", runtime.GOOS)
 	}
 
 	cases := []struct {
