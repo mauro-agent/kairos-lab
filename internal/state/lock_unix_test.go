@@ -803,9 +803,11 @@ func TestAcquireLockOnceRefusalQuotesAnAttackerControlledTempSibling(t *testing.
 
 // TestAcquireLockGiveUpQuotesAnAttackerControlledTempSibling pins the same
 // two things as TestAcquireLockOnceRefusalQuotesAnAttackerControlledTempSibling
-// above, but at acquireLock's own give-up call site (the churn branch, not
-// the hard-link one -- see the comment at that call site for why the
-// hard-link branch structurally cannot have a sibling of its own to find).
+// above, but at acquireLock's own give-up call site, and specifically at the
+// churn branch of it. The hard-link branch has a sibling hint of its own and
+// it is quoted the same way; what pins that one is
+// TestAcquireLockGiveUpNamesASiblingThatIsTheSecondLink below, which plants
+// the fixture where the sibling is not merely present but is the second link.
 func TestAcquireLockGiveUpQuotesAnAttackerControlledTempSibling(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "state.lock")
@@ -954,8 +956,13 @@ func TestAcquireLockGiveUpNamesASiblingThatIsTheSecondLink(t *testing.T) {
 		t.Fatal("acquireLock should give up against a permanently hard-linked lock path, not acquire it")
 	}
 	msg := err.Error()
-	if !strings.Contains(msg, "hard link") {
-		t.Errorf("give-up message does not report the cause it actually found: %q", msg)
+	// This exact phrase is emitted only by the hard-link give-up branch, so it
+	// is what distinguishes the two branches. Asserting merely on "hard link"
+	// would not: the churn give-up wraps lastErr too, and lastErr's own text
+	// already contains those words, so collapsing both branches onto the churn
+	// narrative would leave a looser assertion green.
+	if !strings.Contains(msg, "still found more than one hard link") {
+		t.Errorf("give-up message is not the hard-link one, so the branch selection fell through to the churn narrative: %q", msg)
 	}
 	if !strings.Contains(msg, strconv.Quote(sibling)) {
 		t.Errorf("give-up message does not name the leftover sibling %q, which is the second link and whose removal is the remedy: %q", sibling, msg)

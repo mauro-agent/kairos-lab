@@ -424,18 +424,23 @@ func acquireLock(path string) (unlock func(), err error) {
 			// unfiltered error printing.
 			sib := lockTempSibling(path)
 			if errors.Is(lastErr, errLockHardLinkAmbiguous) {
-				// Nothing was replaced, nothing was removed, and no process
-				// is repeatedly recreating anything, so the churn narrative
-				// below would describe a cause this is not. What can be
-				// claimed is what lastErr is: the LAST attempt found more
-				// than one hard link. Not every attempt -- lastErr is the
-				// last attempt's error and nothing here records the others,
-				// so a run whose first attempt failed its reopen with ENOENT
-				// and whose second found the link would have been described
-				// wrongly by a sentence about all of them.
+				// The last attempt found more than one hard link rather than
+				// a name that had been replaced or removed, so the churn
+				// narrative below would describe a cause this attempt is not.
+				//
+				// Scoped to that attempt deliberately, in the comment as
+				// well as in the message: lastErr is overwritten every
+				// iteration and nothing here records the earlier ones, so a
+				// run whose first attempt failed its reopen with ENOENT and
+				// whose second found the link did have something removed
+				// under it -- this branch simply has no evidence of it and
+				// must not narrate one way or the other. Saying "nothing was
+				// replaced, nothing was removed" would be the same overreach
+				// as the "every attempt" this replaced, one line above the
+				// fix for it.
 				giveUp := fmt.Errorf("gave up after %d attempt(s) trying to get a stable lock on %s: the restart bound (lockOpenAttempts) was spent, and the last attempt still found more than one hard link on it -- %w", attempt+1, path, lastErr)
 				if sib != "" {
-					giveUp = fmt.Errorf("%w -- there is also a leftover temporary file %q next to it, from a publish that never removed its own temporary name; that file may be the second link itself, in which case removing it by hand is what clears this", giveUp, sib)
+					giveUp = fmt.Errorf("%w -- there is also a leftover temporary file %q next to it, of the shape a publish that never removed its own temporary name leaves behind; that file may be the second link itself, in which case removing it by hand is what clears this", giveUp, sib)
 				}
 				return nil, giveUp
 			}
