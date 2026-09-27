@@ -581,8 +581,8 @@ func runStart(args []string, stdin io.Reader, stdout, stderr io.Writer, store *s
 	// vm.PrepareLinuxShared / vm.PrepareLinuxBridge build a NAT bridge and a
 	// tap on the host -- in memory only, on the *st passed in, with
 	// store.Save(st) -- the only place any of that gets written to disk --
-	// not reached until well after both blocks return, past disk
-	// materialization and the "[2/3] Recording VM state" step below. A
+	// not reached until well after both blocks return, down at the
+	// "[2/3] Recording VM state" step below. A
 	// linux/arm64 host missing EDK2 would sudo its way to a bridge and tap
 	// and only then hit this error, leaving both on the host with nothing
 	// in state.json to name them, so neither `kairos-lab reset` nor

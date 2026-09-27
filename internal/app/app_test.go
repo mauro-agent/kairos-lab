@@ -1984,9 +1984,9 @@ func TestStartStopsWhenPreparingSharedNetworkingFails(t *testing.T) {
 // that seam exists at all), and linuxARM64Firmware is pointed at a path that
 // does not exist, so firmwarePathFor fails deterministically regardless of
 // what is actually installed on the machine running this suite. The
-// runtime.GOOS gate below is real and unstubbed, because the branches under
-// test -- the firmware check and both prepares -- only run there; on any
-// other host this test has nothing to pin and skips, the same as
+// runtime.GOOS gate below is real and unstubbed, because the prepares this
+// pins the check AGAINST are linux-only -- the check itself is unconditional
+// -- so on any other host there is no ordering to pin and this skips, as
 // TestStartPreparesLinuxNetworkingWithTheRunsStateAndRuntimeDir does.
 //
 // Swallowing the error (biosPath, _ := firmwarePathFor(...)) also reddens
@@ -1994,9 +1994,10 @@ func TestStartStopsWhenPreparingSharedNetworkingFails(t *testing.T) {
 // wrong. It does NOT die on buildLinuxFor's arm64 message: only
 // firmwareHostPlatform is stubbed, while vm.BuildQEMUCommand's own arch
 // switch binds to the real runtime.GOARCH, so on the amd64 CI leg
-// buildLinuxFor never enters the arm64 case at all. It dies on "shared
-// linux mode requires tap name" instead, from the stubbed prepare leaving
-// TapName empty -- caught by the FIRST error-content check below, which
+// buildLinuxFor never enters the arm64 case at all. It dies on
+// "<mode> linux mode requires tap name" instead -- the message is %s-formatted
+// from cfg.NetworkMode, so each row gets its own -- from the stubbed prepare
+// leaving TapName empty; caught by the FIRST error-content check below, which
 // t.Fatalf's before the remedy-clause check is ever reached. So the swallow
 // is caught, but not by the assertion that looks like it would.
 func TestStartChecksFirmwareBeforePreparingLinuxNetworking(t *testing.T) {
@@ -2018,8 +2019,9 @@ func TestStartChecksFirmwareBeforePreparingLinuxNetworking(t *testing.T) {
 		},
 		{
 			// bridged needs its own scaffolding shared does not: a candidate
-			// uplink, so resolveBridgeUplink's host probe (line 492) never
-			// runs, and -yes still covers this mode's own sudo prompt the
+			// uplink, so the real bridgeIfaceCandidates -- which probes the
+			// host through vm.DetectUplinkCandidates -- never runs, and -yes
+			// still covers this mode's own sudo prompt the
 			// same way it covers shared's.
 			mode:        "bridged",
 			prepareName: "prepareLinuxBridge",
