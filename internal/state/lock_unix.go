@@ -7,6 +7,8 @@
 package state
 
 import (
+	"crypto/rand"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"os"
@@ -86,11 +88,11 @@ func (s *Store) Update(mutate func(*State) error) (*State, error) {
 	// os.Remove, and unlinking the lock path while another process holds it
 	// open is exactly the swap the separate-lock-file design exists to avoid
 	// (see acquireLockOnce's own doc comment): the name stops pointing at the
-	// locked inode, and the next Update's O_CREATE makes a fresh inode at
+	// locked inode, and the next Update's create makes a fresh inode at
 	// that name and locks THAT one instead, immediately, with zero mutual
 	// exclusion from whoever still holds the old one. Demonstrated: process A
 	// holding LOCK_EX, the path unlinked out from under it, and process B's
-	// O_CREATE|LOCK_EX|LOCK_NB succeeding at once -- two writers inside the
+	// create-and-lock succeeding at once -- two writers inside the
 	// critical section simultaneously. Nothing is lost by leaving it
 	// untracked: cleanup already removes ConfigDir wholesale (it is in
 	// ManagedDirs), which takes the lock file with it regardless of whether
@@ -130,9 +132,17 @@ var lockAcquireTimeout = 5 * time.Second
 // whatever inode is there now, and locks THAT one, with zero mutual
 // exclusion from this one.
 //
+// None of the three below is triggered by anything acquireLockOnce does to
+// path itself any more: it creates its file under a private temporary name
+// and links that into place, and never unlinks path (see acquireLockOnce's
+// own doc comment for the reasoning, and for why that is not the same as
+// eliminating the race). Every trigger is external: a user's manual `rm` of
+// the lock file, or `cleanup`'s os.RemoveAll(ConfigDir) running concurrently
+// with another command's Update.
+//
 //  1. The create/reopen race, documented at the point it is detected below: a
-//     concurrent unlink of the lock path between the O_EXCL attempt failing
-//     and the reopen succeeding fails the reopen with ENOENT.
+//     concurrent replace of the lock path between this call's own link()
+//     failing EEXIST and the reopen succeeding fails the reopen with ENOENT.
 //  2. A concurrent unlink that instead lands strictly between an open
 //     (either branch) and the fstat that follows it: the descriptor is still
 //     open on an inode whose Nlink has already dropped to 0, meaning every
@@ -143,11 +153,10 @@ var lockAcquireTimeout = 5 * time.Second
 //     by comparing a stat of the descriptor (taken before the flock) against
 //     a stat of the PATH (taken after), since flock's exclusivity binds the
 //     inode this descriptor points at and says nothing about what the name
-//     currently resolves to. This is what makes the os.Remove calls in the
-//     euid-0 chown-failure branch below safe: that unlink can hand a
-//     concurrent waiter a lock on an inode this same restart will notice is
-//     no longer the one at path, and send back through this loop instead of
-//     letting it proceed as if it had exclusive access.
+//     currently resolves to. This check narrows the window in which the name
+//     and the locked inode can come apart; it does not eliminate it -- see
+//     the comment at the check itself for exactly what it does and does not
+//     catch.
 //
 // The fix in every case is the same: close the stale descriptor and start
 // over from the open, on the theory that a path this volatile will
@@ -157,21 +166,49 @@ var lockAcquireTimeout = 5 * time.Second
 // than a reason to add headroom per case -- a real deployment is not
 // expected to hit more than one of the three in a row. Anything that keeps
 // failing past this bound is a path that will not stop changing, which is a
-// real error to surface (see the timeout-shaped error acquireLock returns
-// when this bound or the overall lockAcquireTimeout deadline is reached)
-// rather than a reason to keep spinning.
+// real error to surface (see the give-up error acquireLock returns when this
+// bound is spent, and the separate timeout error when lockAcquireTimeout
+// itself is) rather than a reason to keep spinning.
 const lockOpenAttempts = 2
 
-// openLockFile is os.OpenFile, and geteuid is os.Geteuid, each a var only so
-// a test can substitute it -- the same idiom lockAcquireTimeout already uses
-// in this file ("a var only so a test can shorten it; nothing in production
-// assigns it").
+// openLockFile is os.OpenFile, linkLockFile is os.Link, statLockFile is
+// (*os.File).Stat, and geteuid is os.Geteuid, each a var only so a test can
+// substitute it -- the same idiom lockAcquireTimeout already uses in this
+// file ("a var only so a test can shorten it; nothing in production assigns
+// it").
 //
-// openLockFile lets a test intervene between this call's own open and its
-// flock -- swapping the file at path out from under it -- to drive the
-// post-flock inode check (case 3 in lockOpenAttempts's comment) on demand,
-// deterministically, rather than racing a real concurrent goroutine against
-// a timing window measured in microseconds.
+// openLockFile is called in exactly one place below: the reopen of path
+// itself, once creating a fresh file under path has been ruled out because
+// path already names something (see acquireLockOnce's own doc comment for
+// why creation goes through a temporary name and linkLockFile instead of
+// opening path directly). A test can use it to intervene between that open
+// and the subsequent flock -- swapping the file at path out from under it --
+// to drive the post-flock inode check (case 3 in lockOpenAttempts's comment)
+// on demand, rather than racing a real concurrent goroutine against a timing
+// window measured in microseconds.
+//
+// linkLockFile is called once creating the temporary file has succeeded, to
+// publish it at path. A test can use it to intervene between that link
+// succeeding and this call's own cleanup of the temporary name, to drive the
+// Nlink == 0 restart (case 2 in lockOpenAttempts's comment) on demand.
+//
+// statLockFile exists for a narrower reason than the other three: not to
+// change what is returned, but to give a test a reliable signal for exactly
+// when the fstat/Nlink snapshot below has been taken. That snapshot reads
+// the descriptor, so it is unaffected by anything done to path afterward --
+// but only if "afterward" is actually after; gating a test's own swap of
+// path on this call having already returned, rather than on the open
+// (openLockFile) having merely been issued, is what turns "the swap happens
+// between the open and the flock" from a very likely ordering into a
+// guaranteed one. Measured: without this seam, a test synchronising only on
+// openLockFile passed against a mutant with the post-flock check deleted in
+// roughly 1 run out of 5 under an injected scheduling delay -- the fstat
+// below and the test's own unlink of path could still land either side of
+// each other, occasionally routing the same run through the Nlink == 0 path
+// (case 2) instead of the post-flock path (case 3) the test exists to pin,
+// which passes on the mutant because case 2 does not depend on the deleted
+// check at all. Gating on statLockFile instead closed that gap; the same
+// mutation then reddened every run.
 //
 // geteuid lets a test simulate running as euid 0 -- which the chown branch
 // below is gated on -- without the test process actually needing to run as
@@ -179,11 +216,63 @@ const lockOpenAttempts = 2
 // against the test's real (non-root) privileges, which is what lets a test
 // drive a genuine chown failure deterministically (chown to a uid that is
 // not the test's own euid fails with EPERM when not actually privileged)
-// without a third seam.
+// without a fifth seam.
 var (
 	openLockFile = os.OpenFile
+	linkLockFile = os.Link
+	statLockFile = func(f *os.File) (os.FileInfo, error) { return f.Stat() }
 	geteuid      = os.Geteuid
 )
+
+// lockTempFileAttempts bounds the search createTempLockFile makes for an
+// unused temporary name -- the same idiom, and the same bound, as
+// state.go's tempStateFileAttempts (see its own comment for why the bound
+// exists at all: crypto/rand makes an actual collision negligible, so this
+// is about a directory that answers "that name exists" forever, not about
+// retrying collisions).
+const lockTempFileAttempts = 10
+
+// createTempLockFile creates a new, empty, private file in the same
+// directory as path -- which is what lets acquireLockOnce's later
+// linkLockFile call succeed; link(2) fails EXDEV across filesystems, the
+// same constraint that puts createTempStateFile's own temporary file next to
+// state.json rather than in the system temp dir -- under a name of the form
+// <base of path>.tmp-<hex>, and returns it together with the name it was
+// created at.
+//
+// This reproduces createTempStateFile's idiom (crypto/rand suffix, O_EXCL, a
+// bounded search) rather than calling that function directly: that
+// function's name is hardcoded to "state.json.tmp-*" regardless of dir,
+// which would be a misleading name for a lock file's temporary, and it lives
+// in state.go, which carries no unix build tag -- this file is unix-only on
+// purpose (see the top of this file), and duplicating a dozen lines here
+// keeps that boundary intact rather than pulling an unrelated, cross-platform
+// file's naming convention across it for a difference of one string.
+//
+// No O_NOFOLLOW: unlike the reopen of path itself in acquireLockOnce, this
+// name is not predictable in advance -- nothing can pre-plant a symlink (or
+// anything else) at a filename drawn fresh from crypto/rand -- so O_EXCL
+// alone makes the name safe, the same reasoning createTempStateFile's own
+// comment already makes for the identical construction.
+func createTempLockFile(path string) (f *os.File, name string, err error) {
+	dir := filepath.Dir(path)
+	base := filepath.Base(path)
+	for i := 0; i < lockTempFileAttempts; i++ {
+		var suffix [8]byte
+		if _, err := rand.Read(suffix[:]); err != nil {
+			return nil, "", fmt.Errorf("generate a temporary name: %w", err)
+		}
+		candidate := filepath.Join(dir, base+".tmp-"+hex.EncodeToString(suffix[:]))
+		f, err := os.OpenFile(candidate, os.O_CREATE|os.O_EXCL|os.O_RDWR, 0o644)
+		if err == nil {
+			return f, candidate, nil
+		}
+		if !errors.Is(err, os.ErrExist) {
+			return nil, "", err
+		}
+	}
+	return nil, "", fmt.Errorf("no unused temporary name next to %s after %d attempts", path, lockTempFileAttempts)
+}
 
 // acquireLock opens (creating if needed) the file at path, locks it
 // exclusively with flock, and returns a function that unlocks and closes it.
@@ -216,18 +305,36 @@ func acquireLock(path string) (unlock func(), err error) {
 			return nil, aerr
 		}
 		lastErr = aerr
-		// Give up with a timeout-shaped error, rather than restart again,
-		// once EITHER bound is spent: lockOpenAttempts (a path that keeps
-		// getting replaced faster than the deadline arrives, which would
-		// otherwise spin very fast for the whole lockAcquireTimeout) or the
-		// deadline itself (a path that stops changing only after
-		// lockAcquireTimeout has already elapsed). lastErr is wrapped in
-		// rather than discarded, so the specific race that was hit --
+		// Give up, rather than restart again, once EITHER bound is spent --
+		// and say which one, rather than reusing one "timed out" message for
+		// both: they are reached by different races and at wildly different
+		// elapsed times. lockOpenAttempts is reached by a path that keeps
+		// getting replaced faster than the deadline arrives -- measured at
+		// ~81us for both attempts together, 0.004% of a 5s lockAcquireTimeout
+		// -- so calling that a timeout would be false; nothing timed out,
+		// the restart budget was simply spent. The deadline is reached
+		// separately, by a path that stops changing only after
+		// lockAcquireTimeout has already elapsed, which is a genuine
+		// timeout and gets its own message below. lastErr is wrapped into
+		// both rather than discarded, so the specific race that was hit --
 		// ENOENT on the reopen, Nlink == 0, or the post-flock path/inode
 		// mismatch -- is still visible to whoever reads the error.
-		if attempt >= lockOpenAttempts-1 || !time.Now().Before(deadline) {
-			return nil, fmt.Errorf("timed out after %d attempt(s) trying to get a stable lock on %s: the file kept being replaced or removed out from under this process -- if this persists, another process may be repeatedly recreating it; try again (%w)", attempt+1, path, lastErr)
+		if attempt >= lockOpenAttempts-1 {
+			return nil, fmt.Errorf("gave up after %d attempt(s) trying to get a stable lock on %s: the restart bound (lockOpenAttempts) was spent, not the %s timeout -- the file kept being replaced or removed out from under this process; if this persists, another process may be repeatedly recreating it; try again (%w)", attempt+1, path, lockAcquireTimeout, lastErr)
 		}
+		if !time.Now().Before(deadline) {
+			return nil, fmt.Errorf("timed out after %s trying to get a stable lock on %s: the file kept being replaced or removed out from under this process -- if this persists, another process may be repeatedly recreating it; try again (%w)", lockAcquireTimeout, path, lastErr)
+		}
+		// Sleep before restarting, the same lockRetryInterval the flock-wait
+		// loop inside acquireLockOnce already sleeps between LOCK_NB
+		// attempts, so this bound and lockAcquireTimeout actually compose:
+		// without this, both attempts together were measured at ~81us,
+		// leaving essentially all of a 5s lockAcquireTimeout unused budget
+		// on the table the instant something slower than that (a concurrent
+		// os.RemoveAll(ConfigDir) walking a tree, say) causes a replace --
+		// failing the whole Update over a transient that a few hundred
+		// milliseconds of patience would have ridden out.
+		time.Sleep(lockRetryInterval)
 	}
 }
 
@@ -260,111 +367,174 @@ func acquireLock(path string) (unlock func(), err error) {
 // this repo, not a theoretical one, and each is commented at the line it
 // governs.
 func acquireLockOnce(path string, deadline time.Time) (unlock func(), retry bool, err error) {
-	// O_NOFOLLOW: this file lives in the user's config directory, which
-	// kairos-lab's own privilege model treats as attacker-writable input in
-	// several other places already (see the comments on Store.Save and
-	// validateStoredInterfaceName) -- and running the whole tool under sudo
-	// is blessed on macOS, where the stock sudoers keeps HOME, so this open
-	// can happen as root against a path inside a directory the invoking user
-	// controls. It is what stops a symlink planted at path from being
-	// followed: measured against a plain os.OpenFile(path, os.O_CREATE|
-	// os.O_RDWR, ...) with a symlink already at path, the open followed the
-	// link and created the attacker's chosen target -- as root, if the
-	// process was. With O_NOFOLLOW the same open instead fails immediately
-	// with "too many levels of symbolic links".
-	//
-	// O_RDWR and not O_WRONLY: a FIFO planted at path (mkfifo needs no
-	// privilege beyond write access to the directory, which the user already
-	// has) makes an O_WRONLY|O_CREATE open BLOCK until a reader opens the
-	// other end -- which nothing here ever will, so every later invocation of
-	// this tool, including the `reset` that would otherwise let a user clean
-	// up the mess, hangs forever on this open. Measured: O_WRONLY blocked
-	// indefinitely against a FIFO at path; O_RDWR on the same FIFO returned
-	// immediately, because a reader/writer open on a FIFO does not wait for a
-	// peer the way a read-only or write-only one does.
-	//
-	// os.OpenFile and not a raw syscall.Open: os.OpenFile always adds
-	// O_CLOEXEC under the hood, and that is load-bearing here rather than
-	// hygiene. `kairos-lab start` execs QEMU as a child process; a lock fd
-	// that leaked across that exec would still be held open (and still
-	// flocked) by the QEMU process for the VM's entire lifetime, so a second
-	// `kairos-lab start` run against the same config dir would block on this
-	// same flock until that VM exited -- silently, with no message pointing
-	// at why. Do not swap this for syscall.Open even for a seemingly
-	// equivalent flag set; it does not set O_CLOEXEC and a later refactor
-	// that made that swap would reintroduce exactly this.
-	//
-	// 0o644 and not 0o600: what actually saves a user from being locked out
-	// of their own file after a root-privileged run (sudo on macOS) is the
-	// chown below, made a hard precondition rather than best-effort -- NOT
-	// the mode. A previous version of this comment claimed "at 0o644 the user
-	// can still open it read-write", which is false: the mode's `other` class
-	// is what a non-owning user gets, and 0644's other class is r--, while
-	// this open is O_RDWR; measured directly, O_RDWR on a real root-owned
-	// 0644 file this process did not own returned "permission denied", and
-	// O_RDONLY on the same file succeeded. A second version of this same
-	// comment then claimed a process with the same uid the file already has
-	// "can still open it read-write regardless of mode", which is also
-	// false: measured as the owning uid against its own file, O_RDWR
-	// succeeded at 0644 but 0444, 0400 and 0000 all failed with permission
-	// denied -- the owner-class bits bind the owner exactly as they read.
-	// Root is the only thing exempt from a file's mode altogether, and that
-	// is what a root-privileged run's own opens rely on regardless of what
-	// this mode is set to. What 0644 actually buys the one case that
-	// matters, correctly stated: nothing a tighter mode would not also buy
-	// -- the chown below is what changes the owner away from root, and the
-	// owning uid it hands the file to gets read-write from 0644's owner
-	// class either way, the same as it would from 0600's.
-	//
-	// The open itself is two-phase, not one os.OpenFile call, and that is the
-	// fix for a hard-link attack fchown lands on: `ln /etc/sudoers
+	// Creation goes through a private temporary name and linkLockFile, not
+	// straight to O_CREATE|O_EXCL on path itself, and that is the fix for a
+	// hard-link attack fchown lands on: `ln /etc/sudoers
 	// ~/.config/kairos-lab/state.lock` plants a hard link whose inode is a
 	// file the attacker does not own but the lock code would previously have
 	// chowned anyway, because O_NOFOLLOW stops a SYMLINK and does nothing at
 	// all about a hard link -- IsRegular() is true for one, and f.Chown is
 	// fchown(2), which lands on the inode the fd points at regardless of how
-	// many names lead to it. Demonstrated: with a hard link planted at the
-	// lock path, the O_NOFOLLOW open succeeded, IsRegular was true, the fd's
-	// inode equalled the victim's, and the victim's ownership changed.
-	// Linux's fs.protected_hardlinks=1 confines the ordinary version of this
-	// to files the attacker already owns, but macOS -- precisely where this
-	// tool blesses running under sudo with HOME preserved -- has no
-	// equivalent control at all.
+	// many names lead to it. The old two-phase open (O_CREATE|O_EXCL on path,
+	// then a plain reopen on os.ErrExist) closed the common case of that -- a
+	// pre-existing hard link at path fails O_EXCL and falls through to a
+	// reopen that never chowns anything -- but the created branch still
+	// chowned a file reachable by path, a name every other process on the
+	// system already knows, before this call had finished validating it.
+	// Creating under a name nothing but this call knows about, chowning
+	// THERE, and only linking the result into path afterward removes that
+	// window rather than narrowing it: nothing can hard-link to, or race,
+	// a name it has never seen.
 	//
-	// So: try O_CREATE|O_EXCL first. Success means this call is the one that
-	// created the file, which is the only case chown below ever runs in --
-	// a hard link or any other pre-existing name at path fails O_EXCL with
-	// os.ErrExist and falls through to a plain reopen that never chowns
-	// anything. The Nlink check just below is the second, independent half of
-	// the same fix: even on the created branch, this refuses to lock (and
-	// therefore never chowns) a file that already has more than one link,
-	// which a file this call only just created cannot legitimately have.
-	//
-	// The reopen carries no O_CREATE -- it must not create a file the O_EXCL
-	// attempt just proved already exists, or it would stop being the "only
-	// case chown runs in is the one that created the file" guarantee above
-	// depends on -- but that leaves a real window open: this process's own
-	// `cleanup` (or another one running concurrently) can unlink path between
-	// the two opens, and a lock path this steady-state, no-contention run IS
-	// going to take -- the O_EXCL attempt failing EEXIST because a previous
-	// run's lock file is still there is the ordinary case, not the rare one
-	// -- would then fail the reopen with ENOENT. That is case 1 of the three
-	// races lockOpenAttempts's own comment describes: retry is returned true
-	// rather than failing this attempt's caller outright, for a path that
-	// is, an instant later, perfectly creatable again.
-	created := true
-	f, err := openLockFile(path, os.O_CREATE|os.O_EXCL|os.O_RDWR|syscall.O_NOFOLLOW, 0o644)
-	if err != nil {
-		if !errors.Is(err, os.ErrExist) {
-			return nil, false, fmt.Errorf("open lock file %s: %w", path, err)
+	// createTempLockFile creates that temporary file; see its own comment
+	// for why it duplicates createTempStateFile's idiom rather than calling
+	// it, and why O_NOFOLLOW is not needed on this particular open.
+	tmpFile, tmpPath, terr := createTempLockFile(path)
+	if terr != nil {
+		return nil, false, fmt.Errorf("create a temporary file next to lock file %s: %w", path, terr)
+	}
+	tmpClosed := false
+	// cleanupTmp removes ONLY tmpPath, never path. path may not even exist
+	// yet at this point (linkLockFile below has not been attempted), and
+	// even where it does -- another process's lock file already there --
+	// this call did not create it and has no business unlinking it. tmpPath,
+	// by contrast, is a name nothing but this call has ever seen or opened,
+	// so removing it can never hand a concurrent waiter a lock on an inode
+	// it must then notice has moved on -- unlike unlinking path, which is
+	// exactly the shape of change that used to break mutual exclusion for a
+	// concurrent waiter (see Update's own doc comment in this file, and the
+	// post-flock check below, for what that used to look like and what, from
+	// outside this call, still can).
+	cleanupTmp := func() {
+		if !tmpClosed {
+			_ = tmpFile.Close()
+			tmpClosed = true
 		}
-		created = false
-		f, err = openLockFile(path, os.O_RDWR|syscall.O_NOFOLLOW, 0o644)
-		if err != nil {
-			if errors.Is(err, os.ErrNotExist) {
-				return nil, true, fmt.Errorf("open lock file %s: %w", path, err)
+		_ = os.Remove(tmpPath)
+	}
+
+	// The chown is a hard precondition when it applies, not a best-effort
+	// nicety: it is the only thing that stops a root-privileged run (sudo on
+	// macOS) from leaving a root-owned file inside a directory the invoking
+	// user owns and expects to fully control -- see createTempLockFile's own
+	// comment for why 0o644 does not do this on its own. It applies
+	// unconditionally here, with no "did this call create the file" gate the
+	// old single-open version needed: every call reaches this point via its
+	// own createTempLockFile just above, so the temporary file this chown
+	// targets was always created by this euid-0 run, never left behind by an
+	// earlier one. SUDO_UID/SUDO_GID are what sudo itself sets to the
+	// invoking user's identity, so chowning to them undoes exactly the
+	// ownership sudo introduced -- nothing more. When they are absent
+	// (running as real root, not via sudo) there is no invoking user to hand
+	// the file back to, so nothing here is attempted or required.
+	if geteuid() == 0 {
+		uidStr, gidStr := os.Getenv("SUDO_UID"), os.Getenv("SUDO_GID")
+		if uidStr != "" && gidStr != "" {
+			uid, uerr := strconv.Atoi(uidStr)
+			gid, gerr := strconv.Atoi(gidStr)
+			// Absent SUDO_UID/SUDO_GID is fine (real root, not via sudo --
+			// nothing to hand the file back to, above). Present but
+			// unparsable is a different case entirely: sudo did set them, so
+			// there IS an invoking user this file should belong to, and
+			// silently skipping the chown here used to take the lock anyway
+			// and leave exactly the root-owned file the chown exists to
+			// prevent -- with nothing in the error path ever telling anyone
+			// that happened, because there was no error path; this branch
+			// did not return one.
+			if uerr != nil || gerr != nil {
+				cleanupTmp()
+				return nil, false, fmt.Errorf("lock file %s could not be prepared: SUDO_UID=%q / SUDO_GID=%q could not be parsed as integers (%v / %v): the temporary file has been removed rather than left root-owned -- try again", path, uidStr, gidStr, uerr, gerr)
 			}
-			return nil, false, fmt.Errorf("open lock file %s: %w", path, err)
+			if cerr := tmpFile.Chown(uid, gid); cerr != nil {
+				cleanupTmp()
+				return nil, false, fmt.Errorf("lock file %s could not be prepared: its temporary file could not be chowned to the invoking user (uid %d, gid %d): %w -- it has been removed rather than left root-owned; try again", path, uid, gid, cerr)
+			}
+		}
+	}
+
+	// link(2), not rename(2), to publish the temporary file at path: rename
+	// would replace whatever is already there, silently orphaning its inode
+	// -- exactly the swap this whole design exists to avoid, just moved one
+	// call earlier. link fails EEXIST when path is already taken, which is
+	// exactly the O_EXCL semantics the old direct-create relied on, so an
+	// EEXIST here falls through to the same reopen-at-path branch a failed
+	// O_EXCL used to: see lockOpenAttempts's comment, case 1, for the ENOENT
+	// race that reopen can still hit.
+	var f *os.File
+	if lerr := linkLockFile(tmpPath, path); lerr != nil {
+		if !errors.Is(lerr, os.ErrExist) {
+			cleanupTmp()
+			return nil, false, fmt.Errorf("create lock file %s: %w", path, lerr)
+		}
+		cleanupTmp()
+
+		// O_NOFOLLOW: this file lives in the user's config directory, which
+		// kairos-lab's own privilege model treats as attacker-writable input
+		// in several other places already (see the comments on Store.Save
+		// and validateStoredInterfaceName) -- and running the whole tool
+		// under sudo is blessed on macOS, where the stock sudoers keeps
+		// HOME, so this open can happen as root against a path inside a
+		// directory the invoking user controls. It is what stops a symlink
+		// planted at path from being followed: measured against a plain
+		// os.OpenFile(path, os.O_RDWR, ...) with a symlink already at path,
+		// the open followed the link -- as root, if the process was. With
+		// O_NOFOLLOW the same open instead fails immediately with "too many
+		// levels of symbolic links".
+		//
+		// O_RDWR and not O_WRONLY: a FIFO planted at path (mkfifo needs no
+		// privilege beyond write access to the directory, which the user
+		// already has) makes an O_WRONLY open BLOCK until a reader opens the
+		// other end -- which nothing here ever will, so every later
+		// invocation of this tool, including the `reset` that would
+		// otherwise let a user clean up the mess, hangs forever on this
+		// open. Measured: O_WRONLY blocked indefinitely against a FIFO at
+		// path; O_RDWR on the same FIFO returned immediately, because a
+		// reader/writer open on a FIFO does not wait for a peer the way a
+		// read-only or write-only one does.
+		//
+		// os.OpenFile (via the openLockFile seam) and not a raw
+		// syscall.Open: os.OpenFile always adds O_CLOEXEC under the hood,
+		// and that is load-bearing here rather than hygiene. `kairos-lab
+		// start` execs QEMU as a child process; a lock fd that leaked
+		// across that exec would still be held open (and still flocked) by
+		// the QEMU process for the VM's entire lifetime, so a second
+		// `kairos-lab start` run against the same config dir would block on
+		// this same flock until that VM exited -- silently, with no message
+		// pointing at why. Do not swap this for syscall.Open even for a
+		// seemingly equivalent flag set; it does not set O_CLOEXEC and a
+		// later refactor that made that swap would reintroduce exactly
+		// this.
+		//
+		// No O_CREATE: it must not create a file the failed link just
+		// proved already exists at path -- but that leaves a real window
+		// open: this process's own `cleanup` (or another one running
+		// concurrently) can unlink path between the failed link and this
+		// open, and a lock path this steady-state, no-contention run IS
+		// going to take -- the link failing EEXIST because a previous run's
+		// lock file is still there is the ordinary case, not the rare one
+		// -- would then fail this open with ENOENT. That is case 1 of the
+		// three races lockOpenAttempts's own comment describes: retry is
+		// returned true rather than failing this attempt's caller outright,
+		// for a path that is, an instant later, perfectly creatable again.
+		var oerr error
+		f, oerr = openLockFile(path, os.O_RDWR|syscall.O_NOFOLLOW, 0o644)
+		if oerr != nil {
+			if errors.Is(oerr, os.ErrNotExist) {
+				return nil, true, fmt.Errorf("open lock file %s: %w", path, oerr)
+			}
+			return nil, false, fmt.Errorf("open lock file %s: %w", path, oerr)
+		}
+	} else {
+		// The link succeeded: path now names the same inode tmpFile already
+		// has open, so there is no need to reopen anything -- f is simply
+		// tmpFile from here on. tmpPath is removed so the only surviving
+		// name is path, rather than two names for one inode, which the
+		// Nlink check just below would otherwise -- correctly -- refuse to
+		// distinguish from a hard-link attack.
+		f = tmpFile
+		if rerr := os.Remove(tmpPath); rerr != nil {
+			_ = f.Close()
+			return nil, false, fmt.Errorf("lock file %s was linked into place but its temporary name %s could not be removed: %w -- remove it by hand and try again", path, tmpPath, rerr)
 		}
 	}
 	closed := false
@@ -386,7 +556,7 @@ func acquireLockOnce(path string, deadline time.Time) (unlock func(), retry bool
 	// raced out from under it. A FIFO, socket or device sitting at this path
 	// is not a lock file anyone legitimately created; it is refused rather
 	// than locked.
-	fi, err := f.Stat()
+	fi, err := statLockFile(f)
 	if err != nil {
 		return nil, false, fmt.Errorf("stat lock file %s: %w", path, err)
 	}
@@ -396,7 +566,8 @@ func acquireLockOnce(path string, deadline time.Time) (unlock func(), retry bool
 	// The Nlink field this checks below distinguishes three states, not two:
 	//
 	//   Nlink == 1: an ordinary lock file with exactly the one name this
-	//   call opened it by. Proceed.
+	//   call now reaches it by -- path, on both branches above (on the
+	//   linked branch, only once tmpPath has already been removed). Proceed.
 	//
 	//   Nlink == 0: this descriptor's inode has already been unlinked from
 	//   every name it had, including path -- case 2 of the three races
@@ -408,15 +579,17 @@ func acquireLockOnce(path string, deadline time.Time) (unlock func(), retry bool
 	//   trivially fixes.
 	//
 	//   Nlink > 1: a second name for this inode that this function did not
-	//   itself create -- this function never names a file more than once --
-	//   so it is refused outright with retry == false, on both branches
-	//   above. On the reopen branch this is the only defence against the
-	//   hard-link attack described above (chown never runs there at all); on
-	//   the created branch it is a second, independent one, in case anything
-	//   ever links to the file in the window between this open and this
-	//   stat. Unlike Nlink == 0, a hard link is a real, persistent problem
-	//   with whatever is at path, not a transient one an instant will fix --
-	//   it does not belong in the same retryable bucket.
+	//   itself intend -- this function never leaves a file linked under more
+	//   than one name at a time -- so it is refused outright with
+	//   retry == false. On the reopen branch this is the only defence
+	//   against the hard-link attack described above (chown never runs
+	//   there at all); on the linked branch it means either something added
+	//   another name to this inode in the narrow window between the link
+	//   succeeding and this call's own removal of tmpPath, or that the
+	//   removal of tmpPath itself silently failed. Either way, unlike
+	//   Nlink == 0, that is a real, persistent problem with whatever is at
+	//   path, not a transient one an instant will fix, so it does not belong
+	//   in the same retryable bucket.
 	//
 	// The type assertion failing is treated as a refusal too, not as "the
 	// check does not apply here": failing open is what a defence is supposed
@@ -440,68 +613,6 @@ func acquireLockOnce(path string, deadline time.Time) (unlock func(), retry bool
 	}
 	if st.Nlink > 1 {
 		return nil, false, fmt.Errorf("lock file %s has %d hard links, want exactly 1: refusing to lock a file that may alias another path", path, st.Nlink)
-	}
-
-	// The chown is a hard precondition when it applies, not a best-effort
-	// nicety: it is the only thing that stops a root-privileged run (sudo on
-	// macOS) from leaving a root-owned file inside a directory the invoking
-	// user owns and expects to fully control -- see the mode comment above
-	// for why 0o644 does not do this on its own. It applies only when this
-	// call created the file (created, above): a file that already existed
-	// was not created by this euid-0 run, and chowning it would be changing
-	// the ownership of someone else's file rather than fixing this run's
-	// own. SUDO_UID/SUDO_GID are what sudo itself sets to the invoking user's
-	// identity, so chowning to them undoes exactly the ownership sudo
-	// introduced -- nothing more. When they are absent (running as real root,
-	// not via sudo) there is no invoking user to hand the file back to, so
-	// nothing here is attempted or required.
-	//
-	// Both failure branches below unlink path before returning: created is
-	// true here, so this call is the one that just put a root-owned file at
-	// path, and leaving it there hands the very next unprivileged run (this
-	// tool never suggests running as root except for this one euid-0 path) a
-	// bare "permission denied" on that file with no remedy at all -- exactly
-	// the lockout the chown exists to prevent, self-inflicted by the attempt
-	// to prevent it. Unlinking it here is what closes the loop the previous
-	// version of this error asked the user to close by hand ("remove the
-	// file and try again"); this does that removal itself instead of asking.
-	//
-	// Unlinking path here by name, rather than the inode this descriptor
-	// holds, is exactly the shape of change that used to break mutual
-	// exclusion for a concurrent waiter: a second process's reopen can have
-	// already succeeded against this same inode, in the window between this
-	// call's O_EXCL and this point, and go on to flock it and proceed as
-	// though it had exclusive access to whatever is at path -- which, after
-	// this unlink, it no longer does. That is what the post-flock
-	// path/inode check below (case 3 in lockOpenAttempts's comment) exists
-	// to catch, in that OTHER call, not this one: this call itself never
-	// reaches the flock below on either failure branch here, so what makes
-	// this unlink safe is not anything added in this call's own path, but
-	// every caller of acquireLockOnce validating what it locked, after it
-	// locked it, against what the name currently resolves to.
-	if created && geteuid() == 0 {
-		uidStr, gidStr := os.Getenv("SUDO_UID"), os.Getenv("SUDO_GID")
-		if uidStr != "" && gidStr != "" {
-			uid, uerr := strconv.Atoi(uidStr)
-			gid, gerr := strconv.Atoi(gidStr)
-			// Absent SUDO_UID/SUDO_GID is fine (real root, not via sudo --
-			// nothing to hand the file back to, above). Present but
-			// unparsable is a different case entirely: sudo did set them, so
-			// there IS an invoking user this file should belong to, and
-			// silently skipping the chown here used to take the lock anyway
-			// and leave exactly the root-owned file the chown exists to
-			// prevent -- with nothing in the error path ever telling anyone
-			// that happened, because there was no error path; this branch did
-			// not return one.
-			if uerr != nil || gerr != nil {
-				_ = os.Remove(path)
-				return nil, false, fmt.Errorf("lock file %s was created owned by root, but SUDO_UID=%q / SUDO_GID=%q could not be parsed as integers (%v / %v): the file has been removed rather than left root-owned -- try again", path, uidStr, gidStr, uerr, gerr)
-			}
-			if cerr := f.Chown(uid, gid); cerr != nil {
-				_ = os.Remove(path)
-				return nil, false, fmt.Errorf("lock file %s was created owned by root and could not be chowned to the invoking user (uid %d, gid %d): %w -- the file has been removed rather than left root-owned; try again", path, uid, gid, cerr)
-			}
-		}
 	}
 
 	// LOCK_EX|LOCK_NB in a bounded retry loop, not a bare blocking LOCK_EX:
@@ -547,11 +658,26 @@ func acquireLockOnce(path string, deadline time.Time) (unlock func(), retry bool
 	// lock does not guard whatever is or is not at path any more, and that
 	// is the whole of what this check exists to catch.
 	//
-	// This also makes a user's manual `rm` of the lock file safe -- which
-	// matters because the timed-out error above used to recommend exactly
-	// that ("remove the file and try again", in an earlier version of this
-	// comment) -- rather than a second, silent way to end up with two
-	// processes each believing they hold exclusive access.
+	// What this check is worth, stated as what was actually measured rather
+	// than in either direction overstated: acquireLockOnce itself never
+	// unlinks path any more (see the top of this function), so it is not
+	// itself a way for the name and the locked inode to come apart -- but it
+	// is not the only way that can happen, and this check does not close
+	// that off. It catches a replacement that lands BEFORE it runs --
+	// measured, that took the maximum number of simultaneous holders of the
+	// critical section in that case from 2 down to 1, a real fix -- and it
+	// catches nothing after: Update holds this lock for the whole
+	// Load/mutate/Save cycle, essentially all of a holder's wall time, and
+	// nothing revalidates for the rest of it once this one check has
+	// passed. Two ways still land a replacement after this point: a user's
+	// manual `rm` of the lock file, and `cleanup`'s
+	// os.RemoveAll(ConfigDir) running concurrently with another command's
+	// Update. Measured, both left the maximum number of simultaneous holders
+	// at 2, unchanged by this check either way. The consequence of that is
+	// a lost update to state.json, not anything privileged -- the chown
+	// above is the only place this file's contents or ownership matter
+	// beyond flock's own bookkeeping, and neither of those two remaining
+	// paths touches it.
 	//
 	// On mismatch this is folded into the same retry as cases 1 and 2 above
 	// (see lockOpenAttempts's comment): the lock this attempt holds is

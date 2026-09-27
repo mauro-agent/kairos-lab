@@ -307,27 +307,67 @@ func TestUpdateTimesOutRatherThanHangingOnAHeldLock(t *testing.T) {
 // on an inode that path no longer names, which guards nothing against
 // anyone else who opens path fresh.
 //
-// The timing is made deterministic with real concurrency rather than a
-// microsecond race: a competing flock is held on the original file first, so
-// the goroutine under test is guaranteed to have already opened the file and
-// taken its fstat/Nlink snapshot (Nlink == 1, correctly, since the swap
-// below has not happened yet) before it ever reaches its own (blocked)
-// flock attempt. The swap -- remove the original name, create a fresh file
-// at the same name -- then happens at leisure, and only once it is
-// complete is the held lock released, which is what lets the goroutine's
-// blocked flock() finally succeed, on the now-orphaned original inode.
+// The timing is made deterministic with a real handshake through the
+// statLockFile seam, not an unsynchronised sleep: a previous version of this
+// test used time.Sleep(50 * time.Millisecond) here on the theory that the
+// goroutine's own open, fstat and first flock attempt -- a handful of
+// syscalls -- would always finish well within that margin. They usually do,
+// but "usually" is not "guaranteed": under scheduling pressure a
+// late-scheduled goroutine could still be sitting at its very first
+// instruction when the sleep elapses, so the swap below would land BEFORE
+// the goroutine ever opens path, not after -- meaning its first (and only)
+// attempt opens the REPLACEMENT directly, flocks it unopposed, matches its
+// own Lstat trivially, and returns success on attempt 0, having never
+// reached the restart path this test exists to pin. Every assertion below
+// still passes in that scenario, because the lock it ends up holding
+// genuinely is the replacement's -- which is what makes it a silent,
+// load-dependent false pass rather than a loud failure.
+//
+// A first attempt at fixing that synchronised on openLockFile instead --
+// signalling the moment the reopen of path (the only call in acquireLockOnce
+// that touches path itself once a pre-existing file, "original" below, is
+// already there) was issued -- is not quite enough either. That does prove
+// the open targeted "original" rather than a later replacement, but the
+// fstat/Nlink snapshot acquireLockOnce takes right after that open is a
+// separate call, on a separate line, and nothing pins it to have already run
+// by the time a test synchronised only on the open goes on to swap path.
+// Measured: with the post-flock check deleted (the mutation this test exists
+// to catch) and only that open-based signal gating the swap, this test still
+// PASSED in roughly 1 run out of 5 under an injected 120ms scheduling delay
+// -- the swap's unlink of path occasionally landed in the gap between the
+// open returning and the fstat running, which drops this attempt's Nlink to
+// 0 and routes it through the Nlink == 0 restart (case 2) instead of the
+// post-flock check (case 3) this test means to pin; case 2 does not depend
+// on the deleted check at all, so the mutant passed by accident, through the
+// wrong door.
+//
+// statLockFile closes that gap: it is invoked exactly where the fstat/Nlink
+// snapshot is taken, so gating the swap on it having already RETURNED (not
+// merely on the earlier open having been issued) proves that snapshot is
+// already in hand -- reading the original file's Nlink == 1, correctly,
+// since nothing has touched it yet -- before the swap can begin. flock's own
+// exclusivity does the rest of the ordering work from there: a competing
+// LOCK_EX is already held on original before the goroutine is even spawned,
+// so its own LOCK_EX|LOCK_NB attempt gets EWOULDBLOCK and the retry loop
+// sleeps lockRetryInterval before trying again, which is what leaves it
+// still holding that snapshot, blocked, once the swap below completes and
+// releases the lock it is waiting on.
 //
 // What proves the fix actually ran, rather than merely that acquireLock
-// returned no error, is the contention check at the end: flock is a
-// per-INODE exclusion between any two independently opened descriptors on
-// it (measured: two separate os.OpenFile calls on the same path conflict
-// with each other, even within one process), so a LOCK_EX|LOCK_NB attempt
-// through this test's own separate descriptor on the REPLACEMENT file
-// succeeds if and only if acquireLock is not currently holding a lock on
-// that same inode. Before this fix, acquireLock returned success right
-// after the flock on the orphaned original succeeded, with nothing checking
-// that path had moved on -- which this assertion would have caught, since
-// nothing would then be holding the replacement's lock at all.
+// returned no error, is two things, not one: the openLockFile call count
+// asserted after the fact must be at least 2 -- proving a restart actually
+// happened, rather than the single successful-on-attempt-0 path the
+// unsynchronised version could silently take -- and the contention check at
+// the end: flock is a per-INODE exclusion between any two independently
+// opened descriptors on it (measured: two separate os.OpenFile calls on the
+// same path conflict with each other, even within one process), so a
+// LOCK_EX|LOCK_NB attempt through this test's own separate descriptor on the
+// REPLACEMENT file succeeds if and only if acquireLock is not currently
+// holding a lock on that same inode. Before the post-flock check existed,
+// acquireLock returned success right after the flock on the orphaned
+// original succeeded, with nothing checking that path had moved on -- which
+// this assertion would have caught, since nothing would then be holding the
+// replacement's lock at all.
 func TestAcquireLockRestartsAfterThePathIsReplacedBetweenOpenAndFlock(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "state.lock")
@@ -341,6 +381,28 @@ func TestAcquireLockRestartsAfterThePathIsReplacedBetweenOpenAndFlock(t *testing
 		t.Fatal(err)
 	}
 
+	realOpenLockFile := openLockFile
+	openCalls := 0
+	openLockFile = func(name string, flag int, perm os.FileMode) (*os.File, error) {
+		f, err := realOpenLockFile(name, flag, perm)
+		openCalls++
+		return f, err
+	}
+	t.Cleanup(func() { openLockFile = realOpenLockFile })
+
+	realStatLockFile := statLockFile
+	statted := make(chan struct{})
+	var signaled bool
+	statLockFile = func(f *os.File) (os.FileInfo, error) {
+		fi, err := realStatLockFile(f)
+		if !signaled {
+			signaled = true
+			close(statted)
+		}
+		return fi, err
+	}
+	t.Cleanup(func() { statLockFile = realStatLockFile })
+
 	type result struct {
 		unlock func()
 		err    error
@@ -351,12 +413,11 @@ func TestAcquireLockRestartsAfterThePathIsReplacedBetweenOpenAndFlock(t *testing
 		resultCh <- result{u, err}
 	}()
 
-	// Give the goroutine time to open the file, take its fstat/Nlink
-	// snapshot, and hit its own first (necessarily blocked, since original
-	// still holds the lock) flock attempt -- all a handful of syscalls,
-	// several orders of magnitude faster than this margin, and none of it
-	// depends on anything this goroutine (the test) does next.
-	time.Sleep(50 * time.Millisecond)
+	select {
+	case <-statted:
+	case <-time.After(5 * time.Second):
+		t.Fatal("acquireLock did not reach its fstat/Nlink snapshot of path within 5s")
+	}
 
 	if err := os.Remove(path); err != nil {
 		t.Fatal(err)
@@ -382,6 +443,10 @@ func TestAcquireLockRestartsAfterThePathIsReplacedBetweenOpenAndFlock(t *testing
 	}
 	defer res.unlock()
 
+	if openCalls < 2 {
+		t.Errorf("openLockFile was called %d time(s), want at least 2: acquireLock must not have restarted, so this test never exercised the post-flock identity check it exists to pin", openCalls)
+	}
+
 	flockErr := syscall.Flock(int(replacement.Fd()), syscall.LOCK_EX|syscall.LOCK_NB)
 	if flockErr == nil {
 		_ = syscall.Flock(int(replacement.Fd()), syscall.LOCK_UN)
@@ -393,38 +458,40 @@ func TestAcquireLockRestartsAfterThePathIsReplacedBetweenOpenAndFlock(t *testing
 }
 
 // TestAcquireLockGivesUpWhenThePathNeverStopsBeingReplaced pins the restart
-// bound: lockOpenAttempts caps the number of times acquireLock restarts the
-// whole open/validate/lock sequence, so a path that keeps getting replaced
-// on every single attempt must end in the timeout-shaped give-up error
-// rather than spinning forever. openLockFile is faked to replace whatever it
-// just successfully opened, on every call -- which drives the Nlink == 0
-// retry (case 2) on every attempt, the same restart counter the post-flock
-// check (case 3) shares, per lockOpenAttempts's own comment -- so this
-// equally pins that the two share one bound rather than each getting its
-// own.
+// bound's existence: lockOpenAttempts caps the number of times acquireLock
+// restarts the whole open/validate/lock sequence, so a path that keeps
+// getting replaced on every single attempt must end in the give-up error
+// rather than spinning forever -- removing lockOpenAttempts's cap (letting
+// acquireLock restart unboundedly) reddens this test.
+//
+// linkLockFile is faked to remove path immediately after every successful
+// link -- which drives the Nlink == 0 retry (case 2 in lockOpenAttempts's
+// comment) on every attempt. This does NOT also exercise case 3 (the
+// post-flock path/inode mismatch): every attempt here is caught by the
+// Nlink == 0 check before ever reaching the flock, since removing path drops
+// this call's own link count to 0 well before that point (instrumented: the
+// post-flock check was reached 0 times over 5 runs of this test). So this
+// pins only that the bound exists, not that case 2 and case 3 share it --
+// TestAcquireLockRestartsAfterThePathIsReplacedBetweenOpenAndFlock is what
+// exercises case 3, separately, and nothing here pins that the two count
+// against the same counter rather than each having its own.
 func TestAcquireLockGivesUpWhenThePathNeverStopsBeingReplaced(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "state.lock")
 
-	original := openLockFile
+	original := linkLockFile
 	calls := 0
-	openLockFile = func(name string, flag int, perm os.FileMode) (*os.File, error) {
-		f, err := original(name, flag, perm)
-		if err != nil {
-			return f, err
+	linkLockFile = func(oldname, newname string) error {
+		if err := original(oldname, newname); err != nil {
+			return err
 		}
 		calls++
-		if rerr := os.Remove(name); rerr != nil {
+		if rerr := os.Remove(newname); rerr != nil {
 			t.Fatalf("remove during simulated churn: %v", rerr)
 		}
-		repl, cerr := original(name, os.O_CREATE|os.O_EXCL|os.O_RDWR, 0o644)
-		if cerr != nil {
-			t.Fatalf("recreate during simulated churn: %v", cerr)
-		}
-		_ = repl.Close()
-		return f, nil
+		return nil
 	}
-	t.Cleanup(func() { openLockFile = original })
+	t.Cleanup(func() { linkLockFile = original })
 
 	_, err := acquireLock(path)
 	if err == nil {
@@ -434,32 +501,39 @@ func TestAcquireLockGivesUpWhenThePathNeverStopsBeingReplaced(t *testing.T) {
 		t.Errorf("error %q does not describe giving up on a churning path", err)
 	}
 	if calls != lockOpenAttempts {
-		t.Errorf("openLockFile was called %d times, want exactly lockOpenAttempts (%d): the restart bound did not stop the loop where expected", calls, lockOpenAttempts)
+		t.Errorf("linkLockFile succeeded %d time(s), want exactly lockOpenAttempts (%d): the restart bound did not stop the loop where expected", calls, lockOpenAttempts)
 	}
 }
 
 // TestAcquireLockOnceRetriesWhenLockFileDeletedAfterOpen pins the Nlink == 0
 // branch (case 2 in lockOpenAttempts's comment): a lock file deleted in the
-// window between this call's own open and the fstat immediately following
-// it is "the file was deleted under us", not "the file aliases another
-// path" -- it gets retry == true and a message that says so, distinct from
-// the Nlink > 1 hard-link refusal pinned separately below.
+// window between this call's own link() into place and the fstat that
+// follows it is "the file was deleted under us", not "the file aliases
+// another path" -- it gets retry == true and a message that says so,
+// distinct from the Nlink > 1 hard-link refusal pinned separately below.
+//
+// linkLockFile, not openLockFile, is the seam to fake for this: creation no
+// longer opens path directly (see acquireLockOnce's own doc comment), so the
+// window this test targets sits between linkLockFile succeeding and
+// acquireLockOnce's own subsequent removal of its temporary name -- a
+// concurrent unlink of path landing there leaves only the temporary name,
+// and this call's own cleanup of THAT name is what actually drops the link
+// count to 0, one line later.
 func TestAcquireLockOnceRetriesWhenLockFileDeletedAfterOpen(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "state.lock")
 
-	original := openLockFile
-	openLockFile = func(name string, flag int, perm os.FileMode) (*os.File, error) {
-		f, err := original(name, flag, perm)
-		if err != nil {
-			return f, err
+	original := linkLockFile
+	linkLockFile = func(oldname, newname string) error {
+		if err := original(oldname, newname); err != nil {
+			return err
 		}
-		if rerr := os.Remove(name); rerr != nil {
+		if rerr := os.Remove(newname); rerr != nil {
 			t.Fatalf("remove: %v", rerr)
 		}
-		return f, nil
+		return nil
 	}
-	t.Cleanup(func() { openLockFile = original })
+	t.Cleanup(func() { linkLockFile = original })
 
 	unlock, retry, err := acquireLockOnce(path, time.Now().Add(time.Second))
 	if err == nil {
@@ -551,8 +625,14 @@ func TestAcquireLockOnceRejectsUnparsableSudoIDsAsRoot(t *testing.T) {
 // chown syscall itself is not faked -- it runs for real, under this test
 // process's real, unprivileged credentials, against a target uid that is
 // neither that identity nor root, which is what makes the real fchown fail
-// with EPERM deterministically without the test needing actual root.
+// with EPERM deterministically without the test needing actual root. If the
+// suite is ever run as real root, targetUID's real fchown would succeed
+// instead of failing -- the same reason state_test.go's
+// TestSaveFailureLeavesPreviousStateIntact guards itself the same way.
 func TestAcquireLockOnceRejectsAChownFailureAsRoot(t *testing.T) {
+	if os.Geteuid() == 0 {
+		t.Skip("root can chown to any uid, so the chown under test would succeed")
+	}
 	dir := t.TempDir()
 	path := filepath.Join(dir, "state.lock")
 
