@@ -1569,6 +1569,34 @@ func loadStoredState(t *testing.T) *state.State {
 	return st
 }
 
+// TestStartRefusesWhenARecordedVMIsActuallyRunning is the test that should
+// have gated the refusal this commit's own message promises to preserve:
+// `git grep -n "already running"` and `git grep -n "still running (PID"` both
+// find their string only in app.go and the README, never in a test, which is
+// how a migration that silently stopped a live VM's record from ever
+// reaching state.VMs (the alpha1-shaped legacy record migrateLegacyVM used to
+// drop) got past review with every existing test green. os.Getpid() stands
+// in for a live VM process: vm.IsRunning does a real kill(pid, 0), and the
+// test process's own PID answers that as running for as long as the test
+// itself is running, with no process to spawn or clean up.
+func TestStartRefusesWhenARecordedVMIsActuallyRunning(t *testing.T) {
+	t.Setenv("KAIROS_LAB_CONFIG_DIR", t.TempDir())
+	t.Setenv("KAIROS_LAB_CACHE_DIR", t.TempDir())
+	isolateFromHostBinaries(t)
+	pid := os.Getpid()
+	seedInjectedState(t, func(st *state.State) {
+		state.UpsertVM(st, state.VM{Name: "kairos-disk0", PID: pid})
+	})
+
+	var stdout, stderr bytes.Buffer
+	err := Run([]string{"start"}, strings.NewReader(""), &stdout, &stderr, "test")
+
+	want := fmt.Sprintf("a vm is already running with pid %d", pid)
+	if err == nil || err.Error() != want {
+		t.Fatalf("start with a live recorded PID = %v, want error %q", err, want)
+	}
+}
+
 // The privilege pre-flight is asked about the run's mode, and its refusal ends
 // the run before anything has been built.
 //

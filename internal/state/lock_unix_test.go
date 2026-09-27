@@ -5,6 +5,7 @@ package state
 import (
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"syscall"
 	"testing"
@@ -144,5 +145,100 @@ func TestUpdateRefusesASymlinkAtTheLockPath(t *testing.T) {
 	}
 	if _, err := os.Lstat(target); !os.IsNotExist(err) {
 		t.Errorf("the symlink target should not exist, lstat returned: %v", err)
+	}
+}
+
+// TestUpdateRefusesAHardLinkAtTheLockPath pins the Nlink defence against a
+// hard link at the lock path, which O_NOFOLLOW does nothing about: O_NOFOLLOW
+// stops a SYMLINK from being followed, but a hard link is a second name for
+// the very same inode, and the open just opens that inode directly, no
+// following involved. IsRegular is true for it, exactly as it is for a
+// legitimate lock file, which is what made the pre-fix code chown it at euid
+// 0 without ever noticing it was not the file this call created (see
+// acquireLock's own comment for the root-privileged half of this attack,
+// which needs euid 0 to observe and so cannot be driven through this
+// unprivileged test). What this test pins is available at any privilege
+// level: a lock file with more than one link is refused outright, and the
+// other name's contents are left untouched.
+func TestUpdateRefusesAHardLinkAtTheLockPath(t *testing.T) {
+	t.Setenv("KAIROS_LAB_CONFIG_DIR", t.TempDir())
+	t.Setenv("KAIROS_LAB_CACHE_DIR", t.TempDir())
+	store, err := DefaultStore()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(store.ConfigDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	victim := filepath.Join(store.ConfigDir, "victim")
+	if err := os.WriteFile(victim, []byte("victim\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Link(victim, store.LockPath); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := store.Update(func(*State) error { return nil }); err == nil {
+		t.Fatal("Update against a hard-linked lock path should fail, not lock the victim's inode")
+	}
+
+	body, err := os.ReadFile(victim)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(body) != "victim\n" {
+		t.Errorf("the hard link's target was modified: contents = %q", body)
+	}
+}
+
+// TestUpdateTimesOutRatherThanHangingOnAHeldLock pins the fix for a bare
+// LOCK_EX with no deadline: any same-uid process that already holds this
+// lock used to wedge every later Update indefinitely, with no message at
+// all -- the same shape of failure the FIFO paragraph in acquireLock's
+// comment already names, arrived at one syscall later. lockAcquireTimeout is
+// shortened here only, the same idiom internal/vm/network_linux.go uses for
+// staleCleanupSettleDelay, so this test proves the bound is enforced without
+// itself waiting out the production timeout.
+func TestUpdateTimesOutRatherThanHangingOnAHeldLock(t *testing.T) {
+	t.Setenv("KAIROS_LAB_CONFIG_DIR", t.TempDir())
+	t.Setenv("KAIROS_LAB_CACHE_DIR", t.TempDir())
+	store, err := DefaultStore()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(store.ConfigDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	// Stand in for another kairos-lab process mid-Update: open and flock the
+	// lock path directly, and hold it for the rest of the test.
+	held, err := os.OpenFile(store.LockPath, os.O_CREATE|os.O_RDWR, 0o644)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer held.Close()
+	if err := syscall.Flock(int(held.Fd()), syscall.LOCK_EX); err != nil {
+		t.Fatal(err)
+	}
+
+	original := lockAcquireTimeout
+	lockAcquireTimeout = 200 * time.Millisecond
+	t.Cleanup(func() { lockAcquireTimeout = original })
+
+	done := make(chan error, 1)
+	go func() {
+		_, err := store.Update(func(*State) error { return nil })
+		done <- err
+	}()
+	select {
+	case err := <-done:
+		if err == nil {
+			t.Fatal("Update against an already-held lock should time out, not succeed")
+		}
+		if !strings.Contains(err.Error(), store.LockPath) {
+			t.Errorf("error %q does not name the lock path", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("Update did not return within 5s of a 200ms lockAcquireTimeout -- it is hanging rather than timing out")
 	}
 }

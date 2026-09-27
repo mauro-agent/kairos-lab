@@ -547,6 +547,100 @@ func TestLoadMigratesLegacyVMIntoVMs(t *testing.T) {
 	if !strings.Contains(string(raw), `"vms"`) {
 		t.Errorf("a save after migrating should carry the \"vms\" key, got:\n%s", raw)
 	}
+	// The version guard exists to stop an old binary from misreading a file a
+	// new one wrote; that only works if a migrated v1 file is actually
+	// relabelled v2 once it is saved again. It carried "version":1 next to a
+	// "vms" list before this was fixed, which is indistinguishable, to a v1
+	// Load, from a file that never had a VM at all -- v1's Load has no
+	// version check and no "vms" field to decode, so it silently reports
+	// nothing running for a VM the file says is at a live PID.
+	if !strings.Contains(string(raw), `"version": 2`) {
+		t.Errorf("a save after migrating a v1 file should carry \"version\": 2, got:\n%s", raw)
+	}
+}
+
+// TestLoadMigratesAlpha1ShapedLegacyVM pins the migration against the exact
+// shape the v0.0.0-alpha1 tag wrote, not just the shape the current build
+// happens to produce. disk_name did not exist on VM until commit 006089f,
+// which `git merge-base --is-ancestor v0.0.0-alpha1 006089f` confirms comes
+// after alpha1, so an alpha1 state.json with a live VM has a "vm" object
+// carrying pid and disk_path but no disk_name key at all. Gating the
+// migration on DiskName alone -- the defect this test is written against --
+// silently dropped that entire record: demonstrated against both binaries
+// with this exact shape and a live PID, the pre-milestone build correctly
+// refused start and reset ("a vm is already running", "a VM is still
+// running"), and the regressed build refused neither.
+func TestLoadMigratesAlpha1ShapedLegacyVM(t *testing.T) {
+	t.Setenv("KAIROS_LAB_CONFIG_DIR", t.TempDir())
+	t.Setenv("KAIROS_LAB_CACHE_DIR", t.TempDir())
+	store, err := DefaultStore()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(store.ConfigDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	legacy := `{"version":1,"vm":{"pid":1234,"disk_path":"/home/user/.cache/kairos-lab/vm/kairos-disk0.qcow2","log_path":"/home/user/.cache/kairos-lab/vm/kairos-disk0.log","qga_socket_path":"/home/user/.cache/kairos-lab/vm/kairos-disk0.qga.sock","started_at":"2026-03-18T00:00:00Z"}}`
+	if err := os.WriteFile(store.StatePath, []byte(legacy), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	st, err := store.Load()
+	if err != nil {
+		t.Fatalf("loading an alpha1-shaped v1 file should succeed: %v", err)
+	}
+	if len(st.VMs) != 1 {
+		t.Fatalf("VMs after migrating an alpha1-shaped record = %+v, want exactly one entry", st.VMs)
+	}
+	got := st.VMs[0]
+	if got.Name == "" {
+		t.Error("migrated VM Name is empty; a record with no disk_name still needs a usable Name")
+	}
+	if got.Name != "kairos-disk0" {
+		t.Errorf("migrated VM Name = %q, want %q, derived from disk_path's basename", got.Name, "kairos-disk0")
+	}
+	if got.PID != 1234 {
+		t.Errorf("migrated VM PID = %d, want 1234", got.PID)
+	}
+	if got.LogPath == "" || got.QGASockPath == "" {
+		t.Errorf("migrated VM lost LogPath or QGASockPath: %+v", got)
+	}
+}
+
+// TestLoadMigratesALegacyVMWithNeitherDiskNameNorDiskPath pins the last-resort
+// fallback in legacyVMName: a record that carries a live PID but not even a
+// disk_path (imaginable from a build older still, or a file trimmed by hand)
+// must still survive migration with a stable synthetic name rather than
+// being silently dropped or given an empty Name that collides with any other
+// unnamed entry.
+func TestLoadMigratesALegacyVMWithNeitherDiskNameNorDiskPath(t *testing.T) {
+	t.Setenv("KAIROS_LAB_CONFIG_DIR", t.TempDir())
+	t.Setenv("KAIROS_LAB_CACHE_DIR", t.TempDir())
+	store, err := DefaultStore()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(store.ConfigDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	legacy := `{"version":1,"vm":{"pid":4321}}`
+	if err := os.WriteFile(store.StatePath, []byte(legacy), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	st, err := store.Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(st.VMs) != 1 {
+		t.Fatalf("VMs = %+v, want exactly one entry", st.VMs)
+	}
+	if st.VMs[0].Name != "vm0" {
+		t.Errorf("migrated VM Name = %q, want the synthetic %q", st.VMs[0].Name, "vm0")
+	}
+	if st.VMs[0].PID != 4321 {
+		t.Errorf("migrated VM PID = %d, want 4321", st.VMs[0].PID)
+	}
 }
 
 // TestLoadSetupOnlyLegacyFileDropsTheDeadVMKey covers the file shape every
@@ -625,11 +719,15 @@ func TestLoadDoesNotMigrateWhenVMsAlreadyPresent(t *testing.T) {
 	}
 }
 
-// TestLoadRefusesANewerSchemaVersion pins the guard that makes the version
-// bump to 2 mean anything. Without it, an older build reading a file a newer
-// one wrote would see no "vm" key -- v2 dropped it for "vms" -- conclude
-// nothing is running, and start a second VM over what may still be a live
-// bridge and tap.
+// TestLoadRefusesANewerSchemaVersion pins the guard against a file THIS
+// build cannot understand: a version above SchemaVersion means some future
+// release wrote it in a shape this one has never seen. It is not a downgrade
+// defence -- an older binary reading a file a newer one wrote runs its own
+// Load, which this check cannot reach into and never will, so it changes
+// nothing about what that binary does. What it changes is what THIS binary
+// does when handed a file from later than itself: refuse with a message
+// naming both versions and the file to look at, instead of silently
+// misreading a shape it does not have fields for.
 func TestLoadRefusesANewerSchemaVersion(t *testing.T) {
 	t.Setenv("KAIROS_LAB_CONFIG_DIR", t.TempDir())
 	t.Setenv("KAIROS_LAB_CACHE_DIR", t.TempDir())
@@ -653,6 +751,37 @@ func TestLoadRefusesANewerSchemaVersion(t *testing.T) {
 				t.Errorf("error %q does not mention %q", err, want)
 			}
 		}
+	}
+}
+
+// TestLoadRefusesTooManyVMs pins the cap on len(st.VMs): the slot domain is
+// 0..MaxSlot, so a file with more VMs than that has more entries than this
+// build can ever address, and is corrupt or hand-edited rather than merely
+// large. vm.RunningVMs does one kill(pid, 0) syscall per entry with no bound
+// of its own, so without this refusal, Load itself is the only thing standing
+// between an inflated file and an unbounded number of syscalls per status
+// check.
+func TestLoadRefusesTooManyVMs(t *testing.T) {
+	t.Setenv("KAIROS_LAB_CONFIG_DIR", t.TempDir())
+	t.Setenv("KAIROS_LAB_CACHE_DIR", t.TempDir())
+	store, err := DefaultStore()
+	if err != nil {
+		t.Fatal(err)
+	}
+	st := NewState(store)
+	for i := 0; i <= MaxSlot+1; i++ { // MaxSlot+2 entries, one past the MaxSlot+1 that fits
+		st.VMs = append(st.VMs, VM{Name: fmt.Sprintf("vm%d", i)})
+	}
+	if err := store.Save(st); err != nil {
+		t.Fatal(err)
+	}
+
+	_, err = store.Load()
+	if err == nil {
+		t.Fatal("loading a state file with more VMs than slots exist should be refused, not silently accepted")
+	}
+	if !strings.Contains(err.Error(), fmt.Sprintf("%d", MaxSlot+2)) {
+		t.Errorf("error %q does not name the VM count %d", err, MaxSlot+2)
 	}
 }
 
@@ -691,8 +820,34 @@ func TestAllocateVMSlot(t *testing.T) {
 			vms = append(vms, VM{Name: fmt.Sprintf("vm%d", i), Slot: i})
 		}
 		st := &State{VMs: vms}
-		if _, err := AllocateVMSlot(st, nil); err == nil {
+		slot, err := AllocateVMSlot(st, nil)
+		if err == nil {
 			t.Fatal("AllocateVMSlot with every slot in 0..MaxSlot used should return an error")
+		}
+		// -1, not 0: 0 is itself a valid slot, so a caller that writes
+		// slot, _ := AllocateVMSlot(...) and drops the error must not get back
+		// something that looks like a real allocation of the first slot.
+		if slot != -1 {
+			t.Errorf("AllocateVMSlot error return = %d, want -1 so an ignored error still fails ValidateSlot", slot)
+		}
+	})
+
+	t.Run("ignores a stored slot outside 0..MaxSlot when building the used set", func(t *testing.T) {
+		// This pins the contract, not a behavioural difference this specific
+		// case can show: mutation testing this exact scenario (a single
+		// wildly out-of-range Slot) against a build that skips the
+		// ValidateSlot check found no observable difference, because the
+		// search loop below only ever queries keys 0..MaxSlot and an
+		// out-of-range key can never collide with one of those queries. The
+		// skip is still correct -- it is what keeps a corrupt or hand-edited
+		// slot from being recorded in `used` at all, which matters once
+		// anything downstream (a future widening of the search range, a
+		// second reader of `used`) stops guaranteeing that same non-collision
+		// -- so this stays as a regression pin on the stated contract.
+		st := &State{VMs: []VM{{Name: "corrupt", Slot: 1000000}}}
+		slot, err := AllocateVMSlot(st, nil)
+		if err != nil || slot != 0 {
+			t.Fatalf("AllocateVMSlot with only an out-of-range stored slot = (%d, %v), want (0, nil)", slot, err)
 		}
 	})
 }

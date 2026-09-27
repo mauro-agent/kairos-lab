@@ -9,6 +9,7 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strings"
 	"time"
 )
 
@@ -126,9 +127,13 @@ type VM struct {
 // slot is read.
 const MaxSlot = 99
 
-// ValidateSlot refuses a slot outside 0..MaxSlot. Every reader of a VM.Slot
-// that came out of state.json -- a file the user can hand-edit -- should call
-// this before deriving a tap name, a port or anything else keyed on it.
+// ValidateSlot refuses a slot outside 0..MaxSlot. There are no call sites yet
+// -- this build derives nothing from Slot -- but every one that will exist has
+// to call this before trusting a slot that came out of state.json, a file the
+// user can hand-edit: wherever a tap name is formed from a slot, wherever
+// SSHPort or WebPort are derived from a slot, and AllocateVMSlot's own
+// used-set loop below, which is the one call site that already exists and
+// already has to decide what to do with a stored slot outside this range.
 func ValidateSlot(slot int) error {
 	if slot < 0 || slot > MaxSlot {
 		return fmt.Errorf("invalid vm slot %d: must be between 0 and %d", slot, MaxSlot)
@@ -210,20 +215,47 @@ func (s *Store) Load() (*State, error) {
 	if err := json.Unmarshal(b, &st); err != nil {
 		return nil, fmt.Errorf("parse state file: %w", err)
 	}
-	if st.Version == 0 {
-		st.Version = SchemaVersion
-	}
 	// A version newer than this binary understands is refused rather than
-	// loaded. Without this check the bump to SchemaVersion is inert: an older
-	// binary reading a file a newer one wrote sees no "vm" key at all (v2
-	// dropped it for "vms"), silently concludes nothing is running, and
-	// starts a second VM over what may still be a live bridge and tap. A
-	// refusal that names both versions at least tells the user why, and points
-	// at the file to look at.
+	// loaded. This is NOT a defence against a downgrade: an older binary
+	// reading a v2 file is a scenario this check cannot touch at all, because
+	// the check lives here, in the new binary, and an old binary never runs
+	// this code -- `git show 3d48893:internal/state/state.go` is the build
+	// immediately before this one, and its Load has no version check
+	// whatsoever, so nothing added here changes what it does with a v2 file.
+	// (An earlier version of this comment claimed otherwise; that claim did
+	// not survive being checked against the commit it was about.) What this
+	// guard actually protects is THIS build against a file a FUTURE version
+	// writes: without it, a schema change three versions from now that this
+	// binary cannot make sense of would be silently misread instead of
+	// refused with a message naming both versions and the file to look at.
 	if st.Version > SchemaVersion {
 		return nil, fmt.Errorf("state file %s has schema version %d, which is newer than the %d this build understands: upgrade kairos-lab before using it against this config directory", s.StatePath, st.Version, SchemaVersion)
 	}
+	// Every file that reaches here is understood by this build, whether it
+	// arrived at version 0 (the key absent -- nothing before SchemaVersion 2
+	// ever omitted it, so this is only NewState's own zero value on a file
+	// that was never saved), some version below SchemaVersion, or exactly
+	// SchemaVersion. It is stamped to SchemaVersion unconditionally, not only
+	// when it was 0: leaving a migrated v1 file's Version at 1 was the exact
+	// defect a v1-shaped state.json full of "vms" and no "vm" key measurably
+	// produced -- an old binary reading THAT file (Version still 1, so the
+	// old binary's total absence of a version check never even looks at it)
+	// finds no "vm" key, silently concludes nothing is running, and reports
+	// `vm running: false` for a VM the file says is running at a live PID.
+	// Stamping the version here, before migrateLegacyVM runs, is what makes a
+	// migrated file self-describing as what it now is: a save right after
+	// this Load republishes it as version 2, not still 1.
+	st.Version = SchemaVersion
 	migrateLegacyVM(&st)
+	// MaxSlot bounds the domain a slot can address, so a vms list longer than
+	// MaxSlot+1 cannot be a file this build produced -- AllocateVMSlot refuses
+	// once every slot in 0..MaxSlot is taken, long before a 101st entry could
+	// be appended. vm.RunningVMs does one kill(pid, 0) per entry with no cap
+	// of its own, so a hand-edited or corrupted file that inflates this list
+	// would otherwise turn one Load into an unbounded number of syscalls.
+	if len(st.VMs) > MaxSlot+1 {
+		return nil, fmt.Errorf("state file %s lists %d VMs, more than the %d slots (0..%d) this build can address: the file is corrupt or was hand-edited", s.StatePath, len(st.VMs), MaxSlot+1, MaxSlot)
+	}
 	st.ManagedDirs = uniqueSorted(append(st.ManagedDirs, s.ConfigDir, s.CacheDir))
 	st.ManagedFiles = uniqueSorted(st.ManagedFiles)
 	return &st, nil
@@ -236,20 +268,70 @@ func (s *Store) Load() (*State, error) {
 // The clear is unconditional, not only on the branch that actually migrates
 // something. Every state.json ever written before this milestone carries a
 // "vm" key, because the old VM field had no omitempty: a setup-only file (no
-// VM ever started) decodes it as an empty VM{}, which is not migrated -- an
-// empty record with no DiskName is not a VM that ever ran -- but the key must
-// still stop appearing once this file is saved again, or every setup-only
-// state.json in the wild would carry a dead "vm": {} forever.
+// VM ever started) decodes it as an empty VM{}, which is not migrated -- the
+// zero VM legacyVMExisted checks for below -- but the key must still stop
+// appearing once this file is saved again, or every setup-only state.json in
+// the wild would carry a dead "vm": {} forever.
+//
+// The gate used to be st.LegacyVM.DiskName != "", and that was itself a
+// defect: disk_name did not exist on VM at all until commit 006089f
+// (2026-04-01), and the v0.0.0-alpha1 tag (2026-03-18) predates it --
+// `git merge-base --is-ancestor v0.0.0-alpha1 006089f` confirms the ordering.
+// A state.json written by that build has a populated "vm" object -- pid,
+// disk_path, log_path, qga_socket_path, started_at, no disk_name key at all
+// -- for a VM that is running right now, and the DiskName-only gate dropped
+// the entire record on the floor: demonstrated against both binaries with an
+// alpha1-shaped file and a live PID, the base commit correctly refused start
+// and reset ("a vm is already running", "a VM is still running"), and this
+// one refused neither. legacyVMExisted below checks the fields that actually
+// mean "a VM existed" instead of the one field a real released build might
+// never have written.
 func migrateLegacyVM(st *State) {
-	if len(st.VMs) == 0 && st.LegacyVM != nil && st.LegacyVM.DiskName != "" {
+	if len(st.VMs) == 0 && st.LegacyVM != nil && legacyVMExisted(st.LegacyVM) {
 		migrated := *st.LegacyVM
-		migrated.Name = st.LegacyVM.DiskName
+		migrated.Name = legacyVMName(st.LegacyVM)
 		migrated.Slot = 0
 		migrated.TapName = st.Network.TapName
 		migrated.NetworkMode = st.Network.Mode
 		st.VMs = append(st.VMs, migrated)
 	}
 	st.LegacyVM = nil
+}
+
+// legacyVMExisted reports whether a decoded v1 "vm" object represents a VM
+// that actually ran, rather than the {} an old build's setup-only state.json
+// always carried (the old field had no omitempty, so the key was there
+// either way). PID, DiskPath, DiskName and LogPath are checked because every
+// schema this tool has ever written sets at least one of them the moment a
+// VM starts -- DiskName only since 006089f, DiskPath and LogPath since
+// before that, and PID as soon as the process is spawned -- so a record with
+// all four empty is one that never started, on any build.
+func legacyVMExisted(v *VM) bool {
+	return v.PID != 0 || v.DiskPath != "" || v.DiskName != "" || v.LogPath != ""
+}
+
+// legacyVMName derives a Name for a migrated v1 VM record. Name is new in
+// SchemaVersion 2 and did not exist for migrateLegacyVM's gate to have
+// already required, so a legacy record can reach here with nothing to draw
+// it from at all -- an alpha1-shaped file has a pid and a disk_path but no
+// disk_name key. DiskName is preferred because it is already the unique,
+// stable identifier FindVM/UpsertVM/RemoveVM key on; DiskPath's basename with
+// the .qcow2 suffix trimmed is the next best thing, since it is what DiskName
+// itself is derived from at the point a disk is created; and a fixed
+// synthetic name is the last resort for a record with neither, so that a VM
+// this build cannot otherwise identify still gets a Name that satisfies every
+// caller who assumes VMs have one, rather than an empty string that collides
+// with every other unnamed entry.
+func legacyVMName(v *VM) string {
+	if v.DiskName != "" {
+		return v.DiskName
+	}
+	if v.DiskPath != "" {
+		if name := strings.TrimSuffix(filepath.Base(v.DiskPath), ".qcow2"); name != "" {
+			return name
+		}
+	}
+	return "vm0"
 }
 
 // Save publishes st at s.StatePath, by writing a complete temporary file
@@ -530,9 +612,34 @@ func RemoveVM(st *State, name string) {
 // reallocating it on every restart would move a still-referenced VM onto a
 // fresh tap and strand the old one -- still on the host, no longer named by
 // anything in state.json, and invisible to reset and cleanup.
+//
+// The error return carries -1, not 0. 0 is a valid slot -- the very first one
+// this function would ever hand out -- so a caller that writes
+// `slot, _ := AllocateVMSlot(...)` and ignores the error would get a value
+// that looks exactly like a real allocation and collides with whatever
+// already holds slot 0. -1 fails ValidateSlot instead, so an ignored error
+// still surfaces the first time the result is checked against the one rule
+// every slot has to pass.
 func AllocateVMSlot(st *State, free func(int) bool) (int, error) {
 	used := make(map[int]bool, len(st.VMs))
 	for _, v := range st.VMs {
+		// A stored slot outside 0..MaxSlot cannot have come from this
+		// function -- it only ever hands out slots ValidateSlot accepts -- so
+		// it is either hand-edited or corrupt, and this call site is one of
+		// the ones ValidateSlot's own doc comment says must check before
+		// trusting a stored slot. Recording an out-of-range value in used
+		// happens to be harmless today, verified by mutation: the search
+		// below only ever queries keys in 0..MaxSlot, so a key outside that
+		// range can never collide with one it looks up. Skipping it here is
+		// still the right call, not a no-op left in out of caution -- an
+		// unbounded number of distinct out-of-range values in a hand-edited
+		// or corrupted st.VMs would otherwise grow this map by one entry per
+		// value for no purpose, and a future change to the search loop below
+		// (say, searching a wider range) could turn today's harmless entry
+		// into tomorrow's collision without this line changing at all.
+		if ValidateSlot(v.Slot) != nil {
+			continue
+		}
 		used[v.Slot] = true
 	}
 	for slot := 0; slot <= MaxSlot; slot++ {
@@ -544,7 +651,7 @@ func AllocateVMSlot(st *State, free func(int) bool) (int, error) {
 		}
 		return slot, nil
 	}
-	return 0, fmt.Errorf("no free vm slot in 0..%d", MaxSlot)
+	return -1, fmt.Errorf("no free vm slot in 0..%d", MaxSlot)
 }
 
 // VMOrZero is transition-only API, to be deleted in M3 once every call site
