@@ -560,23 +560,24 @@ func TestAcquireLockOnceRetriesWhenLockFileDeletedAfterOpen(t *testing.T) {
 	}
 }
 
-// TestAcquireLockOnceRefusesAHardLinkedFile pins the Nlink > 1 branch this
-// scenario reaches: path is already a hard link to victim before this call
-// ever runs, so linkLockFile's own link(2) fails EEXIST and this call takes
-// the reopen branch -- the same branch case 4 in lockOpenAttempts's own
-// comment describes another kairos-lab process's own mid-publish as
-// reaching. A single attempt cannot tell the two apart (chown never runs on
-// this branch either way, which is exactly why it is the persistent case's
-// only remaining target), so it is retry == true here, same as that
-// transient case -- not retry == false, which used to be this test's own
-// assertion until the design changed to fix spurious non-retryable refusals
-// during an ordinary concurrent publish. The persistent case this test
-// actually sets up is still refused in the end: TestUpdateRefusesAHardLinkAt
-// TheLockPath pins that end-to-end through Update, where acquireLock's
-// restart bound converts a hard link that never resolves into its own
-// give-up error once the bound is spent, rather than acquireLockOnce ever
-// calling it non-retryable on the first attempt.
-func TestAcquireLockOnceRefusesAHardLinkedFile(t *testing.T) {
+// TestAcquireLockOnceRetriesAPreExistingHardLinkedFile pins the Nlink > 1
+// branch this scenario reaches: path is already a hard link to victim before
+// this call ever runs, so linkLockFile's own link(2) fails EEXIST and this
+// call takes the reopen branch -- the same branch case 4 in
+// lockOpenAttempts's own comment describes another kairos-lab process's own
+// mid-publish as reaching. A single attempt cannot tell the two apart (chown
+// never runs on this branch either way, which is exactly why it is the
+// persistent case's only remaining target), so it is retry == true here,
+// same as that transient case -- not retry == false, which used to be this
+// test's own assertion (and this test's own name) until the design changed
+// to fix spurious non-retryable refusals during an ordinary concurrent
+// publish. The persistent case this test actually sets up is still refused
+// in the end: TestUpdateRefusesAHardLinkAtTheLockPath pins that end-to-end
+// through Update, where acquireLock's restart bound converts a hard link
+// that never resolves into its own give-up error once the bound is spent,
+// rather than acquireLockOnce ever calling it non-retryable on the first
+// attempt.
+func TestAcquireLockOnceRetriesAPreExistingHardLinkedFile(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "state.lock")
 	victim := filepath.Join(dir, "victim")
@@ -707,5 +708,255 @@ func TestAcquireLockOnceRejectsAChownFailureAsRoot(t *testing.T) {
 	}
 	if len(entries) != 0 {
 		t.Errorf("the temporary file should have been removed rather than left root-owned, directory contains: %v", entries)
+	}
+}
+
+// TestAcquireLockOnceRefusesASecondLinkOnItsOwnPublishedFile pins the
+// !reopened arm of the Nlink > 1 check -- reachable only through this call's
+// own successful link (or its own successful link(2)-unsupported fallback
+// create), which is why a second name appearing on that same inode before
+// the fstat runs is refused outright (retry == false), not treated as the
+// transient, other-process-mid-publish case the reopen branch handles.
+// Mutating `reopened := false` to `reopened := true` unconditionally --
+// which makes this arm unreachable -- reddens this test: with that mutation
+// this scenario returns retry == true instead of false.
+//
+// statLockFile is the seam used to plant the second link, rather than racing
+// a real goroutine: it runs exactly once, right after this call's own
+// successful link and its own cleanup of its temporary name (f is already
+// tmpFile, path already names the published file) and right before the
+// fstat/Nlink snapshot the check under test reads -- see statLockFile's own
+// comment for why that is a reliable, synchronous point to intervene rather
+// than a timing window measured in microseconds.
+func TestAcquireLockOnceRefusesASecondLinkOnItsOwnPublishedFile(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "state.lock")
+	second := filepath.Join(dir, "second-name")
+
+	realStatLockFile := statLockFile
+	statLockFile = func(f *os.File) (os.FileInfo, error) {
+		if err := os.Link(path, second); err != nil {
+			t.Fatalf("plant a second link at %s: %v", second, err)
+		}
+		return realStatLockFile(f)
+	}
+	t.Cleanup(func() { statLockFile = realStatLockFile })
+
+	unlock, retry, err := acquireLockOnce(path, time.Now().Add(time.Second))
+	if err == nil {
+		if unlock != nil {
+			unlock()
+		}
+		t.Fatal("acquireLockOnce should refuse when its own just-published file gains a second link before the fstat, not succeed")
+	}
+	if retry {
+		t.Errorf("this call is the only one that has ever named this inode by path on the non-reopen branch, so a second name on it now is a real, persistent problem, not a transient one -- got retry = true, err = %v", err)
+	}
+	if !strings.Contains(err.Error(), "hard links") {
+		t.Errorf("error %q does not name the hard-link refusal", err)
+	}
+}
+
+// TestAcquireLockOnceRefusalQuotesAnAttackerControlledTempSibling pins two
+// things at once, both at 0% coverage before this test: that the outright
+// -refusal branch's own lockTempSibling hint actually fires when a real
+// leftover sibling is there (exercising lockTempSibling's own
+// `return matches[0]`, and this call site's own `if sib != ""` body), and
+// that the sibling's name -- read from filepath.Glob over ConfigDir, which
+// this file's own comments already treat as attacker-writable -- reaches the
+// error message quoted (%q) rather than raw. cmd/kairos-lab/main.go prints
+// errors with a bare fmt.Fprintln(os.Stderr, "error:", err), no filtering, so
+// an unquoted control byte in a filename would reach a real terminal.
+func TestAcquireLockOnceRefusalQuotesAnAttackerControlledTempSibling(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "state.lock")
+	second := filepath.Join(dir, "second-name")
+	sibling := path + ".tmp-esc\x1bcr\rlf\n"
+	if err := os.WriteFile(sibling, nil, 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	realStatLockFile := statLockFile
+	statLockFile = func(f *os.File) (os.FileInfo, error) {
+		if err := os.Link(path, second); err != nil {
+			t.Fatalf("plant a second link at %s: %v", second, err)
+		}
+		return realStatLockFile(f)
+	}
+	t.Cleanup(func() { statLockFile = realStatLockFile })
+
+	_, _, err := acquireLockOnce(path, time.Now().Add(time.Second))
+	if err == nil {
+		t.Fatal("acquireLockOnce should refuse when its own just-published file gains a second link before the fstat, not succeed")
+	}
+	msg := err.Error()
+	if !strings.Contains(msg, "leftover temporary file") {
+		t.Errorf("error %q does not name the leftover temporary sibling", msg)
+	}
+	if strings.ContainsAny(msg, "\x1b\r\n") {
+		t.Errorf("error message contains raw control bytes from the attacker-named sibling, want them quoted: %q", msg)
+	}
+	if !strings.Contains(msg, `\x1b`) || !strings.Contains(msg, `\r`) || !strings.Contains(msg, `\n`) {
+		t.Errorf("error message does not contain the quoted escapes for the sibling's control bytes: %q", msg)
+	}
+}
+
+// TestAcquireLockGiveUpQuotesAnAttackerControlledTempSibling pins the same
+// two things as TestAcquireLockOnceRefusalQuotesAnAttackerControlledTempSibling
+// above, but at acquireLock's own give-up call site (the churn branch, not
+// the hard-link one -- see the comment at that call site for why the
+// hard-link branch structurally cannot have a sibling of its own to find).
+func TestAcquireLockGiveUpQuotesAnAttackerControlledTempSibling(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "state.lock")
+	sibling := path + ".tmp-esc\x1bcr\rlf\n"
+	if err := os.WriteFile(sibling, nil, 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	original := linkLockFile
+	linkLockFile = func(oldname, newname string) error {
+		if err := original(oldname, newname); err != nil {
+			return err
+		}
+		if rerr := os.Remove(newname); rerr != nil {
+			t.Fatalf("remove during simulated churn: %v", rerr)
+		}
+		return nil
+	}
+	t.Cleanup(func() { linkLockFile = original })
+
+	_, err := acquireLock(path)
+	if err == nil {
+		t.Fatal("acquireLock should give up against a path that never stops being replaced")
+	}
+	msg := err.Error()
+	if !strings.Contains(msg, "leftover temporary file") {
+		t.Errorf("error %q does not name the leftover temporary sibling", msg)
+	}
+	if strings.ContainsAny(msg, "\x1b\r\n") {
+		t.Errorf("error message contains raw control bytes from the attacker-named sibling, want them quoted: %q", msg)
+	}
+	if !strings.Contains(msg, `\x1b`) || !strings.Contains(msg, `\r`) || !strings.Contains(msg, `\n`) {
+		t.Errorf("error message does not contain the quoted escapes for the sibling's control bytes: %q", msg)
+	}
+}
+
+// TestAcquireLockOnceFallsBackWhenLinkIsUnsupported pins the
+// isLinkUnsupported fallback, at 0% coverage before this test -- the whole
+// fallback block was never reached by any test. linkLockFile is faked to
+// return EOPNOTSUPP -- one of the four errno shapes isLinkUnsupported
+// recognises -- on every call, which routes this call through the
+// O_CREATE|O_EXCL-at-path branch rather than the ordinary
+// temp-file-and-link one. SUDO_UID/SUDO_GID are set to this process's own
+// real uid/gid, and geteuid is faked to 0 (see its own comment for why that
+// alone is enough: the real fchown still runs, chowning the file to its own
+// already-current owner, which succeeds without real root), so the
+// fallback's own chownToInvokingUser call is exercised for real rather than
+// skipped.
+func TestAcquireLockOnceFallsBackWhenLinkIsUnsupported(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "state.lock")
+
+	realLinkLockFile := linkLockFile
+	linkLockFile = func(oldname, newname string) error { return syscall.EOPNOTSUPP }
+	t.Cleanup(func() { linkLockFile = realLinkLockFile })
+
+	t.Setenv("SUDO_UID", strconv.Itoa(os.Geteuid()))
+	t.Setenv("SUDO_GID", strconv.Itoa(os.Getegid()))
+	originalEuid := geteuid
+	geteuid = func() int { return 0 }
+	t.Cleanup(func() { geteuid = originalEuid })
+
+	unlock, retry, err := acquireLockOnce(path, time.Now().Add(time.Second))
+	if err != nil {
+		t.Fatalf("acquireLockOnce should fall back to creating directly at path when link(2) is unsupported, not fail: retry=%v, err=%v", retry, err)
+	}
+	defer unlock()
+
+	// Creates AT the final name, with no leftover temporary file: unlike the
+	// ordinary route, this branch never has a separate temporary name to
+	// clean up (see the fallback's own comment).
+	entries, derr := os.ReadDir(dir)
+	if derr != nil {
+		t.Fatal(derr)
+	}
+	if len(entries) != 1 || entries[0].Name() != filepath.Base(path) {
+		t.Fatalf("directory contains %v, want exactly the lock file itself with no leftover temporary name", entries)
+	}
+
+	var st syscall.Stat_t
+	if serr := syscall.Stat(path, &st); serr != nil {
+		t.Fatal(serr)
+	}
+	// Still chowns: the fake geteuid + real SUDO_UID/SUDO_GID above must have
+	// driven a real fchown against the file the fallback actually created.
+	if int(st.Uid) != os.Geteuid() || int(st.Gid) != os.Getegid() {
+		t.Errorf("lock file owner = uid %d gid %d, want uid %d gid %d -- chownToInvokingUser did not run against the fallback-created file", st.Uid, st.Gid, os.Geteuid(), os.Getegid())
+	}
+	// Still checks Nlink: an ordinary, single-link file is what the Nlink
+	// check is required to accept, and did -- acquireLockOnce returned
+	// success rather than refusing or retrying.
+	if st.Nlink != 1 {
+		t.Errorf("fallback-created lock file has %d hard links, want 1", st.Nlink)
+	}
+	// Still runs the post-flock identity check: unlock succeeding (deferred
+	// above) with no error already proves this call reached and passed it.
+}
+
+// TestAcquireLockOnceDoesNotFallBackOnAnUnrelatedLinkError pins
+// isLinkUnsupported's own narrowness end to end: a link(2) failure for a
+// reason that has nothing to do with hardlink support at all (EACCES, a
+// permissions problem) must surface as the ordinary, non-retryable "create
+// lock file" error, not be swallowed into the fallback -- which would give up
+// the fallback's own (already-reduced) protections for no reason, and
+// silently mask a real permissions problem as if it were a filesystem
+// limitation.
+func TestAcquireLockOnceDoesNotFallBackOnAnUnrelatedLinkError(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "state.lock")
+
+	original := linkLockFile
+	linkLockFile = func(oldname, newname string) error { return syscall.EACCES }
+	t.Cleanup(func() { linkLockFile = original })
+
+	unlock, retry, err := acquireLockOnce(path, time.Now().Add(time.Second))
+	if err == nil {
+		if unlock != nil {
+			unlock()
+		}
+		t.Fatal("acquireLockOnce should surface an unrelated link(2) failure (EACCES) as an ordinary error, not fall back to creating directly at path")
+	}
+	if retry {
+		t.Errorf("EACCES is not one of the four races lockOpenAttempts's comment describes -- got retry = true, err = %v", err)
+	}
+	if _, statErr := os.Lstat(path); !os.IsNotExist(statErr) {
+		t.Errorf("path should not have been created at all when link(2) fails for an unrelated reason, lstat returned: %v", statErr)
+	}
+}
+
+// TestIsLinkUnsupportedClassifiesErrnosNarrowly pins isLinkUnsupported's own
+// narrow boundary directly, at 0.0% coverage before this test: only the four
+// errnos its own comment names, not a blanket "anything that is not
+// ErrExist".
+func TestIsLinkUnsupportedClassifiesErrnosNarrowly(t *testing.T) {
+	cases := []struct {
+		name string
+		err  error
+		want bool
+	}{
+		{"EPERM", syscall.EPERM, true},
+		{"EOPNOTSUPP", syscall.EOPNOTSUPP, true},
+		{"ENOSYS", syscall.ENOSYS, true},
+		{"EXDEV", syscall.EXDEV, true},
+		{"EACCES", syscall.EACCES, false},
+		{"ErrExist", os.ErrExist, false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := isLinkUnsupported(tc.err); got != tc.want {
+				t.Errorf("isLinkUnsupported(%v) = %v, want %v", tc.err, got, tc.want)
+			}
+		})
 	}
 }

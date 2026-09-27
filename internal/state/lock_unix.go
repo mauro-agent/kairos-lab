@@ -136,10 +136,17 @@ var lockAcquireTimeout = 5 * time.Second
 // and locks THAT one, with zero mutual exclusion from this one.
 //
 // None of the four below is triggered by anything acquireLockOnce does to
-// path itself any more: it creates its file under a private temporary name
-// and links that into place, and never unlinks path (see acquireLockOnce's
-// own doc comment for the reasoning, and for why that is not the same as
-// eliminating the race). Three of the four triggers are external: a user's
+// path itself any more on its ordinary route: it creates its file under a
+// private temporary name and links that into place, never unlinking path
+// (see acquireLockOnce's own doc comment for the reasoning, and for why that
+// is not the same as eliminating the race). The one exception is the
+// link(2)-unsupported fallback, which creates directly AT path rather than
+// under a private name first -- so if its own chown then fails, its own
+// cleanup removes what it just created there; see chownToInvokingUser's call
+// site inside that fallback for why that is a narrow, near-immediate failure
+// of a precondition already checked once earlier in the same call, not a
+// race with anything external, and so does not add a fifth trigger to the
+// four below. Three of the four triggers below are external: a user's
 // manual `rm` of the lock file, or `cleanup`'s os.RemoveAll(ConfigDir)
 // running concurrently with another command's Update. The fourth needs no
 // external actor at all -- it is another kairos-lab process's own
@@ -165,14 +172,25 @@ var lockAcquireTimeout = 5 * time.Second
 //  4. A concurrent acquireLockOnce reaching the same reopen branch as case 1,
 //     but landing between a DIFFERENT call's own link() succeeding and that
 //     other call's own removal of its temporary name: this call's reopen
-//     then observes Nlink == 2, one name from each of two callers' temporary
-//     files that briefly both pointed at path. That resolves itself the
-//     instant the other call finishes its own cleanup -- a gap measured
-//     elsewhere in this file at microseconds, not the persistent Nlink > 1 a
-//     real hard link produces, which the same check refuses outright
-//     instead of restarting (see the Nlink check itself for why only the
-//     reopen branch can observe case 4 and the branch that itself just
-//     published the file cannot).
+//     then observes Nlink == 2 -- the other call's own temporary name and
+//     path itself, briefly both pointing at the same inode (this call's own
+//     temporary name was already removed by cleanupTmp() before this reopen
+//     ran, so it never pointed at that inode and plays no part in this
+//     count). That resolves itself the instant the other call finishes its
+//     own cleanup -- a gap measured elsewhere in this file at microseconds.
+//     A pre-existing hard link planted at path produces the identical Nlink
+//     == 2 shape and reaches this exact same reopen branch (its link(2)
+//     fails EEXIST against the hard link exactly as it would against
+//     another call's temporary name), so it is restarted here too, not
+//     refused outright by some other arm of the check: the outright
+//     "refuse, do not restart" arm is reached only when THIS call's own
+//     link or O_CREATE|O_EXCL create succeeded, which requires path not to
+//     have existed beforehand -- so it can never observe a hard link
+//     planted in advance at all. Only the restart bound (lockOpenAttempts)
+//     below, and the deadline in acquireLock's own loop, eventually convert
+//     a hard link that never resolves into the give-up error (see
+//     errLockHardLinkAmbiguous's own comment, and the Nlink check itself for
+//     the fuller version of this reasoning).
 //
 // The fix in every case is the same: close the stale descriptor and start
 // over from the open, on the theory that a path this volatile will
@@ -186,6 +204,20 @@ var lockAcquireTimeout = 5 * time.Second
 // bound is spent, and the separate timeout error when lockAcquireTimeout
 // itself is) rather than a reason to keep spinning.
 const lockOpenAttempts = 2
+
+// errLockHardLinkAmbiguous marks the Nlink > 1 error the reopen branch below
+// returns when it cannot yet tell a concurrent kairos-lab process's own
+// mid-publish (case 4 in lockOpenAttempts's own comment) apart from a real,
+// persistent hard link planted at path -- both produce the identical
+// Nlink == 2 shape on a single attempt, and only time (a bounded number of
+// restarts, or the restart bound being spent without it resolving) tells
+// them apart. It exists so acquireLock's own give-up message, once that
+// bound IS spent, can be worded around a real hard-link refusal with a real
+// remedy, rather than around the "kept being replaced or removed ... try
+// again" narrative that fits the other three races in lockOpenAttempts's
+// comment but not this one: a completely static hard link replaces nothing,
+// is removed by nobody, and "try again" is advice that can never clear it.
+var errLockHardLinkAmbiguous = errors.New("ambiguous between a concurrent publish and a persistent hard link")
 
 // openLockFile is os.OpenFile, linkLockFile is os.Link, statLockFile is
 // (*os.File).Stat, and geteuid is os.Geteuid, each a var only so a test can
@@ -350,26 +382,52 @@ func acquireLock(path string) (unlock func(), err error) {
 		// and say which one, rather than reusing one "timed out" message for
 		// both: they are reached by different races. lockOpenAttempts is
 		// reached by a path that keeps getting replaced on every single
-		// attempt, which the message below calls exactly that -- the restart
-		// budget being spent -- rather than a timeout, since it does not
-		// itself check whether lockAcquireTimeout has also elapsed by this
-		// point; with the retry sleep just below in the loop, it can have,
-		// so the message must not claim it has not. The deadline is checked
-		// separately, just below, and gets its own, genuinely distinct
-		// message when IT is what ends the loop. lastErr is wrapped into
-		// both rather than discarded, so the specific race that was hit --
-		// ENOENT on the reopen, Nlink == 0, or the post-flock path/inode
-		// mismatch -- is still visible to whoever reads the error.
+		// attempt (or, since the hard-link defence stopped refusing the
+		// reopen branch outright, by a persistent hard link that never
+		// resolves either -- see errLockHardLinkAmbiguous's own comment),
+		// which the message below says -- rather than a timeout, since it
+		// does not itself check whether lockAcquireTimeout has also elapsed
+		// by this point; with the retry sleep just below in the loop, it can
+		// have, so the message must not claim it has not. The deadline is
+		// checked separately, just below, and gets its own, genuinely
+		// distinct message when IT is what ends the loop. lastErr is wrapped
+		// into every variant below rather than discarded, so the specific
+		// race that was hit -- ENOENT on the reopen, Nlink == 0, the
+		// post-flock path/inode mismatch, or a persistent Nlink > 1 -- is
+		// still visible to whoever reads the error, and the wording built
+		// around it is chosen to match rather than guessed at: see the
+		// branch on errLockHardLinkAmbiguous immediately below for why a
+		// static hard link gets its own message rather than the "kept being
+		// replaced or removed ... try again" one that fits the other three.
 		if attempt >= lockOpenAttempts-1 {
+			if errors.Is(lastErr, errLockHardLinkAmbiguous) {
+				// Nothing was replaced, nothing was removed, and no process
+				// is repeatedly recreating anything -- the one true fact is
+				// that every attempt still found more than one hard link, so
+				// say that and let lastErr's own message (built where the
+				// Nlink > 1 check itself detects this) carry the remedy,
+				// rather than layering the churn narrative below on top of a
+				// cause it does not describe.
+				return nil, fmt.Errorf("gave up after %d attempt(s) trying to get a stable lock on %s: the restart bound (lockOpenAttempts) was spent, and every attempt still found more than one hard link on it -- %w", attempt+1, path, lastErr)
+			}
 			giveUp := fmt.Errorf("gave up after %d attempt(s) trying to get a stable lock on %s: the restart bound (lockOpenAttempts) was spent -- the file kept being replaced or removed out from under this process; if this persists, another process may be repeatedly recreating it; try again (%w)", attempt+1, path, lastErr)
 			// See lockTempSibling's own comment: a leftover <path>.tmp-* is a
 			// real, demonstrated cause of exactly this give-up (an earlier
 			// publish's temporary name outliving its own removal, or
 			// cleanup's os.RemoveAll(ConfigDir) racing this one), so name it
 			// rather than leave the user with only "try again" for advice
-			// that will not help.
+			// that will not help. Not checked in the hard-link branch above:
+			// that call's own cleanupTmp() already removed its temporary
+			// name before the reopen that observed the hard link, so there
+			// is structurally no sibling of THIS call's left to find there
+			// -- looking anyway would either always come up empty or, worse,
+			// name an unrelated leftover and imply it caused a problem it
+			// did not. %q, not %s: sib comes from a glob over ConfigDir,
+			// which this file's own comments already treat as
+			// attacker-writable, and this string reaches a terminal via
+			// cmd/kairos-lab/main.go's unfiltered error printing.
 			if sib := lockTempSibling(path); sib != "" {
-				giveUp = fmt.Errorf("%w -- found %s next to it, a leftover temporary file from an unfinished publish; removing that by hand is likely what clears this", giveUp, sib)
+				giveUp = fmt.Errorf("%w -- found %q next to it, a leftover temporary file from an unfinished publish; removing that by hand is likely what clears this", giveUp, sib)
 			}
 			return nil, giveUp
 		}
@@ -678,11 +736,24 @@ func acquireLockOnce(path string, deadline time.Time) (unlock func(), retry bool
 	}
 	if st.Nlink > 1 {
 		if reopened {
-			return nil, true, fmt.Errorf("lock file %s has %d hard links, want exactly 1: another kairos-lab process may be mid-publish (between its own link and its own removal of its temporary name) -- retrying", path, st.Nlink)
+			// Worded around errLockHardLinkAmbiguous rather than asserting a
+			// single cause: this branch genuinely cannot tell a concurrent
+			// kairos-lab process's own mid-publish apart from a persistent
+			// hard link on a single attempt (see errLockHardLinkAmbiguous's
+			// own comment, and lockOpenAttempts's case 4), so it names both,
+			// rather than stating the transient one as fact and then saying
+			// "retrying" -- whether this attempt actually gets to retry is
+			// acquireLock's call, made after the restart budget is checked,
+			// not a fact this line is in a position to promise.
+			return nil, true, fmt.Errorf("lock file %s has %d hard links, want exactly 1 (%w): could be another kairos-lab process still mid-publish (between its own link and its own removal of its temporary name), which clears on its own within a restart or two, or could be a real hard link left at this path, which does not -- if this keeps recurring, identify and remove the second link (find %s -samefile %s, or ls -li %s)", path, st.Nlink, errLockHardLinkAmbiguous, filepath.Dir(path), path, path)
 		}
 		refusal := fmt.Errorf("lock file %s has %d hard links, want exactly 1: refusing to lock a file that may alias another path", path, st.Nlink)
+		// %q, not %s: sib comes from a glob over ConfigDir, which this
+		// file's own comments already treat as attacker-writable, and this
+		// string reaches a terminal via cmd/kairos-lab/main.go's unfiltered
+		// error printing (see lockTempSibling's own comment).
 		if sib := lockTempSibling(path); sib != "" {
-			refusal = fmt.Errorf("%w -- found %s next to it, a leftover temporary file; removing that by hand is likely what clears this", refusal, sib)
+			refusal = fmt.Errorf("%w -- found %q next to it, a leftover temporary file; removing that by hand is likely what clears this", refusal, sib)
 		}
 		return nil, false, refusal
 	}
@@ -731,11 +802,18 @@ func acquireLockOnce(path string, deadline time.Time) (unlock func(), retry bool
 	// is the whole of what this check exists to catch.
 	//
 	// What this check is worth, stated as what was actually measured rather
-	// than in either direction overstated: acquireLockOnce itself never
-	// unlinks path any more (see the top of this function), so it is not
-	// itself a way for the name and the locked inode to come apart -- but it
-	// is not the only way that can happen, and this check does not close
-	// that off. It catches a replacement that lands BEFORE it runs --
+	// than in either direction overstated: on the ordinary route,
+	// acquireLockOnce never unlinks path (see the top of this function), so
+	// that route is not itself a way for the name and the locked inode to
+	// come apart. The link(2)-unsupported fallback is a narrow exception --
+	// it creates directly at path, and its own cleanup removes exactly that
+	// if its own chown then fails (see lockOpenAttempts's own comment for why
+	// that is near-unreachable in practice: the identical chown precondition
+	// already succeeded once, against the temporary file, earlier in this
+	// same call, on every route including this one) -- but neither route is
+	// the only way the name and inode can come apart either way, and this
+	// check does not close that off. It catches a replacement that lands
+	// BEFORE it runs --
 	// measured, that took the maximum number of simultaneous holders of the
 	// critical section in that case from 2 down to 1, a real fix -- and it
 	// catches nothing after: Update holds this lock for the whole
