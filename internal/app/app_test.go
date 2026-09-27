@@ -1954,82 +1954,133 @@ func TestStartStopsWhenPreparingSharedNetworkingFails(t *testing.T) {
 	}
 }
 
-// TestStartChecksFirmwareBeforePreparingLinuxSharedNetworking pins the
-// ordering that fixed kairos-io/kairos-lab#8's sharpest half: on a
-// linux/arm64 host with no EDK2 installed, `start -network shared` used to
-// prompt for sudo, let vm.PrepareLinuxShared build a NAT bridge and a tap --
-// setting st.Network.BridgeName, TapName, CleanupRequired and
+// TestStartChecksFirmwareBeforePreparingLinuxNetworking pins the ordering
+// that fixed kairos-io/kairos-lab#8's sharpest half: on a linux/arm64 host
+// with no EDK2 installed, `start -network shared` (and, on this host,
+// `-network bridged` just as much) used to prompt for sudo, let the mode's
+// own vm.PrepareLinuxShared / vm.PrepareLinuxBridge build a NAT bridge and a
+// tap -- setting st.Network.BridgeName, TapName, CleanupRequired and
 // CreatedByKairosLab in memory, on the *state.State this run loaded -- and
-// only THEN fail on the missing firmware, with store.Save(st) still two
-// hundred lines downstream and never reached. The host kept a privileged
-// bridge and tap that state.json had no record of, so neither `kairos-lab
-// reset` nor `kairos-lab cleanup` could find them to tear down.
+// only THEN fail on the missing firmware, with store.Save(st) still well
+// downstream and never reached. The host kept a privileged bridge and tap
+// that state.json had no record of, so neither `kairos-lab reset` nor
+// `kairos-lab cleanup` could find them to tear down.
 //
 // This is a trigger and not a new bug on its own: at 59c6949 the firmware
 // `return err` was gated on runtime.GOOS == "darwin", so it was unreachable
-// from the linux-gated prepare block below it. Making the check unconditional
-// put a Linux-reachable early return downstream of a Linux-only privileged
-// prepare.
+// from the linux-gated prepare blocks below it. Making the check
+// unconditional put a Linux-reachable early return downstream of two
+// Linux-only privileged prepares, not one -- which is why both modes are
+// driven through the same table below rather than only shared: the fix sits
+// above both branches, and a regression that moved the check back below only
+// one of them would otherwise show up in just the row nobody happened to be
+// looking at. (Demonstrated: gate the hoisted check on `*network !=
+// "bridged"` and restore an equivalent one just above buildQEMUCommand for
+// bridged, and the shared-only version of this test stayed green while the
+// bridged row here reddens -- see that row's own comment for the message.)
 //
 // firmwareHostPlatform is stubbed to a linux/arm64 host the real GOOS/GOARCH
 // pair on this CI runner is not (see TestFirmwarePathFor's comment on why
 // that seam exists at all), and linuxARM64Firmware is pointed at a path that
 // does not exist, so firmwarePathFor fails deterministically regardless of
 // what is actually installed on the machine running this suite. The
-// runtime.GOOS gate below is real and unstubbed, because the branch under
-// test -- both the firmware check and vm.PrepareLinuxShared -- only runs
-// there; on any other host this test has nothing to pin and skips, the same
-// as TestStartPreparesLinuxNetworkingWithTheRunsStateAndRuntimeDir does.
+// runtime.GOOS gate below is real and unstubbed, because the branches under
+// test -- the firmware check and both prepares -- only run there; on any
+// other host this test has nothing to pin and skips, the same as
+// TestStartPreparesLinuxNetworkingWithTheRunsStateAndRuntimeDir does.
 //
-// The error is checked for the remedy clause and not merely for "an error",
-// so this also stands in for the failure mode of swallowing it (biosPath, _
-// := firmwarePathFor(...)): with the error discarded, the run instead dies on
-// buildLinuxFor's own terse "missing qemu firmware path for arm64" one step
-// further down, and the remedy text a user needs to fix their host
-// (kairos-io/kairos#4858) is never shown.
-func TestStartChecksFirmwareBeforePreparingLinuxSharedNetworking(t *testing.T) {
+// Swallowing the error (biosPath, _ := firmwarePathFor(...)) also reddens
+// this, but by a route worth writing down, because the obvious guess is
+// wrong. It does NOT die on buildLinuxFor's arm64 message: only
+// firmwareHostPlatform is stubbed, while vm.BuildQEMUCommand's own arch
+// switch binds to the real runtime.GOARCH, so on the amd64 CI leg
+// buildLinuxFor never enters the arm64 case at all. It dies on "shared
+// linux mode requires tap name" instead, from the stubbed prepare leaving
+// TapName empty -- caught by the FIRST error-content check below, which
+// t.Fatalf's before the remedy-clause check is ever reached. So the swallow
+// is caught, but not by the assertion that looks like it would.
+func TestStartChecksFirmwareBeforePreparingLinuxNetworking(t *testing.T) {
 	if runtime.GOOS != "linux" {
-		t.Skipf("the NAT bridge and tap vm.PrepareLinuxShared builds are Linux-only, and so is the branch under test; on %s neither is reached", runtime.GOOS)
+		t.Skipf("the NAT bridge and tap vm.PrepareLinuxShared/vm.PrepareLinuxBridge build are Linux-only, and so is the branch under test; on %s neither is reached", runtime.GOOS)
 	}
-	t.Setenv("KAIROS_LAB_CONFIG_DIR", t.TempDir())
-	t.Setenv("KAIROS_LAB_CACHE_DIR", t.TempDir())
-	isolateFromHostBinaries(t)
-	seedStartableState(t, "kairos-disk0")
-	stubNetworkPrivilege(t, func(string) error { return nil })
 
-	savedPlatform := firmwareHostPlatform
-	t.Cleanup(func() { firmwareHostPlatform = savedPlatform })
-	firmwareHostPlatform = func() (string, string) { return "linux", "arm64" }
-
-	missingFirmware := filepath.Join(t.TempDir(), "no-such-firmware.fd")
-	savedFirmware := linuxARM64Firmware
-	t.Cleanup(func() { linuxARM64Firmware = savedFirmware })
-	linuxARM64Firmware = []string{missingFirmware}
-
-	calls := 0
-	stubPrepareLinuxShared(t, func(*state.State, string) error {
-		calls++
-		return nil
-	})
-
-	var stdout, stderr bytes.Buffer
-	err := Run([]string{"start", "-name", "kairos-disk0", "-no-iso", "-network", "shared", "-yes"},
-		strings.NewReader(""), &stdout, &stderr, "test")
-
-	if err == nil || !strings.Contains(err.Error(), "arm64 UEFI firmware not found") {
-		t.Fatalf("start returned %v, want linuxARM64FirmwarePath's error; stdout:\n%s", err, stdout.String())
+	cases := []struct {
+		mode        string
+		prepareName string
+		args        []string
+		stub        func(*testing.T, func(st *state.State, runtimeDir string) error)
+	}{
+		{
+			mode:        "shared",
+			prepareName: "prepareLinuxShared",
+			args:        []string{"-network", "shared"},
+			stub:        stubPrepareLinuxShared,
+		},
+		{
+			// bridged needs its own scaffolding shared does not: a candidate
+			// uplink, so resolveBridgeUplink's host probe (line 492) never
+			// runs, and -yes still covers this mode's own sudo prompt the
+			// same way it covers shared's.
+			mode:        "bridged",
+			prepareName: "prepareLinuxBridge",
+			args:        []string{"-network", "bridged"},
+			stub:        stubPrepareLinuxBridge,
+		},
 	}
-	if !strings.Contains(err.Error(), missingFirmware) {
-		t.Errorf("error %q does not name the missing candidate %q", err, missingFirmware)
-	}
-	if !strings.Contains(err.Error(), "qemu-efi-aarch64") {
-		t.Errorf("error %q lost the remedy clause naming the package to install -- swallowing the error (biosPath, _ := firmwarePathFor(...)) would fail this the same way, by dying later on buildLinuxFor's terser message instead", err)
-	}
-	if calls != 0 {
-		t.Fatalf("prepareLinuxShared ran %d times before the firmware check failed, want 0 -- the NAT bridge and tap it builds would be left on the host with nothing in state.json to name them, unreachable by reset or cleanup", calls)
-	}
-	if strings.Contains(stdout.String(), "[1/3] Preparing networking") {
-		t.Errorf("the run printed the networking step before the firmware check failed:\n%s", stdout.String())
+
+	for _, tc := range cases {
+		t.Run(tc.mode, func(t *testing.T) {
+			t.Setenv("KAIROS_LAB_CONFIG_DIR", t.TempDir())
+			t.Setenv("KAIROS_LAB_CACHE_DIR", t.TempDir())
+			isolateFromHostBinaries(t)
+			seedStartableState(t, "kairos-disk0")
+			stubNetworkPrivilege(t, func(string) error { return nil })
+			if tc.mode == "bridged" {
+				stubBridgeIfaceCandidates(t, "kairos-fake-uplink0")
+			}
+
+			savedPlatform := firmwareHostPlatform
+			t.Cleanup(func() { firmwareHostPlatform = savedPlatform })
+			firmwareHostPlatform = func() (string, string) { return "linux", "arm64" }
+
+			missingFirmware := filepath.Join(t.TempDir(), "no-such-firmware.fd")
+			savedFirmware := linuxARM64Firmware
+			t.Cleanup(func() { linuxARM64Firmware = savedFirmware })
+			linuxARM64Firmware = []string{missingFirmware}
+
+			calls := 0
+			tc.stub(t, func(*state.State, string) error {
+				calls++
+				return nil
+			})
+
+			var stdout, stderr bytes.Buffer
+			args := append([]string{"start", "-name", "kairos-disk0", "-no-iso"}, tc.args...)
+			args = append(args, "-yes")
+			err := Run(args, strings.NewReader(""), &stdout, &stderr, "test")
+
+			if err == nil || !strings.Contains(err.Error(), "arm64 UEFI firmware not found") {
+				t.Fatalf("start returned %v, want linuxARM64FirmwarePath's error; stdout:\n%s", err, stdout.String())
+			}
+			if !strings.Contains(err.Error(), missingFirmware) {
+				t.Errorf("error %q does not name the missing candidate %q", err, missingFirmware)
+			}
+			if !strings.Contains(err.Error(), "qemu-efi-aarch64") {
+				t.Errorf("error %q lost the remedy clause naming the package to install", err)
+			}
+			// This is the row that catches the ordering hole: gating the
+			// hoisted firmware check on `*network != "bridged"` and
+			// restoring an equivalent one just above buildQEMUCommand
+			// leaves prepareLinuxBridge free to run first, so this call
+			// count goes from 0 to 1 under that mutation while the shared
+			// row above stays green throughout.
+			if calls != 0 {
+				t.Fatalf("%s ran %d times before the firmware check failed, want 0 -- the NAT bridge and tap it builds would be left on the host with nothing in state.json to name them, unreachable by reset or cleanup", tc.prepareName, calls)
+			}
+			if strings.Contains(stdout.String(), "[1/3] Preparing networking") {
+				t.Errorf("the run printed the networking step before the firmware check failed:\n%s", stdout.String())
+			}
+		})
 	}
 }
 
@@ -2725,11 +2776,11 @@ func TestLinuxARM64FirmwarePathNamesTheCandidates(t *testing.T) {
 // an arm64 host: it calls the real, unstubbed firmwareHostPlatform and
 // checks it against runtime.GOOS/runtime.GOARCH directly.
 //
-// The sibling seams declared alongside it -- prepareLinuxBridge,
-// prepareLinuxShared, buildQEMUCommand -- are bare function values with no
-// body of their own (each is just `= vm.SomeFunc`), so there is nothing in
-// them for a mutation to hide in, and none of them needs a guard like this
-// one.
+// The sibling seams declared alongside it -- requireNetworkPrivilege,
+// prepareLinuxBridge, prepareLinuxShared, buildQEMUCommand -- are bare
+// function values with no body of their own (each is just `= vm.SomeFunc`),
+// so there is nothing in them for a mutation to hide in, and none of them
+// needs a guard like this one.
 func TestFirmwarePathFor(t *testing.T) {
 	if goos, goarch := firmwareHostPlatform(); goos != runtime.GOOS || goarch != runtime.GOARCH {
 		t.Errorf("firmwareHostPlatform() = (%q, %q), want the real host (%q, %q)", goos, goarch, runtime.GOOS, runtime.GOARCH)
