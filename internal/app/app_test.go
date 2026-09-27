@@ -1995,7 +1995,11 @@ func stubPrepareLinuxBridge(t *testing.T, prepare func(st *state.State, runtimeD
 // /usr/share/AAVMF and friends, and pass or fail by what happens to be
 // installed on the machine running the tests rather than by what the test
 // asserts.
-func stubLinuxARM64Firmware(t *testing.T) {
+//
+// It returns the path it wrote, for a caller that wants to assert the
+// resolver returned that exact file rather than only that it returned
+// without error. Most callers ignore the return value.
+func stubLinuxARM64Firmware(t *testing.T) string {
 	t.Helper()
 	path := filepath.Join(t.TempDir(), "QEMU_EFI.fd")
 	if err := os.WriteFile(path, []byte("firmware"), 0o644); err != nil {
@@ -2004,6 +2008,7 @@ func stubLinuxARM64Firmware(t *testing.T) {
 	saved := linuxARM64Firmware
 	t.Cleanup(func() { linuxARM64Firmware = saved })
 	linuxARM64Firmware = []string{path}
+	return path
 }
 
 // A bridged run consents to enslaving a named interface, even when the mode
@@ -2589,10 +2594,23 @@ func TestLinuxARM64FirmwarePathNamesTheCandidates(t *testing.T) {
 			t.Errorf("error %q should name candidate path %q", err, want)
 		}
 	}
+	// Anchored on the remedy clause alone, not the whole message: the message
+	// also contains strings.Join(linuxARM64Firmware, ", "), which already
+	// spells "aavmf" (from AAVMF_CODE.fd) and satisfies three of these five
+	// names by way of a PATH, not a package name -- so asserting against the
+	// full error lets the remedy clause be deleted outright and still pass.
+	// Splitting on " -- " isolates the tail that actually names packages; a
+	// message with no such split -- the remedy clause deleted outright --
+	// leaves remedy empty, which fails every one of the five checks below
+	// rather than short-circuiting on the first.
+	remedy := ""
+	if _, tail, ok := strings.Cut(err.Error(), " -- "); ok {
+		remedy = tail
+	}
 	wantPackages := []string{"qemu-efi-aarch64", "edk2-aarch64", "aavmf", "qemu-uefi-aarch64", "qemu-system-aarch64"}
 	for _, want := range wantPackages {
-		if !strings.Contains(err.Error(), want) {
-			t.Errorf("error %q should name package %q", err, want)
+		if !strings.Contains(remedy, want) {
+			t.Errorf("remedy clause %q should name package %q", remedy, want)
 		}
 	}
 }
@@ -2614,13 +2632,7 @@ func TestLinuxARM64FirmwarePathNamesTheCandidates(t *testing.T) {
 // non-darwin host returns "", nil without exercising anything -- that path
 // is covered by app_darwin_test.go, on the one leg that can run it for real.
 func TestFirmwarePathFor(t *testing.T) {
-	stubbedFirmware := filepath.Join(t.TempDir(), "QEMU_EFI.fd")
-	if err := os.WriteFile(stubbedFirmware, []byte("firmware"), 0o644); err != nil {
-		t.Fatalf("write fake firmware: %v", err)
-	}
-	saved := linuxARM64Firmware
-	t.Cleanup(func() { linuxARM64Firmware = saved })
-	linuxARM64Firmware = []string{stubbedFirmware}
+	stubbedFirmware := stubLinuxARM64Firmware(t)
 
 	cases := []struct {
 		name     string
@@ -2642,6 +2654,64 @@ func TestFirmwarePathFor(t *testing.T) {
 				t.Errorf("firmwarePathFor(%q, %q) = %q, want %q", tc.goos, tc.goarch, path, tc.wantPath)
 			}
 		})
+	}
+}
+
+// TestFirmwarePathFor above proves firmwarePathFor itself picks the right
+// branch. It does not prove runStart calls it, calls it with the arguments in
+// the right order, or still calls it at all rather than the pre-fix
+// macOSFirmwarePath() -- and internal/vm's buildLinuxFor("amd64", ...) drops
+// cfg.BiosPath before it becomes a QEMU argument, so no assertion against the
+// built command line can tell those three failures apart from a correct run,
+// on the one CI leg (amd64) that runs this whole package.
+//
+// This test closes that gap by stubbing every seam the wiring goes through:
+// firmwareHostPlatform reports a linux/arm64 host that this test host is
+// not, linuxARM64Firmware is stubbed to a temp file only that reported host
+// would resolve, and buildQEMUCommand captures the vm.StartConfig runStart
+// actually built instead of one this test constructed by hand. If runStart
+// stopped calling firmwarePathFor (biosPath := ""), or called it with goos
+// and goarch swapped, or reverted to calling macOSFirmwarePath() directly --
+// the literal code this whole branch exists to replace, and which happens to
+// return the right answer on darwin and an empty one on every other GOOS --
+// this fails on every leg, macOS included, because firmwareHostPlatform is
+// what says which branch to expect here regardless of the real host.
+func TestStartResolvesLinuxARM64FirmwareForTheHostFirmwareHostPlatformReports(t *testing.T) {
+	t.Setenv("KAIROS_LAB_CONFIG_DIR", t.TempDir())
+	t.Setenv("KAIROS_LAB_CACHE_DIR", t.TempDir())
+	isolateFromHostBinaries(t)
+	stubbedFirmware := stubLinuxARM64Firmware(t)
+	seedStartableState(t, "kairos-disk0")
+	stubNetworkPrivilege(t, func(string) error { return nil })
+
+	savedPlatform := firmwareHostPlatform
+	t.Cleanup(func() { firmwareHostPlatform = savedPlatform })
+	firmwareHostPlatform = func() (string, string) { return "linux", "arm64" }
+
+	var captured vm.StartConfig
+	savedBuild := buildQEMUCommand
+	t.Cleanup(func() { buildQEMUCommand = savedBuild })
+	buildQEMUCommand = func(cfg vm.StartConfig) (string, []string, error) {
+		captured = cfg
+		return savedBuild(cfg)
+	}
+
+	// user mode needs no uplink, no bridge/tap prepare and no sudo consent,
+	// so nothing about networking is in the way of the one thing under test.
+	var stdout, stderr bytes.Buffer
+	err := Run([]string{"start", "-name", "kairos-disk0", "-no-iso", "-network", "user", "-yes"},
+		strings.NewReader(""), &stdout, &stderr, "test")
+	// The state is written and buildQEMUCommand has already run by
+	// "[2/3] Recording VM state", one step before the launch that PATH
+	// isolation makes fail -- the same point TestStartRecordsTheUplinkThePrepareUsed
+	// stops at, and for the same reason.
+	if err == nil || !strings.Contains(err.Error(), "start qemu") {
+		t.Fatalf("start returned %v, want it to have recorded the VM and then failed to launch it; stdout:\n%s", err, stdout.String())
+	}
+
+	if captured.BiosPath != stubbedFirmware {
+		t.Errorf("runStart built vm.StartConfig with BiosPath %q, want %q -- the firmware firmwarePathFor(firmwareHostPlatform()) resolves for the host firmwareHostPlatform reports",
+			captured.BiosPath, stubbedFirmware)
 	}
 }
 

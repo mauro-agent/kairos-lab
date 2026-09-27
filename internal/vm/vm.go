@@ -196,11 +196,12 @@ func buildLinuxFor(goarch string, cfg StartConfig) (string, []string, error) {
 		args = append(args, "-enable-kvm", "-cpu", "host")
 	case "arm64":
 		// 1. qemu-system-aarch64 has no default machine: leaving out -machine
-		// exits with "No machine specified, and there is no default", which is
-		// system/vl.c's find_default_machine() finding nothing to fall back
-		// to, before QEMU ever reads the ISO. -bios is a separate requirement,
-		// not a partner in that same failure: a command line with -machine but
-		// no -bios starts and runs -- it just boots nothing, because the virt
+		// exits with "No machine specified, and there is no default", which
+		// is system/vl.c's select_machine() emitting that message once its
+		// call to find_default_machine() comes back NULL, before QEMU ever
+		// reads the ISO. -bios is a separate requirement, not a partner in
+		// that same failure: a command line with -machine but no -bios
+		// starts and runs -- it just boots nothing, because the virt
 		// machine's flash is empty (kairos-io/kairos#4858).
 		//
 		// 2. -enable-kvm and -cpu host are coupled here, not optional extras:

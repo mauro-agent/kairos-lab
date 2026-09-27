@@ -329,6 +329,33 @@ var prepareLinuxBridge = vm.PrepareLinuxBridge
 // rule behind on it. Standing in for it is the way to reach the call at all.
 var prepareLinuxShared = vm.PrepareLinuxShared
 
+// buildQEMUCommand is vm.BuildQEMUCommand behind the same kind of seam, and
+// it is here for what it lets a test see rather than for what it lets a test
+// avoid: the real function is safe to call on every CI leg. What is not safe
+// -- or even possible -- is reading BiosPath back out of it afterwards.
+// internal/vm's own buildLinuxFor("amd64", ...) drops the field on the floor
+// before it becomes a QEMU argument, because amd64's default machine already
+// carries SeaBIOS, so the built command line looks identical whether
+// firmwarePathFor resolved a real path or was never reached at all. Capturing
+// the vm.StartConfig runStart built, at the call site and before
+// BuildQEMUCommand has a chance to discard any of it, is the only way the
+// amd64 CI leg can tell those two runs apart.
+var buildQEMUCommand = vm.BuildQEMUCommand
+
+// firmwareHostPlatform is runtime.GOOS/runtime.GOARCH behind a narrow seam
+// that exists for one call below and nowhere else in this function: the
+// network-mode resolution, vmnetNeedsSudo and every other read of the real
+// host in runStart have to keep reading it, because disguising the host from
+// those would be testing a run that could never happen -- a "linux" network
+// decision sitting beside a "darwin" sudo prompt. The one decision that does
+// need disguising is this one: firmwarePathFor's linux/arm64 branch is
+// unreachable from an amd64 CI host through the real runtime.GOOS/GOARCH,
+// which is the exact branch that shipped broken once already (see
+// firmwarePathFor's own comment). This seam is what lets a test drive
+// runStart end-to-end as though it were running on that host, for this one
+// decision alone.
+var firmwareHostPlatform = func() (string, string) { return runtime.GOOS, runtime.GOARCH }
+
 func runStart(args []string, stdin io.Reader, stdout, stderr io.Writer, store *state.Store) error {
 	fs := flag.NewFlagSet("start", flag.ContinueOnError)
 	isoPath := fs.String("iso", "", "path to ISO file")
@@ -740,14 +767,14 @@ func runStart(args []string, stdin io.Reader, stdout, stderr io.Writer, store *s
 		macAddress = vm.MACForDisk(disk.Name)
 	}
 
-	biosPath, err := firmwarePathFor(runtime.GOOS, runtime.GOARCH)
+	biosPath, err := firmwarePathFor(firmwareHostPlatform())
 	if err != nil {
 		return err
 	}
 	// Use short names for socket (Unix socket path limit is ~108 chars)
 	qgaSock := filepath.Join(runtimeDir, "qemu.sock")
 	logPath := filepath.Join(runtimeDir, "qemu.log")
-	binary, qemuArgs, err := vm.BuildQEMUCommand(vm.StartConfig{
+	binary, qemuArgs, err := buildQEMUCommand(vm.StartConfig{
 		ISOPath:       isoLocal,
 		DiskPath:      disk.Path,
 		QGASocketPath: qgaSock,
@@ -2467,21 +2494,29 @@ func defaultBridgeIface() string {
 // [FD.QEMU_VARS], a separate flash device every packager ships as its own file
 // beside the code image (Alpine's QEMU_VARS.fd, Debian's and Arch's
 // AAVMF_VARS.fd / QEMU_VARS.fd, openSUSE's aavmf-aarch64-vars.bin). Entries
-// 1-4 and 6 are all the same code-only build output: Arch's entry 6 is a
-// symlink to its own entry 3, and Debian's entry 6 is entry 2's image
-// truncated to a larger pflash size -- padding is what differs, not
-// code-vs-code+vars.
+// 1-4 and 6 are all code-only build output; none of them is ever the
+// combined image. Where entry 6 duplicates another entry, that duplication is
+// sometimes only padding -- Arch's entry 6 is a symlink to its own entry 3,
+// and Debian's entry 6 is entry 2's image truncated to a larger pflash size --
+// but not always: Fedora's edk2.spec symlinks entry 6 to a build produced
+// under edk2-build.fedora's [build.armvirt.aa64.silent] section, which sets a
+// different DEBUG_PRINT_ERROR_LEVEL from the [build.armvirt.aa64.verbose]
+// section that produces entry 3, so on Fedora (and CentOS/RHEL, which inherit
+// the same spec -- %files aarch64 carries no %if fedora guard) entry 6 is a
+// different EDK2 build, not a resize of entry 3. code-vs-code+vars is still
+// the one distinction that never happens; padding-vs-different-build is not
+// pinned the same way across every distribution that ships entry 6.
 //
 // What the order actually buys is smaller: each distribution reaches its own
 // -bios-intended image first -- Alpine at entry 1, Debian/Ubuntu at entry 2,
 // Fedora/CentOS/RHEL/Arch at entry 3, openSUSE at entry 4. Entry 5 catches a
 // host with no firmware PACKAGE at all: an upstream-built QEMU, or an Alpine
 // host with qemu-system-aarch64 but no aavmf. Entry 6 is belt-and-braces on
-// the four distributions that ship it -- Alpine, Debian/Ubuntu, Fedora and
-// Arch; openSUSE ships no /usr/share/AAVMF/ at all -- and unreachable in
-// practice, because each of those four's own package already matched an
-// earlier entry first. Position barely matters beyond that: every entry here
-// boots under plain -bios regardless of where it sits in the list.
+// the distributions that ship it -- Alpine, Debian/Ubuntu, Fedora/CentOS/RHEL
+// and Arch; openSUSE ships no /usr/share/AAVMF/ at all -- and unreachable in
+// practice, because each of those already matched an earlier entry first.
+// Position barely matters beyond that: every entry here boots under plain
+// -bios regardless of where it sits in the list.
 //
 // Entry 1 is Alpine's alone, not Debian's, despite the path's name. Debian and
 // Ubuntu's qemu-efi-aarch64 package puts QEMU_EFI.fd under
@@ -2489,16 +2524,20 @@ func defaultBridgeIface() string {
 // AAVMF_CODE.fd / AAVMF_VARS.fd pair under /usr/share/AAVMF/; Alpine's aavmf
 // package is the one that puts QEMU_EFI.fd there.
 //
-// Entry 5 has no FIRMWARE package behind it: Debian and openSUSE both strip
-// QEMU's bundled edk2-*.fd out of their own packaging, and Fedora and Arch
-// never shipped it at all. It does have a distribution package behind it on
-// Alpine, though -- qemu-system-aarch64 carries it directly, because QEMU's
-// own pc-bios/meson.build installs edk2-aarch64-code.fd into QEMU's data
-// directory and nothing there strips it. Without this entry, a user running an
-// upstream-built QEMU -- or an Alpine user who installed the emulator but
-// never pulled in aavmf -- has working firmware sitting on disk and is told
-// none exists. It is also the same file macOSFirmwarePath resolves below, just
-// under the Linux path QEMU installs it to instead of a Homebrew prefix.
+// Entry 5 has no firmware package behind it on any distribution: QEMU's own
+// pc-bios/meson.build installs edk2-aarch64-code.fd as part of the emulator
+// package itself, not aavmf, qemu-efi-aarch64, edk2-aarch64 or
+// qemu-uefi-aarch64, so wherever this exact file is on disk it got there
+// through the emulator's own package rather than a firmware one. That is why
+// it survives on Alpine, where qemu-system-aarch64 carries the file directly
+// and nothing strips it, and why it is absent everywhere else, for two
+// different reasons: Debian and openSUSE strip QEMU's bundled edk2-*.fd out
+// of their own packaging, and Fedora and Arch do not ship it. Without this
+// entry, a user running an upstream-built QEMU -- or an Alpine user who
+// installed the emulator but never pulled in aavmf -- has working firmware
+// sitting on disk and is told none exists. It is also the same file
+// macOSFirmwarePath resolves below, just under the Linux path QEMU installs
+// it to instead of a Homebrew prefix.
 var linuxARM64Firmware = []string{
 	"/usr/share/AAVMF/QEMU_EFI.fd",            // apk: aavmf
 	"/usr/share/qemu-efi-aarch64/QEMU_EFI.fd", // apt: qemu-efi-aarch64
@@ -2569,9 +2608,13 @@ func macOSFirmwarePath() (string, error) {
 // runStart used to switch on runtime.GOOS/runtime.GOARCH inline, so the
 // linux/arm64 case was invisible to the amd64 CI leg that runs every test in
 // this package -- deleting that case entirely left the whole suite green.
-// Routing the selection through this pure function is what lets a table test
-// put the linux/arm64 case under test without needing an arm64 host to run
-// on, so the same deletion now fails a test instead of passing unnoticed.
+// Routing the selection through this function is what lets a table test put
+// the linux/arm64 case under test without needing an arm64 host to run on,
+// so the same deletion now fails a test instead of passing unnoticed. It is
+// not itself pure -- it calls linuxARM64FirmwarePath, which os.Stats absolute
+// paths, and macOSFirmwarePath, which forks brew and stats what that prints
+// -- so the same (goos, goarch) pair can answer differently on different
+// hosts; only buildLinuxFor in internal/vm/vm_test.go earns that word.
 func firmwarePathFor(goos, goarch string) (string, error) {
 	switch {
 	case goos == "darwin":
