@@ -4,13 +4,14 @@
 // This file MUST stay untagged. The tests in vm_test.go that need a Linux
 // host guard on a runtime GOOS check rather than a build tag, which invites
 // "tidying" the pair into //go:build linux -- and the moment a constraint
-// lands on this file the
-// macOS leg fails to compile with "undefined: testMACAddress" in a file whose
-// author never opened it. The rest of vm_test.go deliberately carries no skip
-// at all: the arch-parameterised builders are pure, so those tests are meant
-// to run on the macOS leg too, and tagging this file would silence them. Nothing on a linux host notices: only
-// `GOOS=darwin GOARCH=arm64 go vet ./internal/vm/` compiles vm_darwin_test.go,
-// since `go build` does not read _test.go files at all.
+// lands on this file the macOS leg fails to compile with "undefined:
+// testMACAddress" in a file whose author never opened it. The rest of
+// vm_test.go deliberately carries no skip at all: the arch-parameterised
+// builders, the non-parameterised buildLinux wrapper around them, and
+// netDeviceArg are all pure, so those tests are meant to run on the macOS leg
+// too, and tagging this file would silence them. Nothing on a linux host
+// notices: only `GOOS=darwin GOARCH=arm64 go vet ./internal/vm/` compiles
+// vm_darwin_test.go, since `go build` does not read _test.go files at all.
 package vm
 
 import (

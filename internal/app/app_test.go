@@ -2518,20 +2518,30 @@ func TestStartDerivesADifferentMACForADifferentDisk(t *testing.T) {
 
 // The firmware search has to accept the first candidate that is a real file,
 // and ignore a directory that happens to carry the same name.
+//
+// firstReal sits before present and is itself a real file, so the two real
+// candidates disagree about which one a last-wins bug would return. Without
+// it {missing, asDir, present} carries exactly one real file, and a mutation
+// that assigned inside the loop and returned after it -- last real file wins,
+// not first -- would still return present and this test would not notice.
 func TestFirstExistingFile(t *testing.T) {
 	dir := t.TempDir()
 	missing := filepath.Join(dir, "absent.fd")
 	asDir := filepath.Join(dir, "as-dir.fd")
+	firstReal := filepath.Join(dir, "first-real.fd")
 	present := filepath.Join(dir, "present.fd")
 	if err := os.Mkdir(asDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(firstReal, []byte("firmware"), 0o644); err != nil {
 		t.Fatal(err)
 	}
 	if err := os.WriteFile(present, []byte("firmware"), 0o644); err != nil {
 		t.Fatal(err)
 	}
 
-	if got := firstExistingFile([]string{missing, asDir, present}); got != present {
-		t.Errorf("got %q, want %q", got, present)
+	if got := firstExistingFile([]string{missing, asDir, firstReal, present}); got != firstReal {
+		t.Errorf("got %q, want %q (the first real file, not the last)", got, firstReal)
 	}
 	if got := firstExistingFile([]string{missing}); got != "" {
 		t.Errorf("got %q, want an empty path", got)
@@ -2544,6 +2554,20 @@ func TestFirstExistingFile(t *testing.T) {
 // This test does not stub linuxARM64Firmware: it is exercising the real list,
 // so a host that genuinely has firmware installed has nothing wrong to
 // report and is skipped rather than failed.
+//
+// Every candidate path and every package name is required, not just one of
+// each: a message asserted against with "contains at least one of" passes
+// even after the list is truncated to a single bogus path, or the package
+// parenthetical is shrunk to one name -- both silently drop information a
+// user needs to fix their host, and neither used to fail this test.
+//
+// The wanted paths are literals here, not linuxARM64Firmware itself. The
+// error text is built from strings.Join(linuxARM64Firmware, ", "), so
+// iterating that same slice to check the message is near-tautological: it
+// can only fail if the %s verb is dropped, and a truncated or corrupted
+// linuxARM64Firmware would still "pass" against itself. Literals catch that
+// -- if the production list stops naming one of these paths, this fails
+// regardless of what the list was mutated to.
 func TestLinuxARM64FirmwarePathNamesTheCandidates(t *testing.T) {
 	if firstExistingFile(linuxARM64Firmware) != "" {
 		t.Skip("this host has arm64 firmware installed")
@@ -2552,25 +2576,72 @@ func TestLinuxARM64FirmwarePathNamesTheCandidates(t *testing.T) {
 	if err == nil {
 		t.Fatal("expected an error when no firmware is installed")
 	}
-	foundPath := false
-	for _, want := range linuxARM64Firmware {
-		if strings.Contains(err.Error(), want) {
-			foundPath = true
-			break
+	wantPaths := []string{
+		"/usr/share/AAVMF/QEMU_EFI.fd",
+		"/usr/share/qemu-efi-aarch64/QEMU_EFI.fd",
+		"/usr/share/edk2/aarch64/QEMU_EFI.fd",
+		"/usr/share/qemu/qemu-uefi-aarch64.bin",
+		"/usr/share/qemu/edk2-aarch64-code.fd",
+		"/usr/share/AAVMF/AAVMF_CODE.fd",
+	}
+	for _, want := range wantPaths {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("error %q should name candidate path %q", err, want)
 		}
 	}
-	if !foundPath {
-		t.Errorf("error %q should name at least one candidate path", err)
-	}
-	foundPackage := false
-	for _, want := range []string{"qemu-efi-aarch64", "edk2-aarch64", "aavmf", "qemu-uefi-aarch64"} {
-		if strings.Contains(err.Error(), want) {
-			foundPackage = true
-			break
+	wantPackages := []string{"qemu-efi-aarch64", "edk2-aarch64", "aavmf", "qemu-uefi-aarch64", "qemu-system-aarch64"}
+	for _, want := range wantPackages {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("error %q should name package %q", err, want)
 		}
 	}
-	if !foundPackage {
-		t.Errorf("error %q should name at least one package", err)
+}
+
+// firmwarePathFor is the seam that makes runStart's linux/arm64 firmware
+// branch reachable from an amd64 test host: it takes goos and goarch as
+// plain arguments instead of reading runtime.GOOS/runtime.GOARCH itself,
+// the same shape buildLinuxFor uses in internal/vm for the same reason.
+//
+// This is the regression test for the failure mode that shipped once
+// already: runStart used to switch on runtime.GOOS/runtime.GOARCH inline, so
+// the linux/arm64 case it added was invisible to the amd64 CI leg that runs
+// every test in this package -- deleting that case left `go test ./...`
+// fully green. Table-testing firmwarePathFor directly is what makes that
+// deletion fail here regardless of which host runs the suite.
+//
+// No ("darwin", ...) row: macOSFirmwarePath self-guards on the real
+// runtime.GOOS rather than on the goos argument, so a darwin row run on a
+// non-darwin host returns "", nil without exercising anything -- that path
+// is covered by app_darwin_test.go, on the one leg that can run it for real.
+func TestFirmwarePathFor(t *testing.T) {
+	stubbedFirmware := filepath.Join(t.TempDir(), "QEMU_EFI.fd")
+	if err := os.WriteFile(stubbedFirmware, []byte("firmware"), 0o644); err != nil {
+		t.Fatalf("write fake firmware: %v", err)
+	}
+	saved := linuxARM64Firmware
+	t.Cleanup(func() { linuxARM64Firmware = saved })
+	linuxARM64Firmware = []string{stubbedFirmware}
+
+	cases := []struct {
+		name     string
+		goos     string
+		goarch   string
+		wantPath string
+	}{
+		{name: "linux/arm64 resolves the stubbed firmware", goos: "linux", goarch: "arm64", wantPath: stubbedFirmware},
+		{name: "linux/amd64 needs no firmware", goos: "linux", goarch: "amd64", wantPath: ""},
+		{name: "an OS this tool builds no firmware lookup for", goos: "windows", goarch: "amd64", wantPath: ""},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			path, err := firmwarePathFor(tc.goos, tc.goarch)
+			if err != nil {
+				t.Fatalf("firmwarePathFor(%q, %q) error = %v, want nil", tc.goos, tc.goarch, err)
+			}
+			if path != tc.wantPath {
+				t.Errorf("firmwarePathFor(%q, %q) = %q, want %q", tc.goos, tc.goarch, path, tc.wantPath)
+			}
+		})
 	}
 }
 
