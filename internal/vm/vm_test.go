@@ -303,10 +303,10 @@ func TestBuildLinuxBindsToTheHostArchitecture(t *testing.T) {
 	if !slices.Equal(gotArgs, wantArgs) {
 		t.Errorf("buildLinux args = %v, want %v (buildLinuxFor(runtime.GOARCH, cfg))", gotArgs, wantArgs)
 	}
-	if (gotErr == nil) != (wantErr == nil) {
-		t.Errorf("buildLinux err = %v, want %v", gotErr, wantErr)
-	} else if gotErr != nil && gotErr.Error() != wantErr.Error() {
-		t.Errorf("buildLinux err = %q, want %q", gotErr, wantErr)
+	// wantErr is nil past the Fatalf above, so this is the whole comparison:
+	// buildLinux must not fail where buildLinuxFor(runtime.GOARCH) succeeded.
+	if gotErr != nil {
+		t.Errorf("buildLinux err = %v, want nil (buildLinuxFor(runtime.GOARCH, cfg) succeeded)", gotErr)
 	}
 }
 
