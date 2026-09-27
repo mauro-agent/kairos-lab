@@ -1954,6 +1954,85 @@ func TestStartStopsWhenPreparingSharedNetworkingFails(t *testing.T) {
 	}
 }
 
+// TestStartChecksFirmwareBeforePreparingLinuxSharedNetworking pins the
+// ordering that fixed kairos-io/kairos-lab#8's sharpest half: on a
+// linux/arm64 host with no EDK2 installed, `start -network shared` used to
+// prompt for sudo, let vm.PrepareLinuxShared build a NAT bridge and a tap --
+// setting st.Network.BridgeName, TapName, CleanupRequired and
+// CreatedByKairosLab in memory, on the *state.State this run loaded -- and
+// only THEN fail on the missing firmware, with store.Save(st) still two
+// hundred lines downstream and never reached. The host kept a privileged
+// bridge and tap that state.json had no record of, so neither `kairos-lab
+// reset` nor `kairos-lab cleanup` could find them to tear down.
+//
+// This is a trigger and not a new bug on its own: at 59c6949 the firmware
+// `return err` was gated on runtime.GOOS == "darwin", so it was unreachable
+// from the linux-gated prepare block below it. Making the check unconditional
+// put a Linux-reachable early return downstream of a Linux-only privileged
+// prepare.
+//
+// firmwareHostPlatform is stubbed to a linux/arm64 host the real GOOS/GOARCH
+// pair on this CI runner is not (see TestFirmwarePathFor's comment on why
+// that seam exists at all), and linuxARM64Firmware is pointed at a path that
+// does not exist, so firmwarePathFor fails deterministically regardless of
+// what is actually installed on the machine running this suite. The
+// runtime.GOOS gate below is real and unstubbed, because the branch under
+// test -- both the firmware check and vm.PrepareLinuxShared -- only runs
+// there; on any other host this test has nothing to pin and skips, the same
+// as TestStartPreparesLinuxNetworkingWithTheRunsStateAndRuntimeDir does.
+//
+// The error is checked for the remedy clause and not merely for "an error",
+// so this also stands in for the failure mode of swallowing it (biosPath, _
+// := firmwarePathFor(...)): with the error discarded, the run instead dies on
+// buildLinuxFor's own terse "missing qemu firmware path for arm64" one step
+// further down, and the remedy text a user needs to fix their host
+// (kairos-io/kairos#4858) is never shown.
+func TestStartChecksFirmwareBeforePreparingLinuxSharedNetworking(t *testing.T) {
+	if runtime.GOOS != "linux" {
+		t.Skipf("the NAT bridge and tap vm.PrepareLinuxShared builds are Linux-only, and so is the branch under test; on %s neither is reached", runtime.GOOS)
+	}
+	t.Setenv("KAIROS_LAB_CONFIG_DIR", t.TempDir())
+	t.Setenv("KAIROS_LAB_CACHE_DIR", t.TempDir())
+	isolateFromHostBinaries(t)
+	seedStartableState(t, "kairos-disk0")
+	stubNetworkPrivilege(t, func(string) error { return nil })
+
+	savedPlatform := firmwareHostPlatform
+	t.Cleanup(func() { firmwareHostPlatform = savedPlatform })
+	firmwareHostPlatform = func() (string, string) { return "linux", "arm64" }
+
+	missingFirmware := filepath.Join(t.TempDir(), "no-such-firmware.fd")
+	savedFirmware := linuxARM64Firmware
+	t.Cleanup(func() { linuxARM64Firmware = savedFirmware })
+	linuxARM64Firmware = []string{missingFirmware}
+
+	calls := 0
+	stubPrepareLinuxShared(t, func(*state.State, string) error {
+		calls++
+		return nil
+	})
+
+	var stdout, stderr bytes.Buffer
+	err := Run([]string{"start", "-name", "kairos-disk0", "-no-iso", "-network", "shared", "-yes"},
+		strings.NewReader(""), &stdout, &stderr, "test")
+
+	if err == nil || !strings.Contains(err.Error(), "arm64 UEFI firmware not found") {
+		t.Fatalf("start returned %v, want linuxARM64FirmwarePath's error; stdout:\n%s", err, stdout.String())
+	}
+	if !strings.Contains(err.Error(), missingFirmware) {
+		t.Errorf("error %q does not name the missing candidate %q", err, missingFirmware)
+	}
+	if !strings.Contains(err.Error(), "qemu-efi-aarch64") {
+		t.Errorf("error %q lost the remedy clause naming the package to install -- swallowing the error (biosPath, _ := firmwarePathFor(...)) would fail this the same way, by dying later on buildLinuxFor's terser message instead", err)
+	}
+	if calls != 0 {
+		t.Fatalf("prepareLinuxShared ran %d times before the firmware check failed, want 0 -- the NAT bridge and tap it builds would be left on the host with nothing in state.json to name them, unreachable by reset or cleanup", calls)
+	}
+	if strings.Contains(stdout.String(), "[1/3] Preparing networking") {
+		t.Errorf("the run printed the networking step before the firmware check failed:\n%s", stdout.String())
+	}
+}
+
 // stubBridgeIfaceCandidates answers the uplink probe with a fixed list for
 // the duration of one test.
 //
@@ -2631,7 +2710,30 @@ func TestLinuxARM64FirmwarePathNamesTheCandidates(t *testing.T) {
 // runtime.GOOS rather than on the goos argument, so a darwin row run on a
 // non-darwin host returns "", nil without exercising anything -- that path
 // is covered by app_darwin_test.go, on the one leg that can run it for real.
+//
+// Before any of that: firmwareHostPlatform's default body -- `return
+// runtime.GOOS, runtime.GOARCH` -- is executed by no test in this file.
+// Every test that touches the seam, including the table below, replaces the
+// whole var with a stub, so the real closure never runs under test. Mutate
+// its body to `return runtime.GOARCH, runtime.GOOS` and go test ./... stays
+// green throughout, because nothing here calls the unstubbed var. Left
+// undetected, that mutation is not hypothetical: on a real linux/arm64 host
+// it produces firmwarePathFor("arm64", "linux"), which falls into the
+// default: arm and returns "", nil -- the exact regression this branch
+// exists to fix, reproduced one level down inside the seam built to prevent
+// it. This is the guard for that, and it runs on every leg without needing
+// an arm64 host: it calls the real, unstubbed firmwareHostPlatform and
+// checks it against runtime.GOOS/runtime.GOARCH directly.
+//
+// The sibling seams declared alongside it -- prepareLinuxBridge,
+// prepareLinuxShared, buildQEMUCommand -- are bare function values with no
+// body of their own (each is just `= vm.SomeFunc`), so there is nothing in
+// them for a mutation to hide in, and none of them needs a guard like this
+// one.
 func TestFirmwarePathFor(t *testing.T) {
+	if goos, goarch := firmwareHostPlatform(); goos != runtime.GOOS || goarch != runtime.GOARCH {
+		t.Errorf("firmwareHostPlatform() = (%q, %q), want the real host (%q, %q)", goos, goarch, runtime.GOOS, runtime.GOARCH)
+	}
 	stubbedFirmware := stubLinuxARM64Firmware(t)
 
 	cases := []struct {
@@ -2677,6 +2779,16 @@ func TestFirmwarePathFor(t *testing.T) {
 // this fails on every leg, macOS included, because firmwareHostPlatform is
 // what says which branch to expect here regardless of the real host.
 func TestStartResolvesLinuxARM64FirmwareForTheHostFirmwareHostPlatformReports(t *testing.T) {
+	if runtime.GOOS == "darwin" && runtime.GOARCH != "arm64" {
+		// The comment above says this fails on every leg, macOS included --
+		// true of the failure it is guarding against, but not of an Intel
+		// Mac: there, vm.BuildQEMUCommand routes on the real (unstubbed)
+		// runtime.GOOS to buildMacOS, whose first statement refuses on
+		// anything but arm64, before the launch that PATH isolation is what
+		// is meant to make fail. See TestStartLaunchesVmnetSharedUnderSudo
+		// in app_darwin_test.go for the same guard on the same mechanism.
+		t.Skipf("macOS support is Apple Silicon only; on darwin/%s buildMacOS refuses before the launch is reached", runtime.GOARCH)
+	}
 	t.Setenv("KAIROS_LAB_CONFIG_DIR", t.TempDir())
 	t.Setenv("KAIROS_LAB_CACHE_DIR", t.TempDir())
 	isolateFromHostBinaries(t)

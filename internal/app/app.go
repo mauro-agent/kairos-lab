@@ -332,14 +332,17 @@ var prepareLinuxShared = vm.PrepareLinuxShared
 // buildQEMUCommand is vm.BuildQEMUCommand behind the same kind of seam, and
 // it is here for what it lets a test see rather than for what it lets a test
 // avoid: the real function is safe to call on every CI leg. What is not safe
-// -- or even possible -- is reading BiosPath back out of it afterwards.
-// internal/vm's own buildLinuxFor("amd64", ...) drops the field on the floor
-// before it becomes a QEMU argument, because amd64's default machine already
-// carries SeaBIOS, so the built command line looks identical whether
-// firmwarePathFor resolved a real path or was never reached at all. Capturing
-// the vm.StartConfig runStart built, at the call site and before
+// -- or even possible, on the amd64 leg -- is reading BiosPath back out of it
+// afterwards. internal/vm's own buildLinuxFor("amd64", ...) drops the field
+// on the floor before it becomes a QEMU argument, because amd64's default
+// machine already carries SeaBIOS, so the built command line looks identical
+// whether firmwarePathFor resolved a real path or was never reached at all.
+// Capturing the vm.StartConfig runStart built, at the call site and before
 // BuildQEMUCommand has a chance to discard any of it, is the only way the
-// amd64 CI leg can tell those two runs apart.
+// amd64 CI leg can tell those two runs apart. (On macos-latest it is
+// possible without this seam: buildMacOS emits "-bios", cfg.BiosPath
+// directly, and app_darwin_test.go reads it back off the built command line
+// with valueAfterArg.)
 var buildQEMUCommand = vm.BuildQEMUCommand
 
 // firmwareHostPlatform is runtime.GOOS/runtime.GOARCH behind a narrow seam
@@ -568,6 +571,28 @@ func runStart(args []string, stdin io.Reader, stdout, stderr io.Writer, store *s
 		return err
 	}
 
+	// Resolved here, and not down by buildQEMUCommand where it used to sit,
+	// because it is a precondition with no dependencies: firmwarePathFor
+	// takes nothing but the (goos, goarch) pair firmwareHostPlatform reports,
+	// so nothing computed between here and the old call site changes its
+	// answer, and there is no reason to let anything privileged or
+	// expensive happen first. The old spot sat after the shared- and
+	// bridged-mode blocks below, which prompt for sudo and then have
+	// vm.PrepareLinuxShared / vm.PrepareLinuxBridge build a NAT bridge and a
+	// tap on the host -- in memory only, on the *st passed in, with
+	// store.Save(st) still two hundred lines downstream. A linux/arm64 host
+	// missing EDK2 would sudo its way to a bridge and tap and only then hit
+	// this error, leaving both on the host with nothing in state.json to
+	// name them, so neither `kairos-lab reset` nor `kairos-lab cleanup` could
+	// find them to tear them down. Checking it here, before either prepare
+	// runs and before the disk is even materialized, is the same reasoning
+	// requireNetworkPrivilege above already applies to the network mode
+	// itself: refuse before anything the refusal would have to leave behind.
+	biosPath, err := firmwarePathFor(firmwareHostPlatform())
+	if err != nil {
+		return err
+	}
+
 	// Materialize disk — done after review so the config is final.
 	if isNewDisk {
 		// Validate the final disk path stays within vmDir before touching the filesystem.
@@ -767,10 +792,6 @@ func runStart(args []string, stdin io.Reader, stdout, stderr io.Writer, store *s
 		macAddress = vm.MACForDisk(disk.Name)
 	}
 
-	biosPath, err := firmwarePathFor(firmwareHostPlatform())
-	if err != nil {
-		return err
-	}
 	// Use short names for socket (Unix socket path limit is ~108 chars)
 	qgaSock := filepath.Join(runtimeDir, "qemu.sock")
 	logPath := filepath.Join(runtimeDir, "qemu.log")
@@ -2614,7 +2635,8 @@ func macOSFirmwarePath() (string, error) {
 // not itself pure -- it calls linuxARM64FirmwarePath, which os.Stats absolute
 // paths, and macOSFirmwarePath, which forks brew and stats what that prints
 // -- so the same (goos, goarch) pair can answer differently on different
-// hosts; only buildLinuxFor in internal/vm/vm_test.go earns that word.
+// hosts, unlike buildLinuxFor (internal/vm/vm.go), which internal/vm's own
+// vm_test.go calls pure for exactly that property.
 func firmwarePathFor(goos, goarch string) (string, error) {
 	switch {
 	case goos == "darwin":
