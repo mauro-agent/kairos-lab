@@ -211,10 +211,11 @@ func buildLinuxFor(goarch string, cfg StartConfig) (string, []string, error) {
 		//
 		// 3. The macOS sibling folds its accelerator into
 		// "-machine virt,accel=hvf,highmem=on" (see buildMacOS) instead of a
-		// separate flag. The two are equivalent: -enable-kvm is shorthand for
-		// accel=kvm merged into the same machine-options dict, and
-		// "virt,gic-version=max" here sets no accel key of its own, so the
-		// later -machine does not clear the one -enable-kvm set.
+		// separate flag. The two accelerator spellings are equivalent:
+		// -enable-kvm is shorthand for accel=kvm merged into the same
+		// machine-options dict, and "virt,gic-version=max" here sets no accel
+		// key of its own, so the later -machine does not clear the one
+		// -enable-kvm set.
 		if cfg.BiosPath == "" {
 			return "", nil, fmt.Errorf("missing qemu firmware path for arm64")
 		}

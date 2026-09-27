@@ -2,6 +2,7 @@ package vm
 
 import (
 	"runtime"
+	"slices"
 	"strings"
 	"testing"
 )
@@ -264,13 +265,48 @@ func TestBuildLinuxPadsStrippedMAC(t *testing.T) {
 	}
 }
 
+// buildLinux itself -- the one line that binds the pure buildLinuxFor to the
+// host's own runtime.GOARCH -- used to be asserted by nothing: every test in
+// this file calls buildLinuxFor directly with an explicit arch, so a
+// hardcoded binding (e.g. always "amd64") left the suite green while an
+// arm64 host silently lost -machine and -bios again, exactly the 59c6949
+// regression this file otherwise guards against. No runtime.GOOS/GOARCH skip
+// is needed: cfg is chosen to succeed on either arch, since arm64 now
+// requires a non-empty BiosPath that amd64 simply ignores.
+func TestBuildLinuxBindsToTheHostArchitecture(t *testing.T) {
+	if runtime.GOOS != "linux" {
+		t.Skip("linux-only test")
+	}
+	cfg := StartConfig{
+		DiskPath:      "/tmp/kairos.qcow2",
+		QGASocketPath: "/tmp/kairos.sock",
+		CPUs:          2,
+		MemoryMB:      4096,
+		NetworkMode:   "user",
+		BiosPath:      "/usr/share/AAVMF/QEMU_EFI.fd",
+	}
+	wantBinary, wantArgs, wantErr := buildLinuxFor(runtime.GOARCH, cfg)
+	gotBinary, gotArgs, gotErr := buildLinux(cfg)
+	if gotBinary != wantBinary {
+		t.Errorf("buildLinux binary = %q, want %q (buildLinuxFor(runtime.GOARCH, cfg))", gotBinary, wantBinary)
+	}
+	if !slices.Equal(gotArgs, wantArgs) {
+		t.Errorf("buildLinux args = %v, want %v (buildLinuxFor(runtime.GOARCH, cfg))", gotArgs, wantArgs)
+	}
+	if (gotErr == nil) != (wantErr == nil) {
+		t.Errorf("buildLinux err = %v, want %v", gotErr, wantErr)
+	} else if gotErr != nil && gotErr.Error() != wantErr.Error() {
+		t.Errorf("buildLinux err = %q, want %q", gotErr, wantErr)
+	}
+}
+
 // qemu-system-aarch64 has no default machine, so the arm64 command line the
 // tool used to build died with "No machine specified" before it ever read the
 // ISO (kairos-io/kairos#4858). No runtime.GOOS/GOARCH skip: buildLinuxFor is
 // pure, so this runs on every host, including the amd64 CI leg.
 func TestBuildLinuxARM64SuppliesMachineAcceleratorAndFirmware(t *testing.T) {
 	const firmware = "/usr/share/AAVMF/QEMU_EFI.fd"
-	_, args, err := buildLinuxFor("arm64", StartConfig{
+	binary, args, err := buildLinuxFor("arm64", StartConfig{
 		ISOPath:     "/tmp/kairos.iso",
 		DiskPath:    "/tmp/kairos.qcow2",
 		CPUs:        2,
@@ -280,6 +316,12 @@ func TestBuildLinuxARM64SuppliesMachineAcceleratorAndFirmware(t *testing.T) {
 	})
 	if err != nil {
 		t.Fatal(err)
+	}
+	// The arm64 binary selection used to be uncoupled from every existing
+	// arm64 test, both of which discarded this return value: an arm64 host
+	// would have launched qemu-system-x86_64 with no test noticing.
+	if binary != "qemu-system-aarch64" {
+		t.Errorf("arm64 binary = %q, want qemu-system-aarch64", binary)
 	}
 	joined := strings.Join(args, " ")
 	for _, want := range []string{
@@ -321,11 +363,19 @@ func TestBuildLinuxAMD64KeepsTheDefaultMachine(t *testing.T) {
 // Without firmware the guest boots to a blank screen, so refuse to build the
 // command at all -- the same refusal buildMacOS already makes.
 func TestBuildLinuxARM64RejectsAnEmptyFirmwarePath(t *testing.T) {
+	// ISOPath, QGASocketPath and MACAddress are all set here so that only
+	// BiosPath is left at its zero value. Leaving every optional field blank
+	// let this test pass even when the production guard checked cfg.ISOPath
+	// instead of cfg.BiosPath -- same error text, wrong field -- because
+	// ISOPath being empty too tripped that wrong guard just as well.
 	binary, args, err := buildLinuxFor("arm64", StartConfig{
-		DiskPath:    "/tmp/kairos.qcow2",
-		CPUs:        2,
-		MemoryMB:    4096,
-		NetworkMode: "user",
+		ISOPath:       "/tmp/kairos.iso",
+		DiskPath:      "/tmp/kairos.qcow2",
+		QGASocketPath: "/tmp/kairos.sock",
+		CPUs:          2,
+		MemoryMB:      4096,
+		NetworkMode:   "user",
+		MACAddress:    testMACAddress,
 	})
 	if err == nil {
 		t.Fatalf("expected an error, got %s %v", binary, args)
