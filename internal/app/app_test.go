@@ -641,6 +641,7 @@ func TestRunningLineIsInertForAStoredDiskPath(t *testing.T) {
 	t.Setenv("KAIROS_LAB_CONFIG_DIR", t.TempDir())
 	t.Setenv("KAIROS_LAB_CACHE_DIR", t.TempDir())
 	isolateFromHostBinaries(t)
+	stubLinuxARM64Firmware(t)
 	store, err := state.DefaultStore()
 	if err != nil {
 		t.Fatalf("DefaultStore: %v", err)
@@ -1811,6 +1812,7 @@ func TestStartPreparesLinuxNetworkingWithTheRunsStateAndRuntimeDir(t *testing.T)
 			t.Setenv("KAIROS_LAB_CONFIG_DIR", t.TempDir())
 			t.Setenv("KAIROS_LAB_CACHE_DIR", cacheDir)
 			isolateFromHostBinaries(t)
+			stubLinuxARM64Firmware(t)
 			seedStartableState(t, "kairos-disk0")
 			stubNetworkPrivilege(t, func(string) error { return nil })
 
@@ -1981,6 +1983,29 @@ func stubPrepareLinuxBridge(t *testing.T, prepare func(st *state.State, runtimeD
 	prepareLinuxBridge = prepare
 }
 
+// stubLinuxARM64Firmware points linuxARM64Firmware at a file this test wrote
+// itself, for the duration of the test.
+//
+// linuxARM64FirmwarePath stats absolute /usr/share/... paths, which is host
+// state that neither isolateFromHostBinaries nor fakeQEMUOnPath's PATH
+// isolation can reach: those change what a child process resolves a bare
+// command name to, not what os.Stat finds at a path this file never composed
+// from PATH. A run on the linux/arm64 leg of this suite -- or any leg with
+// this branch forced on for a manual check -- would otherwise stat the real
+// /usr/share/AAVMF and friends, and pass or fail by what happens to be
+// installed on the machine running the tests rather than by what the test
+// asserts.
+func stubLinuxARM64Firmware(t *testing.T) {
+	t.Helper()
+	path := filepath.Join(t.TempDir(), "QEMU_EFI.fd")
+	if err := os.WriteFile(path, []byte("firmware"), 0o644); err != nil {
+		t.Fatalf("write fake firmware: %v", err)
+	}
+	saved := linuxARM64Firmware
+	t.Cleanup(func() { linuxARM64Firmware = saved })
+	linuxARM64Firmware = []string{path}
+}
+
 // A bridged run consents to enslaving a named interface, even when the mode
 // was chosen inside the config review rather than on the command line.
 //
@@ -2078,6 +2103,7 @@ func TestStartRecordsTheUplinkThePrepareUsed(t *testing.T) {
 	t.Setenv("KAIROS_LAB_CONFIG_DIR", t.TempDir())
 	t.Setenv("KAIROS_LAB_CACHE_DIR", t.TempDir())
 	isolateFromHostBinaries(t)
+	stubLinuxARM64Firmware(t)
 	seedStartableState(t, "kairos-disk0")
 	stubNetworkPrivilege(t, func(string) error { return nil })
 	stubBridgeIfaceCandidates(t, "kairos-fake-uplink0")
@@ -2287,6 +2313,7 @@ func TestStartRecordsNoUplinkForAModeThatAttachesToNone(t *testing.T) {
 	t.Setenv("KAIROS_LAB_CONFIG_DIR", t.TempDir())
 	t.Setenv("KAIROS_LAB_CACHE_DIR", t.TempDir())
 	isolateFromHostBinaries(t)
+	stubLinuxARM64Firmware(t)
 	seedStartableState(t, "kairos-disk0")
 
 	var stdout, stderr bytes.Buffer
@@ -2352,6 +2379,7 @@ func TestStartGivesEachDiskItsOwnStickyMAC(t *testing.T) {
 			t.Setenv("KAIROS_LAB_CONFIG_DIR", t.TempDir())
 			t.Setenv("KAIROS_LAB_CACHE_DIR", t.TempDir())
 			isolateFromHostBinaries(t)
+			stubLinuxARM64Firmware(t)
 			seedStartableState(t, diskName)
 			if tt.seedMAC != "" {
 				store, err := state.DefaultStore()
@@ -2420,6 +2448,7 @@ func TestStartDerivesTheMACFromTheRenamedDisk(t *testing.T) {
 	t.Setenv("KAIROS_LAB_CONFIG_DIR", t.TempDir())
 	t.Setenv("KAIROS_LAB_CACHE_DIR", t.TempDir())
 	onlyFakeQemuImgOnPath(t)
+	stubLinuxARM64Firmware(t)
 	seedStartableState(t, "kairos-disk0")
 	stubNetworkPrivilege(t, func(string) error { return nil })
 
@@ -2484,6 +2513,64 @@ func onlyFakeQemuImgOnPath(t *testing.T) {
 func TestStartDerivesADifferentMACForADifferentDisk(t *testing.T) {
 	if vm.MACForDisk("kairos-disk0") == vm.MACForDisk("kairos-disk1") {
 		t.Fatal("two disk names derive the same address, so per-disk addressing buys nothing")
+	}
+}
+
+// The firmware search has to accept the first candidate that is a real file,
+// and ignore a directory that happens to carry the same name.
+func TestFirstExistingFile(t *testing.T) {
+	dir := t.TempDir()
+	missing := filepath.Join(dir, "absent.fd")
+	asDir := filepath.Join(dir, "as-dir.fd")
+	present := filepath.Join(dir, "present.fd")
+	if err := os.Mkdir(asDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(present, []byte("firmware"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	if got := firstExistingFile([]string{missing, asDir, present}); got != present {
+		t.Errorf("got %q, want %q", got, present)
+	}
+	if got := firstExistingFile([]string{missing}); got != "" {
+		t.Errorf("got %q, want an empty path", got)
+	}
+}
+
+// An arm64 guest boots nothing without EDK2, so the failure has to say which
+// package supplies it (kairos-io/kairos#4858).
+//
+// This test does not stub linuxARM64Firmware: it is exercising the real list,
+// so a host that genuinely has firmware installed has nothing wrong to
+// report and is skipped rather than failed.
+func TestLinuxARM64FirmwarePathNamesTheCandidates(t *testing.T) {
+	if firstExistingFile(linuxARM64Firmware) != "" {
+		t.Skip("this host has arm64 firmware installed")
+	}
+	_, err := linuxARM64FirmwarePath()
+	if err == nil {
+		t.Fatal("expected an error when no firmware is installed")
+	}
+	foundPath := false
+	for _, want := range linuxARM64Firmware {
+		if strings.Contains(err.Error(), want) {
+			foundPath = true
+			break
+		}
+	}
+	if !foundPath {
+		t.Errorf("error %q should name at least one candidate path", err)
+	}
+	foundPackage := false
+	for _, want := range []string{"qemu-efi-aarch64", "edk2-aarch64", "aavmf", "qemu-uefi-aarch64"} {
+		if strings.Contains(err.Error(), want) {
+			foundPackage = true
+			break
+		}
+	}
+	if !foundPackage {
+		t.Errorf("error %q should name at least one package", err)
 	}
 }
 
@@ -3311,6 +3398,7 @@ func TestStartInUserModeSaysWhereTheVMIsAndClearsTheOldAddress(t *testing.T) {
 	t.Setenv("KAIROS_LAB_CONFIG_DIR", t.TempDir())
 	t.Setenv("KAIROS_LAB_CACHE_DIR", t.TempDir())
 	fakeQEMUOnPath(t)
+	stubLinuxARM64Firmware(t)
 	seedStartableState(t, diskName)
 
 	store, err := state.DefaultStore()
@@ -3731,6 +3819,7 @@ func TestStartResolvesTheAddressBesideTheVMAndLeavesItForStatus(t *testing.T) {
 	t.Setenv("KAIROS_LAB_CONFIG_DIR", t.TempDir())
 	t.Setenv("KAIROS_LAB_CACHE_DIR", t.TempDir())
 	fakeQEMUOnPath(t)
+	stubLinuxARM64Firmware(t)
 	seedStartableState(t, diskName)
 	stubNetworkPrivilege(t, func(string) error { return nil })
 	stubBridgeIfaceCandidates(t, "kairos-fake-uplink0")
@@ -4005,6 +4094,7 @@ func startableBridgedRun(t *testing.T, diskName string) *state.Store {
 	t.Setenv("KAIROS_LAB_CONFIG_DIR", t.TempDir())
 	t.Setenv("KAIROS_LAB_CACHE_DIR", t.TempDir())
 	fakeQEMUOnPath(t)
+	stubLinuxARM64Firmware(t)
 	seedStartableState(t, diskName)
 	stubNetworkPrivilege(t, func(string) error { return nil })
 	stubBridgeIfaceCandidates(t, "kairos-fake-uplink0")
