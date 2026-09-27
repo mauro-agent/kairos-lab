@@ -12,7 +12,7 @@ import (
 	"time"
 )
 
-const SchemaVersion = 1
+const SchemaVersion = 2
 
 type Platform struct {
 	OS             string `json:"os"`
@@ -56,7 +56,42 @@ type Disk struct {
 	MAC string `json:"mac,omitempty"`
 }
 
+// VM is one VM record. Up to and including SchemaVersion 1 there was exactly
+// one of these per State (the VM field below, now LegacyVM); SchemaVersion 2
+// moves to a list, in State.VMs, so the tool can eventually track more than
+// one VM at a time. Every field below that predates the list keeps its exact
+// name and JSON tag, so a v1 VM object decodes into this struct unchanged --
+// migrateLegacyVM is what carries it into the list.
 type VM struct {
+	// Name identifies this VM among the others in State.VMs. It is the disk
+	// name the VM boots from: that is already unique among disks (state.json
+	// has no second place two disks could share a name), and a VM has at most
+	// one disk attached for its whole life, so no separate identifier is
+	// needed. FindVM, UpsertVM and RemoveVM all key on this field.
+	Name string `json:"name,omitempty"`
+	// Slot is this VM's position in a small fixed range (0..MaxSlot) used to
+	// derive per-VM resources that collide if two VMs share one -- a tap
+	// device name, a forwarded port -- without recomputing them from the name
+	// on every restart. AllocateVMSlot hands out a new one; a VM already in
+	// the list keeps the slot it was allocated, forever, which is why
+	// AllocateVMSlot is documented as being for new entries only.
+	Slot int `json:"slot,omitempty"`
+	// NetworkMode and TapName are this VM's own copies of what used to be
+	// process-wide fields on State.Network. State.Network is not removed in
+	// this milestone -- the single VM this tool still runs at a time keeps
+	// writing it, and every reader keeps reading it -- but a second VM would
+	// need its own tap and its own mode, so the per-VM copies are added here
+	// now rather than threaded through later.
+	NetworkMode string `json:"network_mode,omitempty"`
+	TapName     string `json:"tap_name,omitempty"`
+	// SSHPort and WebPort are the host-side ports a future per-VM port
+	// forwarding scheme assigns from Slot, so that two VMs in "user" network
+	// mode do not both claim the same forwarded port. Nothing in this
+	// milestone allocates them; the fields exist so the schema does not need
+	// a second migration when that lands.
+	SSHPort int `json:"ssh_port,omitempty"`
+	WebPort int `json:"web_port,omitempty"`
+
 	ISOSource   string   `json:"iso_source,omitempty"`
 	ISOInput    string   `json:"iso_input,omitempty"`
 	ISOLocal    string   `json:"iso_local_path,omitempty"`
@@ -74,12 +109,45 @@ type VM struct {
 	IPAddress   string   `json:"ip_address,omitempty"`
 }
 
+// MaxSlot bounds VM.Slot: slots run 0..MaxSlot inclusive, which is where the
+// bound belongs -- at the point a slot is read back out of state.json, not
+// derived from anything a slot happens to feed into later.
+//
+// It is deliberately not derived from maxInterfaceNameLen (15, in
+// internal/vm/network_shared_parse.go) by way of the tap name's length: a tap
+// is named "kairoslab-tap<slot>", and a negative slot renders its own sign
+// into that name. Measured against the 15-byte rule: "kairoslab-tap-1" and
+// "kairoslab-tap-9" are both 15 bytes and pass it, while "kairoslab-tap-12"
+// is 16 and does not. So the length rule rejects a slot of 100 and a slot of
+// -12 -- but only by accident of digit count, and it accepts every slot from
+// -1 to -9. A rule that lets -1 through is not a bound on the slot. The
+// length check downstream is a second line of defence; ValidateSlot is what
+// actually excludes a negative or oversized slot, at the one place every
+// slot is read.
+const MaxSlot = 99
+
+// ValidateSlot refuses a slot outside 0..MaxSlot. Every reader of a VM.Slot
+// that came out of state.json -- a file the user can hand-edit -- should call
+// this before deriving a tap name, a port or anything else keyed on it.
+func ValidateSlot(slot int) error {
+	if slot < 0 || slot > MaxSlot {
+		return fmt.Errorf("invalid vm slot %d: must be between 0 and %d", slot, MaxSlot)
+	}
+	return nil
+}
+
 type State struct {
-	Version      int      `json:"version"`
-	Platform     Platform `json:"platform"`
-	Setup        Setup    `json:"setup"`
-	Network      Network  `json:"network"`
-	VM           VM       `json:"vm"`
+	Version  int      `json:"version"`
+	Platform Platform `json:"platform"`
+	Setup    Setup    `json:"setup"`
+	Network  Network  `json:"network"`
+	// LegacyVM is the pre-SchemaVersion-2 single-VM field, kept only so Load
+	// can decode a v1 file and migrate it into VMs below. Nothing after Load
+	// returns should read or write it: Load always clears it to nil before
+	// handing the state back, migrated or not, so every other reader of a
+	// State only ever sees VMs.
+	LegacyVM     *VM      `json:"vm,omitempty"`
+	VMs          []VM     `json:"vms,omitempty"`
 	Disks        []Disk   `json:"disks,omitempty"`
 	ManagedDirs  []string `json:"managed_dirs,omitempty"`
 	ManagedFiles []string `json:"managed_files,omitempty"`
@@ -89,6 +157,12 @@ type Store struct {
 	ConfigDir string
 	CacheDir  string
 	StatePath string
+	// LockPath is the cross-process lock file Update acquires around a
+	// Load/mutate/Save cycle. It defaults to state.lock beside StatePath (see
+	// DefaultStore), but Store is exported with exported fields and tests
+	// build one by hand, so Update falls back to ConfigDir/state.lock when
+	// this is left empty rather than requiring every caller to set it.
+	LockPath string
 }
 
 func DefaultStore() (*Store, error) {
@@ -114,6 +188,7 @@ func DefaultStore() (*Store, error) {
 		ConfigDir: cfgDir,
 		CacheDir:  cacheDir,
 		StatePath: filepath.Join(cfgDir, "state.json"),
+		LockPath:  filepath.Join(cfgDir, "state.lock"),
 	}, nil
 }
 
@@ -138,9 +213,43 @@ func (s *Store) Load() (*State, error) {
 	if st.Version == 0 {
 		st.Version = SchemaVersion
 	}
+	// A version newer than this binary understands is refused rather than
+	// loaded. Without this check the bump to SchemaVersion is inert: an older
+	// binary reading a file a newer one wrote sees no "vm" key at all (v2
+	// dropped it for "vms"), silently concludes nothing is running, and
+	// starts a second VM over what may still be a live bridge and tap. A
+	// refusal that names both versions at least tells the user why, and points
+	// at the file to look at.
+	if st.Version > SchemaVersion {
+		return nil, fmt.Errorf("state file %s has schema version %d, which is newer than the %d this build understands: upgrade kairos-lab before using it against this config directory", s.StatePath, st.Version, SchemaVersion)
+	}
+	migrateLegacyVM(&st)
 	st.ManagedDirs = uniqueSorted(append(st.ManagedDirs, s.ConfigDir, s.CacheDir))
 	st.ManagedFiles = uniqueSorted(st.ManagedFiles)
 	return &st, nil
+}
+
+// migrateLegacyVM carries a SchemaVersion-1 single VM record (State.LegacyVM,
+// decoded off the "vm" key) into State.VMs, and always clears LegacyVM
+// afterwards so nothing written from here on ever has a "vm" key again.
+//
+// The clear is unconditional, not only on the branch that actually migrates
+// something. Every state.json ever written before this milestone carries a
+// "vm" key, because the old VM field had no omitempty: a setup-only file (no
+// VM ever started) decodes it as an empty VM{}, which is not migrated -- an
+// empty record with no DiskName is not a VM that ever ran -- but the key must
+// still stop appearing once this file is saved again, or every setup-only
+// state.json in the wild would carry a dead "vm": {} forever.
+func migrateLegacyVM(st *State) {
+	if len(st.VMs) == 0 && st.LegacyVM != nil && st.LegacyVM.DiskName != "" {
+		migrated := *st.LegacyVM
+		migrated.Name = st.LegacyVM.DiskName
+		migrated.Slot = 0
+		migrated.TapName = st.Network.TapName
+		migrated.NetworkMode = st.Network.Mode
+		st.VMs = append(st.VMs, migrated)
+	}
+	st.LegacyVM = nil
 }
 
 // Save publishes st at s.StatePath, by writing a complete temporary file
@@ -372,6 +481,101 @@ func RemoveDisk(st *State, name string) {
 		}
 	}
 	st.Disks = out
+}
+
+// FindVM returns a pointer into st.VMs for the entry named name, or nil when
+// no such entry exists. The pointer is into the slice's own backing array, so
+// writes through it are writes to st -- the same pattern FindDiskByName
+// already uses for disks.
+func FindVM(st *State, name string) *VM {
+	for i := range st.VMs {
+		if st.VMs[i].Name == name {
+			return &st.VMs[i]
+		}
+	}
+	return nil
+}
+
+// UpsertVM replaces the entry named v.Name if one exists, or appends v
+// otherwise.
+func UpsertVM(st *State, v VM) {
+	for i := range st.VMs {
+		if st.VMs[i].Name == v.Name {
+			st.VMs[i] = v
+			return
+		}
+	}
+	st.VMs = append(st.VMs, v)
+}
+
+// RemoveVM deletes the entry named name, if any.
+func RemoveVM(st *State, name string) {
+	out := make([]VM, 0, len(st.VMs))
+	for _, v := range st.VMs {
+		if v.Name != name {
+			out = append(out, v)
+		}
+	}
+	st.VMs = out
+}
+
+// AllocateVMSlot returns the lowest slot in 0..MaxSlot that is neither used by
+// an existing entry in st.VMs nor rejected by free, or an error when every
+// slot in the range is unavailable. A nil free treats every unused slot as
+// available.
+//
+// This allocates a slot for a NEW VM entry only. A VM already found by FindVM
+// must keep the Slot it was recorded with, never call AllocateVMSlot for it:
+// the slot is what a tap name and a forwarded port are derived from, so
+// reallocating it on every restart would move a still-referenced VM onto a
+// fresh tap and strand the old one -- still on the host, no longer named by
+// anything in state.json, and invisible to reset and cleanup.
+func AllocateVMSlot(st *State, free func(int) bool) (int, error) {
+	used := make(map[int]bool, len(st.VMs))
+	for _, v := range st.VMs {
+		used[v.Slot] = true
+	}
+	for slot := 0; slot <= MaxSlot; slot++ {
+		if used[slot] {
+			continue
+		}
+		if free != nil && !free(slot) {
+			continue
+		}
+		return slot, nil
+	}
+	return 0, fmt.Errorf("no free vm slot in 0..%d", MaxSlot)
+}
+
+// VMOrZero is transition-only API, to be deleted in M3 once every call site
+// addresses a specific VM by name instead of assuming there is only one.
+//
+// It returns st.VMs[0], or the zero VM when the list is empty, and exists so
+// read sites that used to say st.VM.X can say VMOrZero(st).X against the new
+// list-shaped state without yet threading a name through. It must not be used
+// for anything that writes back to st -- a copy is returned, not a pointer --
+// which is what MutableVM is for.
+func VMOrZero(st *State) VM {
+	if len(st.VMs) == 0 {
+		return VM{}
+	}
+	return st.VMs[0]
+}
+
+// MutableVM is transition-only API, to be deleted in M3 once every call site
+// addresses a specific VM by name instead of assuming there is only one.
+//
+// It returns a pointer to st.VMs[0], appending one empty record first if the
+// list is empty, so a write site that used to say st.VM.X = v can say
+// MutableVM(st).X = v against the new list-shaped state. The append is what
+// makes it safe to call before anything is known about the VM being started;
+// runStart's own bookkeeping is what later gives that first record a Name and
+// a Slot.
+func MutableVM(st *State) *VM {
+	if len(st.VMs) == 0 {
+		st.VMs = append(st.VMs, VM{})
+	}
+	return &st.VMs[0]
 }
 
 func IsSetupComplete(st *State) bool {

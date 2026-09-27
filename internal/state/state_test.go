@@ -69,7 +69,7 @@ func TestSaveLoadRoundTripKeepsMACAndIP(t *testing.T) {
 		Size:      "60G",
 		MAC:       "52:54:00:ab:cd:ef",
 	})
-	st.VM.IPAddress = "192.168.64.7"
+	MutableVM(st).IPAddress = "192.168.64.7"
 	if err := store.Save(st); err != nil {
 		t.Fatal(err)
 	}
@@ -84,8 +84,8 @@ func TestSaveLoadRoundTripKeepsMACAndIP(t *testing.T) {
 	if disk.MAC != "52:54:00:ab:cd:ef" {
 		t.Errorf("disk MAC = %q, want 52:54:00:ab:cd:ef", disk.MAC)
 	}
-	if loaded.VM.IPAddress != "192.168.64.7" {
-		t.Errorf("vm IP address = %q, want 192.168.64.7", loaded.VM.IPAddress)
+	if VMOrZero(loaded).IPAddress != "192.168.64.7" {
+		t.Errorf("vm IP address = %q, want 192.168.64.7", VMOrZero(loaded).IPAddress)
 	}
 }
 
@@ -118,8 +118,8 @@ func TestLoadStateWrittenBeforeMACField(t *testing.T) {
 	if disk.MAC != "" {
 		t.Errorf("disk MAC = %q, want empty for a pre-MAC state file", disk.MAC)
 	}
-	if st.VM.IPAddress != "" {
-		t.Errorf("vm IP address = %q, want empty for a pre-MAC state file", st.VM.IPAddress)
+	if VMOrZero(st).IPAddress != "" {
+		t.Errorf("vm IP address = %q, want empty for a pre-MAC state file", VMOrZero(st).IPAddress)
 	}
 }
 
@@ -158,7 +158,7 @@ func TestStateJSONKeysForMACAndIP(t *testing.T) {
 	}
 
 	st.Disks[0].MAC = "52:54:00:ab:cd:ef"
-	st.VM.IPAddress = "192.168.64.7"
+	MutableVM(st).IPAddress = "192.168.64.7"
 	if err := store.Save(st); err != nil {
 		t.Fatal(err)
 	}
@@ -230,7 +230,7 @@ func TestSaveFailureLeavesPreviousStateIntact(t *testing.T) {
 	}
 	st := NewState(store)
 	st.Platform.OS = "linux"
-	st.VM.IPAddress = "192.168.64.7"
+	MutableVM(st).IPAddress = "192.168.64.7"
 	if err := store.Save(st); err != nil {
 		t.Fatal(err)
 	}
@@ -241,7 +241,7 @@ func TestSaveFailureLeavesPreviousStateIntact(t *testing.T) {
 
 	sealDir(t, filepath.Dir(store.StatePath))
 	st.Platform.OS = "darwin"
-	st.VM.IPAddress = "10.0.0.1"
+	MutableVM(st).IPAddress = "10.0.0.1"
 	if err := store.Save(st); err == nil {
 		t.Fatal("saving into a directory that cannot be written should fail")
 	}
@@ -257,8 +257,8 @@ func TestSaveFailureLeavesPreviousStateIntact(t *testing.T) {
 	if err != nil {
 		t.Fatalf("the previous state file should still parse: %v", err)
 	}
-	if loaded.Platform.OS != "linux" || loaded.VM.IPAddress != "192.168.64.7" {
-		t.Errorf("previous state changed: os = %q, ip = %q", loaded.Platform.OS, loaded.VM.IPAddress)
+	if loaded.Platform.OS != "linux" || VMOrZero(loaded).IPAddress != "192.168.64.7" {
+		t.Errorf("previous state changed: os = %q, ip = %q", loaded.Platform.OS, VMOrZero(loaded).IPAddress)
 	}
 }
 
@@ -406,7 +406,7 @@ func TestSavePreservesExistingStateFileMode(t *testing.T) {
 				t.Fatal(err)
 			}
 
-			st.VM.IPAddress = "192.168.64.7"
+			MutableVM(st).IPAddress = "192.168.64.7"
 			if err := store.Save(st); err != nil {
 				t.Fatal(err)
 			}
@@ -421,8 +421,8 @@ func TestSavePreservesExistingStateFileMode(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			if loaded.VM.IPAddress != "192.168.64.7" {
-				t.Errorf("vm IP address = %q, want 192.168.64.7", loaded.VM.IPAddress)
+			if VMOrZero(loaded).IPAddress != "192.168.64.7" {
+				t.Errorf("vm IP address = %q, want 192.168.64.7", VMOrZero(loaded).IPAddress)
 			}
 		})
 	}
@@ -458,7 +458,7 @@ func TestConcurrentSaveAndLoad(t *testing.T) {
 		defer wg.Done()
 		for i := 0; i < saves; i++ {
 			st := NewState(store)
-			st.VM.LastError = strings.Repeat("x", i*8)
+			MutableVM(st).LastError = strings.Repeat("x", i*8)
 			if err := store.Save(st); err != nil {
 				saveErrs <- err
 				return
@@ -483,5 +483,321 @@ func TestConcurrentSaveAndLoad(t *testing.T) {
 	}
 	for err := range loadErrs {
 		t.Errorf("concurrent load could not read the state file: %v", err)
+	}
+}
+
+// --- SchemaVersion 2: the VM list, its migration and its helpers ----------
+
+// TestLoadMigratesLegacyVMIntoVMs is the ordinary case the migration exists
+// for: a v1 file with a populated "vm" object, written by any build before
+// this one, has to keep meaning what it meant -- exactly one VM, the one
+// named by disk_name -- once read by a build that understands "vms" instead.
+func TestLoadMigratesLegacyVMIntoVMs(t *testing.T) {
+	t.Setenv("KAIROS_LAB_CONFIG_DIR", t.TempDir())
+	t.Setenv("KAIROS_LAB_CACHE_DIR", t.TempDir())
+	store, err := DefaultStore()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(store.ConfigDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	legacy := `{"version":1,"network":{"mode":"shared","tap_name":"kairoslab-tap0"},"vm":{"disk_name":"kairos-disk0","pid":1234,"ip_address":"192.168.64.7"}}`
+	if err := os.WriteFile(store.StatePath, []byte(legacy), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	st, err := store.Load()
+	if err != nil {
+		t.Fatalf("loading a v1 file with a populated vm object should succeed: %v", err)
+	}
+	if len(st.VMs) != 1 {
+		t.Fatalf("VMs after migration = %+v, want exactly one entry", st.VMs)
+	}
+	got := st.VMs[0]
+	if got.Name != "kairos-disk0" {
+		t.Errorf("migrated VM Name = %q, want %q (the old disk_name)", got.Name, "kairos-disk0")
+	}
+	if got.Slot != 0 {
+		t.Errorf("migrated VM Slot = %d, want 0", got.Slot)
+	}
+	if got.TapName != "kairoslab-tap0" {
+		t.Errorf("migrated VM TapName = %q, want %q, taken from the Network block", got.TapName, "kairoslab-tap0")
+	}
+	if got.NetworkMode != "shared" {
+		t.Errorf("migrated VM NetworkMode = %q, want %q, taken from the Network block", got.NetworkMode, "shared")
+	}
+	if got.PID != 1234 || got.IPAddress != "192.168.64.7" {
+		t.Errorf("migrated VM did not carry over its other fields untouched: %+v", got)
+	}
+	if st.LegacyVM != nil {
+		t.Errorf("LegacyVM should be nil once Load returns, got %+v", st.LegacyVM)
+	}
+
+	if err := store.Save(st); err != nil {
+		t.Fatal(err)
+	}
+	raw, err := os.ReadFile(store.StatePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(raw), `"vm"`) {
+		t.Errorf("a save after migrating should carry no \"vm\" key, got:\n%s", raw)
+	}
+	if !strings.Contains(string(raw), `"vms"`) {
+		t.Errorf("a save after migrating should carry the \"vms\" key, got:\n%s", raw)
+	}
+}
+
+// TestLoadSetupOnlyLegacyFileDropsTheDeadVMKey covers the file shape every
+// setup-only run before this milestone actually wrote: the old VM field had
+// no omitempty, so state.json always carried a "vm" key even when no VM had
+// ever started, decoding as an empty VM{}. That empty record is not a VM that
+// ran and must not become a migrated entry -- but the dead key still has to
+// stop being written once the file is saved again.
+func TestLoadSetupOnlyLegacyFileDropsTheDeadVMKey(t *testing.T) {
+	t.Setenv("KAIROS_LAB_CONFIG_DIR", t.TempDir())
+	t.Setenv("KAIROS_LAB_CACHE_DIR", t.TempDir())
+	store, err := DefaultStore()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(store.ConfigDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	legacy := `{"version":1,"setup":{"completed_at":"2025-01-01T00:00:00Z","dependency_check_passed":true},"vm":{}}`
+	if err := os.WriteFile(store.StatePath, []byte(legacy), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	st, err := store.Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(st.VMs) != 0 {
+		t.Errorf("VMs after loading a setup-only legacy file = %+v, want none", st.VMs)
+	}
+
+	if err := store.Save(st); err != nil {
+		t.Fatal(err)
+	}
+	raw, err := os.ReadFile(store.StatePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(raw), `"vm"`) {
+		t.Errorf("a save should carry no dead \"vm\": {} key, got:\n%s", raw)
+	}
+}
+
+// TestLoadDoesNotMigrateWhenVMsAlreadyPresent pins that the migration is keyed
+// on len(st.VMs) == 0 and not on the mere presence of a "vm" key: a file that
+// already carries "vms" -- which is every file this build itself writes -- is
+// left exactly as it was.
+func TestLoadDoesNotMigrateWhenVMsAlreadyPresent(t *testing.T) {
+	t.Setenv("KAIROS_LAB_CONFIG_DIR", t.TempDir())
+	t.Setenv("KAIROS_LAB_CACHE_DIR", t.TempDir())
+	store, err := DefaultStore()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(store.ConfigDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	// The stray "vm" object beside "vms" is not a realistic file -- nothing
+	// this codebase writes produces both -- but it is exactly what makes this
+	// a test of the len(VMs) == 0 rule rather than of some other one, such as
+	// "migrate whenever vm is present".
+	legacy := `{"version":2,"vm":{"disk_name":"should-not-appear"},"vms":[{"name":"kairos-disk0","slot":0,"pid":42}]}`
+	if err := os.WriteFile(store.StatePath, []byte(legacy), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	st, err := store.Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(st.VMs) != 1 || st.VMs[0].Name != "kairos-disk0" {
+		t.Fatalf("VMs = %+v, want exactly the one entry already on file, unmigrated", st.VMs)
+	}
+	if st.VMs[0].PID != 42 {
+		t.Errorf("VMs[0].PID = %d, want 42, unchanged from what was on file", st.VMs[0].PID)
+	}
+}
+
+// TestLoadRefusesANewerSchemaVersion pins the guard that makes the version
+// bump to 2 mean anything. Without it, an older build reading a file a newer
+// one wrote would see no "vm" key -- v2 dropped it for "vms" -- conclude
+// nothing is running, and start a second VM over what may still be a live
+// bridge and tap.
+func TestLoadRefusesANewerSchemaVersion(t *testing.T) {
+	t.Setenv("KAIROS_LAB_CONFIG_DIR", t.TempDir())
+	t.Setenv("KAIROS_LAB_CACHE_DIR", t.TempDir())
+	store, err := DefaultStore()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(store.ConfigDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	future := fmt.Sprintf(`{"version":%d}`, SchemaVersion+1)
+	if err := os.WriteFile(store.StatePath, []byte(future), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := store.Load(); err == nil {
+		t.Fatal("loading a state file from a newer schema version should be refused, not silently accepted")
+	} else {
+		for _, want := range []string{store.StatePath, fmt.Sprintf("%d", SchemaVersion+1), fmt.Sprintf("%d", SchemaVersion)} {
+			if !strings.Contains(err.Error(), want) {
+				t.Errorf("error %q does not mention %q", err, want)
+			}
+		}
+	}
+}
+
+// TestAllocateVMSlot covers AllocateVMSlot's four documented behaviours: the
+// lowest slot wins, an already-used slot is skipped, a slot free rejects is
+// skipped, and exhausting 0..MaxSlot is an error rather than an out-of-range
+// slot.
+func TestAllocateVMSlot(t *testing.T) {
+	t.Run("empty state returns the lowest slot", func(t *testing.T) {
+		st := &State{}
+		slot, err := AllocateVMSlot(st, nil)
+		if err != nil || slot != 0 {
+			t.Fatalf("AllocateVMSlot(empty) = (%d, %v), want (0, nil)", slot, err)
+		}
+	})
+
+	t.Run("skips slots already used by existing entries", func(t *testing.T) {
+		st := &State{VMs: []VM{{Name: "a", Slot: 0}, {Name: "b", Slot: 1}}}
+		slot, err := AllocateVMSlot(st, nil)
+		if err != nil || slot != 2 {
+			t.Fatalf("AllocateVMSlot = (%d, %v), want (2, nil)", slot, err)
+		}
+	})
+
+	t.Run("skips slots free rejects", func(t *testing.T) {
+		st := &State{}
+		slot, err := AllocateVMSlot(st, func(s int) bool { return s != 0 && s != 1 })
+		if err != nil || slot != 2 {
+			t.Fatalf("AllocateVMSlot = (%d, %v), want (2, nil)", slot, err)
+		}
+	})
+
+	t.Run("errors once 0..MaxSlot is exhausted", func(t *testing.T) {
+		vms := make([]VM, 0, MaxSlot+1)
+		for i := 0; i <= MaxSlot; i++ {
+			vms = append(vms, VM{Name: fmt.Sprintf("vm%d", i), Slot: i})
+		}
+		st := &State{VMs: vms}
+		if _, err := AllocateVMSlot(st, nil); err == nil {
+			t.Fatal("AllocateVMSlot with every slot in 0..MaxSlot used should return an error")
+		}
+	})
+}
+
+// TestValidateSlot pins the boundary: 0 and MaxSlot are accepted, one step
+// past either side is refused.
+func TestValidateSlot(t *testing.T) {
+	if err := ValidateSlot(-1); err == nil {
+		t.Error("ValidateSlot(-1) = nil, want an error")
+	}
+	if err := ValidateSlot(MaxSlot + 1); err == nil {
+		t.Errorf("ValidateSlot(%d) = nil, want an error", MaxSlot+1)
+	}
+	if err := ValidateSlot(0); err != nil {
+		t.Errorf("ValidateSlot(0) = %v, want nil", err)
+	}
+	if err := ValidateSlot(MaxSlot); err != nil {
+		t.Errorf("ValidateSlot(%d) = %v, want nil", MaxSlot, err)
+	}
+}
+
+// TestFindUpsertRemoveVM covers the three name-keyed helpers together: Upsert
+// appends when the name is new and replaces in place when it is not, Find
+// returns a pointer into the live slice (so a write through it is a write to
+// the state), and Remove deletes by name and leaves the rest untouched.
+func TestFindUpsertRemoveVM(t *testing.T) {
+	st := &State{}
+	UpsertVM(st, VM{Name: "kairos-disk0", PID: 111})
+	UpsertVM(st, VM{Name: "kairos-disk1", PID: 222})
+	if len(st.VMs) != 2 {
+		t.Fatalf("VMs after two inserting upserts = %+v, want 2 entries", st.VMs)
+	}
+
+	UpsertVM(st, VM{Name: "kairos-disk0", PID: 999})
+	if len(st.VMs) != 2 {
+		t.Fatalf("VMs after a replacing upsert = %+v, want still 2 entries", st.VMs)
+	}
+	if got := FindVM(st, "kairos-disk0"); got == nil || got.PID != 999 {
+		t.Errorf("FindVM(kairos-disk0) = %+v, want PID 999", got)
+	}
+
+	if got := FindVM(st, "kairos-disk0"); got != nil {
+		got.IPAddress = "192.168.64.9"
+	}
+	if st.VMs[0].IPAddress != "192.168.64.9" {
+		t.Errorf("writing through FindVM's pointer did not reach st.VMs: %+v", st.VMs)
+	}
+
+	RemoveVM(st, "kairos-disk1")
+	if len(st.VMs) != 1 || FindVM(st, "kairos-disk1") != nil {
+		t.Errorf("VMs after removing kairos-disk1 = %+v, want it gone", st.VMs)
+	}
+	if FindVM(st, "kairos-disk0") == nil {
+		t.Error("removing kairos-disk1 should not touch kairos-disk0")
+	}
+}
+
+// TestSaveLoadRoundTripsNewVMFields is the schema-2 sibling of
+// TestSaveLoadRoundTripKeepsMACAndIP: every field VM gained in this milestone
+// survives a save and a reload, not just the pre-existing ones.
+func TestSaveLoadRoundTripsNewVMFields(t *testing.T) {
+	t.Setenv("KAIROS_LAB_CONFIG_DIR", t.TempDir())
+	t.Setenv("KAIROS_LAB_CACHE_DIR", t.TempDir())
+	store, err := DefaultStore()
+	if err != nil {
+		t.Fatal(err)
+	}
+	st := NewState(store)
+	UpsertVM(st, VM{
+		Name:        "kairos-disk0",
+		Slot:        3,
+		NetworkMode: "bridged",
+		TapName:     "kairoslab-tap-3",
+		SSHPort:     2203,
+		WebPort:     8103,
+		PID:         4321,
+	})
+	if err := store.Save(st); err != nil {
+		t.Fatal(err)
+	}
+
+	loaded, err := store.Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := FindVM(loaded, "kairos-disk0")
+	if got == nil {
+		t.Fatal("VM missing after reload")
+	}
+	if got.Slot != 3 {
+		t.Errorf("Slot = %d, want 3", got.Slot)
+	}
+	if got.NetworkMode != "bridged" {
+		t.Errorf("NetworkMode = %q, want %q", got.NetworkMode, "bridged")
+	}
+	if got.TapName != "kairoslab-tap-3" {
+		t.Errorf("TapName = %q, want %q", got.TapName, "kairoslab-tap-3")
+	}
+	if got.SSHPort != 2203 {
+		t.Errorf("SSHPort = %d, want 2203", got.SSHPort)
+	}
+	if got.WebPort != 8103 {
+		t.Errorf("WebPort = %d, want 8103", got.WebPort)
+	}
+	if got.PID != 4321 {
+		t.Errorf("PID = %d, want 4321", got.PID)
 	}
 }

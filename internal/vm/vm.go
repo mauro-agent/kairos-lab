@@ -11,6 +11,8 @@ import (
 	"strings"
 	"syscall"
 	"time"
+
+	"github.com/kairos-io/kairos-lab/internal/state"
 )
 
 type StartConfig struct {
@@ -174,6 +176,27 @@ func IsRunning(pid int) (bool, error) {
 		return false, nil
 	}
 	return true, nil
+}
+
+// RunningVMs returns the entries of st.VMs whose recorded PID is actually
+// live, per IsRunning. A PID column in state.json can go stale in the
+// ordinary course of things -- the process exited and nothing has rewritten
+// state.json since -- so this is what later milestones will use to tell "a
+// VM this tool believes exists" from "a VM this tool believes exists and is
+// actually running", the same distinction runStart's own refusal already
+// draws for the single VM this build still supports.
+//
+// This lives in internal/vm and not internal/state because internal/vm
+// already imports internal/state for its StartConfig and network plumbing;
+// the reverse import would be a cycle.
+func RunningVMs(st *state.State) []state.VM {
+	var running []state.VM
+	for _, v := range st.VMs {
+		if ok, _ := IsRunning(v.PID); ok {
+			running = append(running, v)
+		}
+	}
+	return running
 }
 
 func buildLinux(cfg StartConfig) (string, []string, error) {

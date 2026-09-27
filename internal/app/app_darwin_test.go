@@ -14,6 +14,8 @@ import (
 	"slices"
 	"strings"
 	"testing"
+
+	"github.com/kairos-io/kairos-lab/internal/state"
 )
 
 // The vmnet sudo branch, driven end to end rather than through its two
@@ -65,11 +67,11 @@ func TestStartLaunchesVmnetSharedUnderSudo(t *testing.T) {
 	}
 
 	st := loadStoredState(t)
-	if st.VM.QemuBinary != "sudo" {
-		t.Errorf("QemuBinary = %q, want %q: both vmnet modes need QEMU itself launched as root", st.VM.QemuBinary, "sudo")
+	if state.VMOrZero(st).QemuBinary != "sudo" {
+		t.Errorf("QemuBinary = %q, want %q: both vmnet modes need QEMU itself launched as root", state.VMOrZero(st).QemuBinary, "sudo")
 	}
-	if len(st.VM.QemuArgs) == 0 || st.VM.QemuArgs[0] != "qemu-system-aarch64" {
-		t.Fatalf("QemuArgs = %q, want the QEMU binary as the first argument to sudo", st.VM.QemuArgs)
+	if len(state.VMOrZero(st).QemuArgs) == 0 || state.VMOrZero(st).QemuArgs[0] != "qemu-system-aarch64" {
+		t.Fatalf("QemuArgs = %q, want the QEMU binary as the first argument to sudo", state.VMOrZero(st).QemuArgs)
 	}
 	// The recorded command is the command: st.VM.QemuArgs is what `status`
 	// and a later `stop` read, so the binary moving behind sudo has to be
@@ -80,10 +82,10 @@ func TestStartLaunchesVmnetSharedUnderSudo(t *testing.T) {
 	// And it is a vmnet-shared launch, over no host interface at all: the
 	// firmware path is the one the fake brew answered with, which is what
 	// says macOSFirmwarePath really ran on the way here.
-	if valueAfterArg(st.VM.QemuArgs, "-netdev") != "vmnet-shared,id=net0" {
-		t.Errorf("QemuArgs = %q, want a bare vmnet-shared netdev", st.VM.QemuArgs)
+	if valueAfterArg(state.VMOrZero(st).QemuArgs, "-netdev") != "vmnet-shared,id=net0" {
+		t.Errorf("QemuArgs = %q, want a bare vmnet-shared netdev", state.VMOrZero(st).QemuArgs)
 	}
-	if got := valueAfterArg(st.VM.QemuArgs, "-bios"); got != firmware {
+	if got := valueAfterArg(state.VMOrZero(st).QemuArgs, "-bios"); got != firmware {
 		t.Errorf("-bios = %q, want %q -- the path the fake brew answered with", got, firmware)
 	}
 	if st.Network.BridgeInterface != "" {

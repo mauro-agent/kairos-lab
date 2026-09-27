@@ -277,7 +277,7 @@ func TestResetReportsAFailedNetworkCleanup(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Load: %v", err)
 	}
-	st.VM.LogPath = logPath
+	state.MutableVM(st).LogPath = logPath
 	if err := store.Save(st); err != nil {
 		t.Fatalf("Save: %v", err)
 	}
@@ -342,8 +342,8 @@ func TestCleanupReportsAFailedNetworkCleanup(t *testing.T) {
 // escape two of them and leave the rest.
 func withEveryFieldPoisoned(st *state.State) {
 	withNetworkNames(injectedBridgeName, injectedTapName)(st)
-	st.VM.LogPath = injectedLogPath
-	st.VM.QGASockPath = injectedSockPath
+	state.MutableVM(st).LogPath = injectedLogPath
+	state.MutableVM(st).QGASockPath = injectedSockPath
 	st.Setup.PreExistingDeps = []string{injectedDepName}
 	st.ManagedFiles = append(st.ManagedFiles, injectedManagedFile)
 	st.ManagedDirs = append(st.ManagedDirs, injectedManagedDir)
@@ -412,7 +412,7 @@ func TestPlanIsInertThroughTheFullFlowForSiblingRows(t *testing.T) {
 				// Only the bridge name is malformed, which is what makes the
 				// teardown refuse before it probes or touches the host.
 				withNetworkNames(injectedBridgeName, "")(st)
-				st.VM.LogPath = injectedLogPath
+				state.MutableVM(st).LogPath = injectedLogPath
 			},
 		},
 		{
@@ -1884,8 +1884,8 @@ func TestStartPreparesLinuxNetworkingWithTheRunsStateAndRuntimeDir(t *testing.T)
 				t.Errorf("state records tap %q, want %q -- what the prepare reported, which is what the teardown reads", st.Network.TapName, tapName)
 			}
 			wantNetdev := "tap,id=net0,ifname=" + tapName + ",script=no,downscript=no"
-			if !slices.Contains(st.VM.QemuArgs, wantNetdev) {
-				t.Errorf("the recorded qemu command line has no %q, so the guest is not on the tap the prepare built:\n%q", wantNetdev, st.VM.QemuArgs)
+			if !slices.Contains(state.VMOrZero(st).QemuArgs, wantNetdev) {
+				t.Errorf("the recorded qemu command line has no %q, so the guest is not on the tap the prepare built:\n%q", wantNetdev, state.VMOrZero(st).QemuArgs)
 			}
 		})
 	}
@@ -1961,8 +1961,8 @@ func TestStartStopsWhenPreparingSharedNetworkingFails(t *testing.T) {
 	if strings.Contains(stdout.String(), "[2/3] Recording VM state") {
 		t.Errorf("the run recorded a VM whose network was never prepared:\n%s", stdout.String())
 	}
-	if st := loadStoredState(t); st.VM.QemuBinary != "" || st.Network.Mode != "" {
-		t.Errorf("state records qemu binary %q and network mode %q after a failed prepare, want both empty", st.VM.QemuBinary, st.Network.Mode)
+	if st := loadStoredState(t); state.VMOrZero(st).QemuBinary != "" || st.Network.Mode != "" {
+		t.Errorf("state records qemu binary %q and network mode %q after a failed prepare, want both empty", state.VMOrZero(st).QemuBinary, st.Network.Mode)
 	}
 }
 
@@ -2294,8 +2294,8 @@ func TestStartRecordsTheUplinkThePrepareUsed(t *testing.T) {
 	// And the run really did go through the bridged arm: the guest is on the
 	// tap the prepare reported, not on user networking.
 	wantNetdev := "tap,id=net0,ifname=" + vm.DefaultTapName + ",script=no,downscript=no"
-	if !slices.Contains(st.VM.QemuArgs, wantNetdev) {
-		t.Errorf("the recorded qemu command line has no %q:\n%q", wantNetdev, st.VM.QemuArgs)
+	if !slices.Contains(state.VMOrZero(st).QemuArgs, wantNetdev) {
+		t.Errorf("the recorded qemu command line has no %q:\n%q", wantNetdev, state.VMOrZero(st).QemuArgs)
 	}
 }
 
@@ -2481,7 +2481,7 @@ func TestStartRecordsNoUplinkForAModeThatAttachesToNone(t *testing.T) {
 	if st.Network.BridgeInterface != "" {
 		t.Errorf("state records an uplink of %q for a run that attached to none; `status` would report it as this VM's interface", st.Network.BridgeInterface)
 	}
-	for _, arg := range st.VM.QemuArgs {
+	for _, arg := range state.VMOrZero(st).QemuArgs {
 		if strings.Contains(arg, "kairos-test-uplink0") {
 			t.Errorf("the qemu command line carries the interface: %q", arg)
 		}
@@ -2568,8 +2568,8 @@ func TestStartGivesEachDiskItsOwnStickyMAC(t *testing.T) {
 			// written to state but not handed to QEMU leaves every VM on the
 			// colliding default address while state.json claims otherwise.
 			wantArg := "virtio-net-pci,netdev=net0,mac=" + tt.want
-			if !slices.Contains(st.VM.QemuArgs, wantArg) {
-				t.Errorf("the recorded qemu command line has no %q:\n%q", wantArg, st.VM.QemuArgs)
+			if !slices.Contains(state.VMOrZero(st).QemuArgs, wantArg) {
+				t.Errorf("the recorded qemu command line has no %q:\n%q", wantArg, state.VMOrZero(st).QemuArgs)
 			}
 			if !strings.Contains(stdout.String(), wantArg) {
 				t.Errorf("the command printed to the user has no %q:\n%s", wantArg, stdout.String())
@@ -2626,8 +2626,8 @@ func TestStartDerivesTheMACFromTheRenamedDisk(t *testing.T) {
 			disk.MAC, finalName, want, "original-disk", vm.MACForDisk("original-disk"))
 	}
 	wantArg := "virtio-net-pci,netdev=net0,mac=" + want
-	if !slices.Contains(st.VM.QemuArgs, wantArg) {
-		t.Errorf("the recorded qemu command line has no %q:\n%q", wantArg, st.VM.QemuArgs)
+	if !slices.Contains(state.VMOrZero(st).QemuArgs, wantArg) {
+		t.Errorf("the recorded qemu command line has no %q:\n%q", wantArg, state.VMOrZero(st).QemuArgs)
 	}
 }
 
@@ -3508,8 +3508,8 @@ func TestIPPollPrintsTheAddressAndRecordsItForStatus(t *testing.T) {
 		t.Errorf("a successful lookup warned about something:\n%s", stderr.String())
 	}
 	st := loadStoredState(t)
-	if st.VM.IPAddress != found.IP {
-		t.Errorf("state records the address %q, want %q -- `status` has nothing to show", st.VM.IPAddress, found.IP)
+	if state.VMOrZero(st).IPAddress != found.IP {
+		t.Errorf("state records the address %q, want %q -- `status` has nothing to show", state.VMOrZero(st).IPAddress, found.IP)
 	}
 	// The poller loads and saves the state rather than writing one of its
 	// own, so everything the start recorded is still there.
@@ -3597,7 +3597,7 @@ func TestIPPollTellsALeaseFromASelfAssignedAddress(t *testing.T) {
 			// Both are recorded. A self-assigned address is still what the
 			// host found for this guest, and `status` is where a user reads
 			// back what a start resolved; the row qualifies it there.
-			if got := loadStoredState(t).VM.IPAddress; got != tt.res.IP {
+			if got := state.VMOrZero(loadStoredState(t)).IPAddress; got != tt.res.IP {
 				t.Errorf("state records the address %q, want %q", got, tt.res.IP)
 			}
 		})
@@ -3727,7 +3727,7 @@ func TestStartInUserModeSaysWhereTheVMIsAndClearsTheOldAddress(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Load: %v", err)
 	}
-	st.VM.IPAddress = "192.168.64.99"
+	state.MutableVM(st).IPAddress = "192.168.64.99"
 	if err := store.Save(st); err != nil {
 		t.Fatalf("Save: %v", err)
 	}
@@ -3752,7 +3752,7 @@ func TestStartInUserModeSaysWhereTheVMIsAndClearsTheOldAddress(t *testing.T) {
 	if strings.Contains(out, "VM is up.") {
 		t.Errorf("user mode printed a resolved-address block, contradicting the user-mode block above it:\n%s", out)
 	}
-	if got := loadStoredState(t).VM.IPAddress; got != "" {
+	if got := state.VMOrZero(loadStoredState(t)).IPAddress; got != "" {
 		t.Errorf("state records %q as this VM's address, which `status` would report: the previous run's address was not cleared, or a poll this mode must not start recorded one", got)
 	}
 }
@@ -3790,7 +3790,7 @@ func TestStatusNetworkRowsForEachMode(t *testing.T) {
 			st.Network.BridgeName = "kairoslab0"
 			st.Network.TapName = "kairoslab-tap0"
 			st.Network.BridgeInterface = "eth0"
-			st.VM.IPAddress = "192.168.64.12"
+			state.MutableVM(st).IPAddress = "192.168.64.12"
 		}
 	}
 	tests := []struct {
@@ -3866,7 +3866,7 @@ func TestStatusOmitsTheBridgeRowWhenNoBridgeWasRecorded(t *testing.T) {
 				st.Platform.Arch = "arm64"
 				st.Network.Mode = mode
 				st.Network.BridgeInterface = "en0"
-				st.VM.IPAddress = "192.168.64.12"
+				state.MutableVM(st).IPAddress = "192.168.64.12"
 			})
 			if strings.Contains(out, "bridge resources:") {
 				t.Errorf("status prints a bridge row this run has nothing for:\n%s", out)
@@ -3944,7 +3944,7 @@ func TestStatusQualifiesALinkLocalAddressRow(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			out := runStatusOutput(t, func(st *state.State) {
 				st.Network.Mode = "shared"
-				st.VM.IPAddress = tt.ip
+				state.MutableVM(st).IPAddress = tt.ip
 			})
 			// The trailing newline is the assertion for the first case: a
 			// note appended to a routable address would not match.
@@ -4006,11 +4006,11 @@ func TestStatusIsInertForEveryStoredValueItPrints(t *testing.T) {
 		st.Network.BridgeInterface = injectedBridgeIface
 		st.Network.BridgeName = injectedBridgeName
 		st.Network.TapName = injectedTapName
-		st.VM.IPAddress = injectedIPAddress
-		st.VM.ISOSource = injectedISOSource
-		st.VM.ISOLocal = injectedISOLocal
-		st.VM.DiskPath = injectedDiskPath
-		st.VM.LastError = injectedLastError
+		state.MutableVM(st).IPAddress = injectedIPAddress
+		state.MutableVM(st).ISOSource = injectedISOSource
+		state.MutableVM(st).ISOLocal = injectedISOLocal
+		state.MutableVM(st).DiskPath = injectedDiskPath
+		state.MutableVM(st).LastError = injectedLastError
 		st.Platform.OS = injectedPlatformOS
 		st.Platform.Arch = injectedPlatformArch
 		st.Platform.PackageManager = injectedPackageMgr
@@ -4073,8 +4073,8 @@ func TestOrdinaryStatusRowsAreNotQuoted(t *testing.T) {
 		st.Network.Mode = "shared"
 		st.Network.BridgeName = "kairoslab0"
 		st.Network.TapName = "kairoslab-tap0"
-		st.VM.DiskPath = "/home/u/.cache/kairos-lab/vm/kairos-disk0.qcow2"
-		st.VM.IPAddress = "192.168.64.12"
+		state.MutableVM(st).DiskPath = "/home/u/.cache/kairos-lab/vm/kairos-disk0.qcow2"
+		state.MutableVM(st).IPAddress = "192.168.64.12"
 	})
 	for _, want := range []string{
 		"disk path: /home/u/.cache/kairos-lab/vm/kairos-disk0.qcow2\n",
@@ -4200,11 +4200,11 @@ func TestStartResolvesTheAddressBesideTheVMAndLeavesItForStatus(t *testing.T) {
 	}
 
 	st := loadStoredState(t)
-	if st.VM.IPAddress != found.IP {
-		t.Errorf("state records the address %q, want %q -- the save after the VM exited blanked what the poller wrote", st.VM.IPAddress, found.IP)
+	if state.VMOrZero(st).IPAddress != found.IP {
+		t.Errorf("state records the address %q, want %q -- the save after the VM exited blanked what the poller wrote", state.VMOrZero(st).IPAddress, found.IP)
 	}
-	if st.VM.PID != 0 || st.VM.StoppedAt == "" {
-		t.Errorf("the exit was not recorded: pid %d, stopped at %q", st.VM.PID, st.VM.StoppedAt)
+	if state.VMOrZero(st).PID != 0 || state.VMOrZero(st).StoppedAt == "" {
+		t.Errorf("the exit was not recorded: pid %d, stopped at %q", state.VMOrZero(st).PID, state.VMOrZero(st).StoppedAt)
 	}
 
 	// And the durable channel really shows it, which is the reason any of it
@@ -4293,7 +4293,7 @@ func TestAFailedRecordingClaimsNoMoreThanBothItsFailuresKeep(t *testing.T) {
 
 		// And the half the second line is about: the exit save rebuilt the
 		// file it could not read, so the address is on record afterwards.
-		if got := loadStoredState(t).VM.IPAddress; got != found.IP {
+		if got := state.VMOrZero(loadStoredState(t)).IPAddress; got != found.IP {
 			t.Fatalf("state records the address %q, want %q -- the exit save did not put back what the poller could not write", got, found.IP)
 		}
 		var statusOut bytes.Buffer
@@ -4362,7 +4362,7 @@ func TestAFailedRecordingClaimsNoMoreThanBothItsFailuresKeep(t *testing.T) {
 		if !strings.Contains(startErr.Error(), "create temporary state file") {
 			t.Errorf("the start failed with %v, want the save failure the unwritable config dir causes", startErr)
 		}
-		if got := loadStoredState(t).VM.IPAddress; got != "" {
+		if got := state.VMOrZero(loadStoredState(t)).IPAddress; got != "" {
 			t.Errorf("state records the address %q after a run that could write nothing", got)
 		}
 		var statusOut bytes.Buffer

@@ -392,9 +392,9 @@ func runStart(args []string, stdin io.Reader, stdout, stderr io.Writer, store *s
 	if err := requireSetup(st); err != nil {
 		return err
 	}
-	running, _ := vm.IsRunning(st.VM.PID)
+	running, _ := vm.IsRunning(state.VMOrZero(st).PID)
 	if running {
-		return fmt.Errorf("a vm is already running with pid %d", st.VM.PID)
+		return fmt.Errorf("a vm is already running with pid %d", state.VMOrZero(st).PID)
 	}
 
 	vmDir := filepath.Join(store.CacheDir, "vm")
@@ -845,23 +845,29 @@ func runStart(args []string, stdin io.Reader, stdout, stderr io.Writer, store *s
 	}
 	st.Network.Mode = *network
 	st.Network.BridgeInterface = bridgeInterfaceForMode(*network, networkIface)
-	st.VM.ISOLocal = isoLocal
-	st.VM.DiskPath = disk.Path
-	st.VM.DiskName = disk.Name
-	st.VM.LogPath = logPath
-	st.VM.QemuBinary = cmdName
-	st.VM.QemuArgs = cmdArgs
-	st.VM.StartedAt = state.NowRFC3339()
-	st.VM.StoppedAt = ""
-	st.VM.RuntimeDir = runtimeDir
-	st.VM.QGASockPath = qgaSock
-	st.VM.LastError = ""
+	// Name and Slot are the identity later milestones (multiple VMs) key on.
+	// This build still runs one VM at a time, so Slot is always 0, but
+	// recording both now costs nothing and means M2/M3 do not need a second
+	// migration just to backfill them.
+	state.MutableVM(st).Name = disk.Name
+	state.MutableVM(st).Slot = 0
+	state.MutableVM(st).ISOLocal = isoLocal
+	state.MutableVM(st).DiskPath = disk.Path
+	state.MutableVM(st).DiskName = disk.Name
+	state.MutableVM(st).LogPath = logPath
+	state.MutableVM(st).QemuBinary = cmdName
+	state.MutableVM(st).QemuArgs = cmdArgs
+	state.MutableVM(st).StartedAt = state.NowRFC3339()
+	state.MutableVM(st).StoppedAt = ""
+	state.MutableVM(st).RuntimeDir = runtimeDir
+	state.MutableVM(st).QGASockPath = qgaSock
+	state.MutableVM(st).LastError = ""
 	// The address recorded here belongs to the run being recorded, and this
 	// run has not got one yet: the poll that finds it starts once QEMU is
 	// running. Carrying the previous run's address over would have `status`
 	// report a stale address as this VM's for as long as the poll takes, and
 	// for good if it never answers.
-	st.VM.IPAddress = ""
+	state.MutableVM(st).IPAddress = ""
 	state.AddManagedFile(st, logPath)
 	state.AddManagedFile(st, qgaSock)
 	if err := store.Save(st); err != nil {
@@ -916,11 +922,11 @@ func runStart(args []string, stdin io.Reader, stdout, stderr io.Writer, store *s
 	command.Stdout = childStdio(cmdName == "sudo", stdout, io.MultiWriter(vmOut, logFile))
 	command.Stderr = childStdio(cmdName == "sudo", stderr, io.MultiWriter(vmErr, logFile))
 	if err := command.Start(); err != nil {
-		st.VM.LastError = err.Error()
+		state.MutableVM(st).LastError = err.Error()
 		_ = store.Save(st)
 		return fmt.Errorf("start qemu: %w", err)
 	}
-	st.VM.PID = command.Process.Pid
+	state.MutableVM(st).PID = command.Process.Pid
 	if err := store.Save(st); err != nil {
 		_ = command.Process.Kill()
 		return err
@@ -981,17 +987,17 @@ func runStart(args []string, stdin io.Reader, stdout, stderr io.Writer, store *s
 	<-ipDone
 	select {
 	case res := <-ipResolved:
-		st.VM.IPAddress = res.IP
+		state.MutableVM(st).IPAddress = res.IP
 	default:
 	}
-	st.VM.PID = 0
-	st.VM.StoppedAt = state.NowRFC3339()
+	state.MutableVM(st).PID = 0
+	state.MutableVM(st).StoppedAt = state.NowRFC3339()
 	if waitErr != nil {
-		st.VM.LastError = waitErr.Error()
+		state.MutableVM(st).LastError = waitErr.Error()
 		_ = store.Save(st)
 		return fmt.Errorf("vm exited with error: %w (log: %s)", waitErr, logPath)
 	}
-	st.VM.LastError = ""
+	state.MutableVM(st).LastError = ""
 	if err := store.Save(st); err != nil {
 		return err
 	}
@@ -1395,7 +1401,7 @@ func recordVMIP(store *state.Store, ip string) error {
 	if err != nil {
 		return err
 	}
-	st.VM.IPAddress = ip
+	state.MutableVM(st).IPAddress = ip
 	return store.Save(st)
 }
 
@@ -1410,7 +1416,7 @@ func runStatus(stdout io.Writer, store *state.Store) error {
 	p := platform.Detect()
 	req := deps.Required(p)
 	present := deps.PresentNames(req)
-	running, _ := vm.IsRunning(st.VM.PID)
+	running, _ := vm.IsRunning(state.VMOrZero(st).PID)
 
 	platformLabel := st.Platform.OS + "/" + st.Platform.Arch
 	if st.Platform.OS == "" {
@@ -1441,9 +1447,9 @@ func runStatus(stdout io.Writer, store *state.Store) error {
 	writef(stdout, "dependencies installed by kairos-lab: %s\n", joinOrNone(st.Setup.InstalledByKairosLab))
 	writef(stdout, "managed dirs: %s\n", joinOrNone(st.ManagedDirs))
 	writef(stdout, "managed files: %s\n", joinOrNone(st.ManagedFiles))
-	writef(stdout, "iso source: %s\n", emptyAsNone(st.VM.ISOSource))
-	writef(stdout, "iso path: %s\n", emptyAsNone(st.VM.ISOLocal))
-	writef(stdout, "disk path: %s\n", emptyAsNone(st.VM.DiskPath))
+	writef(stdout, "iso source: %s\n", emptyAsNone(state.VMOrZero(st).ISOSource))
+	writef(stdout, "iso path: %s\n", emptyAsNone(state.VMOrZero(st).ISOLocal))
+	writef(stdout, "disk path: %s\n", emptyAsNone(state.VMOrZero(st).DiskPath))
 	writef(stdout, "network mode: %s\n", emptyAsNone(st.Network.Mode))
 	// The uplink stays a bridged-only row: shared clears the field on
 	// purpose, because the bridge it builds has the tap as its only port and
@@ -1478,7 +1484,7 @@ func runStatus(stdout io.Writer, store *state.Store) error {
 	// address: the block a start prints when it resolves one goes to the
 	// same terminal the guest's boot console is on and can scroll past
 	// unread, and this row is where it can be read back afterwards.
-	writef(stdout, "vm ip address: %s%s\n", emptyAsNone(st.VM.IPAddress), linkLocalAddressNote(st.VM.IPAddress))
+	writef(stdout, "vm ip address: %s%s\n", emptyAsNone(state.VMOrZero(st).IPAddress), linkLocalAddressNote(state.VMOrZero(st).IPAddress))
 	if st.Network.Mode == "user" {
 		// Without this row user mode reports an address of none and nothing
 		// else, which reads like a failure rather than like the mode working
@@ -1488,10 +1494,10 @@ func runStatus(stdout io.Writer, store *state.Store) error {
 	}
 	writef(stdout, "vm running: %t\n", running)
 	if running {
-		writef(stdout, "vm pid: %d\n", st.VM.PID)
+		writef(stdout, "vm pid: %d\n", state.VMOrZero(st).PID)
 	}
-	if st.VM.LastError != "" {
-		writef(stdout, "last vm error: %s\n", planValue(st.VM.LastError))
+	if state.VMOrZero(st).LastError != "" {
+		writef(stdout, "last vm error: %s\n", planValue(state.VMOrZero(st).LastError))
 	}
 	return nil
 }
@@ -1516,9 +1522,9 @@ func runReset(args []string, stdin io.Reader, stdout io.Writer, store *state.Sto
 		return err
 	}
 
-	running, _ := vm.IsRunning(st.VM.PID)
+	running, _ := vm.IsRunning(state.VMOrZero(st).PID)
 	if running {
-		return fmt.Errorf("a VM is still running (PID %d). Exit the VM first (Ctrl-a x in serial console)", st.VM.PID)
+		return fmt.Errorf("a VM is still running (PID %d). Exit the VM first (Ctrl-a x in serial console)", state.VMOrZero(st).PID)
 	}
 
 	// Collect paths to remove
@@ -1542,7 +1548,7 @@ func runReset(args []string, stdin io.Reader, stdout io.Writer, store *state.Sto
 	}
 
 	// Add runtime files
-	paths = append(paths, st.VM.LogPath, st.VM.QGASockPath)
+	paths = append(paths, state.VMOrZero(st).LogPath, state.VMOrZero(st).QGASockPath)
 
 	toRemove, toSkip := splitRemovalPaths(paths, st)
 
@@ -1628,7 +1634,7 @@ func runReset(args []string, stdin io.Reader, stdout io.Writer, store *state.Sto
 		}
 	}
 
-	st.VM = state.VM{}
+	st.VMs = nil
 	if err := store.Save(st); err != nil {
 		return err
 	}
@@ -1731,9 +1737,9 @@ func runCleanup(args []string, stdin io.Reader, stdout io.Writer, store *state.S
 		return fmt.Errorf("cleanup cancelled")
 	}
 
-	running, _ := vm.IsRunning(st.VM.PID)
+	running, _ := vm.IsRunning(state.VMOrZero(st).PID)
 	if running {
-		return fmt.Errorf("a VM is still running (PID %d). Exit the VM first (Ctrl-a x in serial console)", st.VM.PID)
+		return fmt.Errorf("a VM is still running (PID %d). Exit the VM first (Ctrl-a x in serial console)", state.VMOrZero(st).PID)
 	}
 
 	// The error itself is kept, not a bool: it is the only thing that knows
