@@ -260,12 +260,16 @@ func (s *Store) Load() (*State, error) {
 	// hand-edited, not merely large.
 	//
 	// The refusal is deliberate, and its cost is real and otherwise unstated:
-	// every command that calls Load -- status, start, reset and cleanup alike,
-	// measured -- refuses right along with it, including the two commands
-	// (reset, cleanup) a user would otherwise reach for to recover. There is
-	// no in-band remedy for that trade, unlike the version guard just above,
-	// whose message says to upgrade; the file named in the error below has to
-	// be corrected by hand.
+	// every command that calls Load -- status, start, reset and cleanup
+	// alike, measured -- refuses right along with it, including the two
+	// commands (reset, cleanup) a user would otherwise reach for to recover.
+	// Measured against the built binary, that list understates it: setup and
+	// download refuse too, because every Load caller does -- and the
+	// sharpest instance is setup, since it is the very thing most other
+	// errors in this tool tell the user to (re-)run. There is no in-band
+	// remedy for that trade, unlike the version guard just above, whose
+	// message says to upgrade; the file named in the error below has to be
+	// corrected by hand.
 	if len(st.VMs) > MaxSlot+1 {
 		return nil, fmt.Errorf("state file %s lists %d VMs, more than the %d slots (0..%d) this build can address: the file is corrupt or was hand-edited", s.StatePath, len(st.VMs), MaxSlot+1, MaxSlot)
 	}
@@ -371,9 +375,15 @@ func legacyVMName(st *State, v *VM) string {
 // rune (a control character reaching a terminal via a printed VM name is the
 // same class of hazard state.json's other injection defences -- see
 // validateStoredInterfaceName and the plan-printing tests in
-// internal/app -- already guard against). This is the same rule
-// validDiskName (internal/app/app.go) applies to a disk name typed at the
-// prompt, duplicated here rather than shared: internal/app already imports
+// internal/app -- already guard against). This is validDiskName's
+// (internal/app/app.go) rule PLUS that printable-rune clause, which
+// validDiskName does not have: validDiskName("\x1b[2K\rowned") is nil,
+// validDiskName("a\nb") is nil, and validDiskName("a\tb") is nil, all
+// measured. The extra clause is here because a name reaching this function
+// was derived from a disk path or PID recorded in state.json -- an untrusted
+// file a VM record can be migrated out of -- rather than typed at a prompt
+// the way validDiskName's input always is. This function is duplicated
+// rather than shared with validDiskName: internal/app already imports
 // internal/state for the Store and State types it manipulates, so the
 // reverse import this package would need in order to call validDiskName
 // directly would be an import cycle, and internal/state must not depend on

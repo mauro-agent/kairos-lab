@@ -645,9 +645,10 @@ func TestLoadMigratesALegacyVMWithNeitherDiskNameNorDiskPath(t *testing.T) {
 
 // TestValidVMName pins the rule legacyVMName runs every candidate through:
 // reject empty, ".", "..", any path separator, and any non-printable rune --
-// the same rule validDiskName (internal/app/app.go) applies to a disk name
-// typed at the prompt, duplicated here rather than shared (see validVMName's
-// own comment for why).
+// validDiskName's (internal/app/app.go) rule plus that last, printable-rune
+// clause, which validDiskName itself does not have (see validVMName's own
+// comment for why the extra clause belongs here and not there), duplicated
+// here rather than shared (see validVMName's own comment for why).
 func TestValidVMName(t *testing.T) {
 	valid := []string{"kairos-disk0", "vm0", "a", "disk.qcow2", "my_vm-1"}
 	for _, name := range valid {

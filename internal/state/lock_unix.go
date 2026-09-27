@@ -85,7 +85,7 @@ func (s *Store) Update(mutate func(*State) error) (*State, error) {
 	// else this tool leaves behind -- but cleanup's removal loop is
 	// os.Remove, and unlinking the lock path while another process holds it
 	// open is exactly the swap the separate-lock-file design exists to avoid
-	// (see acquireLock's own doc comment): the name stops pointing at the
+	// (see acquireLockOnce's own doc comment): the name stops pointing at the
 	// locked inode, and the next Update's O_CREATE makes a fresh inode at
 	// that name and locks THAT one instead, immediately, with zero mutual
 	// exclusion from whoever still holds the old one. Demonstrated: process A
@@ -121,20 +121,131 @@ const lockRetryInterval = 100 * time.Millisecond
 // production ever assigns it.
 var lockAcquireTimeout = 5 * time.Second
 
-// lockOpenAttempts bounds the retry across acquireLock's create/reopen race,
-// documented at the loop itself: a concurrent unlink of the lock path between
-// the O_EXCL attempt failing and the reopen succeeding fails the reopen with
-// ENOENT, and this is what lets the loop go back for one more O_CREATE|O_EXCL
-// attempt instead of failing the whole Update for a path that is trivially
-// creatable again an instant later. 2, not unbounded: one retry is enough for
-// the race this exists to cover (a single concurrent unlinker), and anything
-// that keeps failing past it is a path that will not stop disappearing,
-// which is a real error to surface rather than a reason to keep spinning.
+// lockOpenAttempts bounds how many times acquireLock restarts the whole
+// open/validate/lock sequence from the top, across three distinct races that
+// all have the same shape: something removed or replaced whatever path names
+// while this call was partway through locking it, leaving this call holding
+// (or about to hold) a lock on an inode nobody can reach by path any more --
+// which guards nothing, since every other process still finds path, opens
+// whatever inode is there now, and locks THAT one, with zero mutual
+// exclusion from this one.
+//
+//  1. The create/reopen race, documented at the point it is detected below: a
+//     concurrent unlink of the lock path between the O_EXCL attempt failing
+//     and the reopen succeeding fails the reopen with ENOENT.
+//  2. A concurrent unlink that instead lands strictly between an open
+//     (either branch) and the fstat that follows it: the descriptor is still
+//     open on an inode whose Nlink has already dropped to 0, meaning every
+//     name that inode had -- including this one -- is already gone. Also
+//     documented at the point it is detected below.
+//  3. A concurrent replace -- an unlink followed by a fresh create at the
+//     same name -- that lands AFTER this call's own flock succeeds: caught
+//     by comparing a stat of the descriptor (taken before the flock) against
+//     a stat of the PATH (taken after), since flock's exclusivity binds the
+//     inode this descriptor points at and says nothing about what the name
+//     currently resolves to. This is what makes the os.Remove calls in the
+//     euid-0 chown-failure branch below safe: that unlink can hand a
+//     concurrent waiter a lock on an inode this same restart will notice is
+//     no longer the one at path, and send back through this loop instead of
+//     letting it proceed as if it had exclusive access.
+//
+// The fix in every case is the same: close the stale descriptor and start
+// over from the open, on the theory that a path this volatile will
+// eventually hold still for one full attempt. 2, not unbounded: one retry
+// was already enough for case 1 alone (a single concurrent unlinker,
+// measured), and cases 2 and 3 are instances of the identical race rather
+// than a reason to add headroom per case -- a real deployment is not
+// expected to hit more than one of the three in a row. Anything that keeps
+// failing past this bound is a path that will not stop changing, which is a
+// real error to surface (see the timeout-shaped error acquireLock returns
+// when this bound or the overall lockAcquireTimeout deadline is reached)
+// rather than a reason to keep spinning.
 const lockOpenAttempts = 2
+
+// openLockFile is os.OpenFile, and geteuid is os.Geteuid, each a var only so
+// a test can substitute it -- the same idiom lockAcquireTimeout already uses
+// in this file ("a var only so a test can shorten it; nothing in production
+// assigns it").
+//
+// openLockFile lets a test intervene between this call's own open and its
+// flock -- swapping the file at path out from under it -- to drive the
+// post-flock inode check (case 3 in lockOpenAttempts's comment) on demand,
+// deterministically, rather than racing a real concurrent goroutine against
+// a timing window measured in microseconds.
+//
+// geteuid lets a test simulate running as euid 0 -- which the chown branch
+// below is gated on -- without the test process actually needing to run as
+// root. The chown syscall itself is not faked: fchown still runs for real
+// against the test's real (non-root) privileges, which is what lets a test
+// drive a genuine chown failure deterministically (chown to a uid that is
+// not the test's own euid fails with EPERM when not actually privileged)
+// without a third seam.
+var (
+	openLockFile = os.OpenFile
+	geteuid      = os.Geteuid
+)
 
 // acquireLock opens (creating if needed) the file at path, locks it
 // exclusively with flock, and returns a function that unlocks and closes it.
 // The caller is expected to defer the returned function immediately.
+//
+// This is a thin restart wrapper around acquireLockOnce, which is where
+// every actual open/validate/lock decision (and the reasoning behind each
+// one) lives; see its own doc comment for that. What lives here is only the
+// bound on how many times, and for how long, this will restart the whole
+// sequence when acquireLockOnce reports the path was replaced or removed out
+// from under a single attempt (see lockOpenAttempts's own comment for the
+// three specific races that can trigger a restart).
+func acquireLock(path string) (unlock func(), err error) {
+	// One deadline, computed once here and threaded through every attempt
+	// below (both the flock-wait loop inside acquireLockOnce and the
+	// restart bound in this loop): lockAcquireTimeout is documented as the
+	// OVERALL limit on how long acquireLock keeps trying, and computing a
+	// fresh deadline per attempt would let a path that keeps getting
+	// replaced (lockOpenAttempts's cases 2 and 3) rearm a full fresh
+	// lockAcquireTimeout of flock-wait budget on every restart, silently
+	// turning a bounded wait into an unbounded one.
+	deadline := time.Now().Add(lockAcquireTimeout)
+	var lastErr error
+	for attempt := 0; ; attempt++ {
+		unlockFn, retry, aerr := acquireLockOnce(path, deadline)
+		if aerr == nil {
+			return unlockFn, nil
+		}
+		if !retry {
+			return nil, aerr
+		}
+		lastErr = aerr
+		// Give up with a timeout-shaped error, rather than restart again,
+		// once EITHER bound is spent: lockOpenAttempts (a path that keeps
+		// getting replaced faster than the deadline arrives, which would
+		// otherwise spin very fast for the whole lockAcquireTimeout) or the
+		// deadline itself (a path that stops changing only after
+		// lockAcquireTimeout has already elapsed). lastErr is wrapped in
+		// rather than discarded, so the specific race that was hit --
+		// ENOENT on the reopen, Nlink == 0, or the post-flock path/inode
+		// mismatch -- is still visible to whoever reads the error.
+		if attempt >= lockOpenAttempts-1 || !time.Now().Before(deadline) {
+			return nil, fmt.Errorf("timed out after %d attempt(s) trying to get a stable lock on %s: the file kept being replaced or removed out from under this process -- if this persists, another process may be repeatedly recreating it; try again (%w)", attempt+1, path, lastErr)
+		}
+	}
+}
+
+// acquireLockOnce is the single-attempt body acquireLock's restart loop
+// calls: it opens (creating if needed) the file at path, validates it, locks
+// it exclusively with flock (waiting, bounded by deadline, if someone else
+// already holds it), and returns a function that unlocks and closes it.
+//
+// The retry return distinguishes two kinds of failure. false means the
+// failure is a real, non-transient problem (a FIFO or socket at path, a
+// symlink, a hard link, an unparseable SUDO_UID/SUDO_GID, a chown failure,
+// or the lock genuinely still held past deadline) and acquireLock should
+// return it as-is. true means path was observed to have been replaced or
+// removed out from under this attempt -- see lockOpenAttempts's own comment
+// for the three specific races this covers -- and acquireLock should close
+// this attempt's descriptor (already done here before returning) and start
+// over from the open, on the theory that a path this volatile will
+// eventually hold still for one full attempt.
 //
 // A separate file, and not state.json itself: Save (state.go) publishes
 // state.json by os.Rename-ing a temporary file over the name, so the inode a
@@ -148,7 +259,7 @@ const lockOpenAttempts = 2
 // Every choice below closes a specific hole that was demonstrated against
 // this repo, not a theoretical one, and each is commented at the line it
 // governs.
-func acquireLock(path string) (unlock func(), err error) {
+func acquireLockOnce(path string, deadline time.Time) (unlock func(), retry bool, err error) {
 	// O_NOFOLLOW: this file lives in the user's config directory, which
 	// kairos-lab's own privilege model treats as attacker-writable input in
 	// several other places already (see the comments on Store.Save and
@@ -237,35 +348,24 @@ func acquireLock(path string) (unlock func(), err error) {
 	// the two opens, and a lock path this steady-state, no-contention run IS
 	// going to take -- the O_EXCL attempt failing EEXIST because a previous
 	// run's lock file is still there is the ordinary case, not the rare one
-	// -- would then fail the reopen with ENOENT and fail this Update
-	// entirely, for a path that is, an instant later, perfectly creatable
-	// again. lockOpenAttempts bounds a retry back to the top of this loop for
-	// exactly that one race: ENOENT on the reopen loops back to another
-	// O_CREATE|O_EXCL attempt, which this time succeeds and creates the file
-	// itself (created flips true, and the chown below now correctly applies).
-	// Bounded rather than unbounded, so a path that somehow never stops
-	// disappearing fails loudly instead of spinning forever -- not a scenario
-	// this codebase can reach, but not one this loop should trust either.
+	// -- would then fail the reopen with ENOENT. That is case 1 of the three
+	// races lockOpenAttempts's own comment describes: retry is returned true
+	// rather than failing this attempt's caller outright, for a path that
+	// is, an instant later, perfectly creatable again.
 	created := true
-	var f *os.File
-	for attempt := 0; ; attempt++ {
-		f, err = os.OpenFile(path, os.O_CREATE|os.O_EXCL|os.O_RDWR|syscall.O_NOFOLLOW, 0o644)
-		if err == nil {
-			created = true
-			break
-		}
+	f, err := openLockFile(path, os.O_CREATE|os.O_EXCL|os.O_RDWR|syscall.O_NOFOLLOW, 0o644)
+	if err != nil {
 		if !errors.Is(err, os.ErrExist) {
-			return nil, fmt.Errorf("open lock file %s: %w", path, err)
+			return nil, false, fmt.Errorf("open lock file %s: %w", path, err)
 		}
 		created = false
-		f, err = os.OpenFile(path, os.O_RDWR|syscall.O_NOFOLLOW, 0o644)
-		if err == nil {
-			break
+		f, err = openLockFile(path, os.O_RDWR|syscall.O_NOFOLLOW, 0o644)
+		if err != nil {
+			if errors.Is(err, os.ErrNotExist) {
+				return nil, true, fmt.Errorf("open lock file %s: %w", path, err)
+			}
+			return nil, false, fmt.Errorf("open lock file %s: %w", path, err)
 		}
-		if errors.Is(err, os.ErrNotExist) && attempt < lockOpenAttempts-1 {
-			continue
-		}
-		return nil, fmt.Errorf("open lock file %s: %w", path, err)
 	}
 	closed := false
 	cleanup := func() {
@@ -288,18 +388,35 @@ func acquireLock(path string) (unlock func(), err error) {
 	// than locked.
 	fi, err := f.Stat()
 	if err != nil {
-		return nil, fmt.Errorf("stat lock file %s: %w", path, err)
+		return nil, false, fmt.Errorf("stat lock file %s: %w", path, err)
 	}
 	if !fi.Mode().IsRegular() {
-		return nil, fmt.Errorf("lock file %s is not a regular file (mode %s): refusing to lock it", path, fi.Mode())
+		return nil, false, fmt.Errorf("lock file %s is not a regular file (mode %s): refusing to lock it", path, fi.Mode())
 	}
-	// A second link to this inode is not a lock file anyone legitimately
-	// created -- this function never itself names the file more than once --
-	// so it is refused outright, on both branches above. On the reopen branch
-	// this is the only defence against the hard-link attack described above
-	// (chown never runs there at all); on the created branch it is a second,
-	// independent one, in case anything ever links to the file in the window
-	// between this open and this stat.
+	// The Nlink field this checks below distinguishes three states, not two:
+	//
+	//   Nlink == 1: an ordinary lock file with exactly the one name this
+	//   call opened it by. Proceed.
+	//
+	//   Nlink == 0: this descriptor's inode has already been unlinked from
+	//   every name it had, including path -- case 2 of the three races
+	//   lockOpenAttempts's own comment describes. This is "the file was
+	//   deleted under us", not "the file aliases another path", and it gets
+	//   retry == true and a message that says so, exactly like case 1 above:
+	//   there is nothing wrong with the file this call is holding open other
+	//   than that path no longer names it, which the next attempt's open
+	//   trivially fixes.
+	//
+	//   Nlink > 1: a second name for this inode that this function did not
+	//   itself create -- this function never names a file more than once --
+	//   so it is refused outright with retry == false, on both branches
+	//   above. On the reopen branch this is the only defence against the
+	//   hard-link attack described above (chown never runs there at all); on
+	//   the created branch it is a second, independent one, in case anything
+	//   ever links to the file in the window between this open and this
+	//   stat. Unlike Nlink == 0, a hard link is a real, persistent problem
+	//   with whatever is at path, not a transient one an instant will fix --
+	//   it does not belong in the same retryable bucket.
 	//
 	// The type assertion failing is treated as a refusal too, not as "the
 	// check does not apply here": failing open is what a defence is supposed
@@ -313,10 +430,16 @@ func acquireLock(path string) (unlock func(), err error) {
 	// forever.
 	st, ok := fi.Sys().(*syscall.Stat_t)
 	if !ok {
-		return nil, fmt.Errorf("lock file %s: could not determine its hard link count (fi.Sys() did not return *syscall.Stat_t): refusing to lock it", path)
+		return nil, false, fmt.Errorf("lock file %s: could not determine its hard link count (fi.Sys() did not return *syscall.Stat_t): refusing to lock it", path)
 	}
-	if st.Nlink != 1 {
-		return nil, fmt.Errorf("lock file %s has %d hard links, want exactly 1: refusing to lock a file that may alias another path", path, st.Nlink)
+	if st.Nlink == 0 {
+		// No manual close here: err is set on the way out, so the deferred
+		// cleanup above closes f. Nothing has been locked yet at this point,
+		// so a plain close is all this branch ever needs.
+		return nil, true, fmt.Errorf("lock file %s was deleted while this process was opening it (0 hard links)", path)
+	}
+	if st.Nlink > 1 {
+		return nil, false, fmt.Errorf("lock file %s has %d hard links, want exactly 1: refusing to lock a file that may alias another path", path, st.Nlink)
 	}
 
 	// The chown is a hard precondition when it applies, not a best-effort
@@ -342,7 +465,21 @@ func acquireLock(path string) (unlock func(), err error) {
 	// to prevent it. Unlinking it here is what closes the loop the previous
 	// version of this error asked the user to close by hand ("remove the
 	// file and try again"); this does that removal itself instead of asking.
-	if created && os.Geteuid() == 0 {
+	//
+	// Unlinking path here by name, rather than the inode this descriptor
+	// holds, is exactly the shape of change that used to break mutual
+	// exclusion for a concurrent waiter: a second process's reopen can have
+	// already succeeded against this same inode, in the window between this
+	// call's O_EXCL and this point, and go on to flock it and proceed as
+	// though it had exclusive access to whatever is at path -- which, after
+	// this unlink, it no longer does. That is what the post-flock
+	// path/inode check below (case 3 in lockOpenAttempts's comment) exists
+	// to catch, in that OTHER call, not this one: this call itself never
+	// reaches the flock below on either failure branch here, so what makes
+	// this unlink safe is not anything added in this call's own path, but
+	// every caller of acquireLockOnce validating what it locked, after it
+	// locked it, against what the name currently resolves to.
+	if created && geteuid() == 0 {
 		uidStr, gidStr := os.Getenv("SUDO_UID"), os.Getenv("SUDO_GID")
 		if uidStr != "" && gidStr != "" {
 			uid, uerr := strconv.Atoi(uidStr)
@@ -358,11 +495,11 @@ func acquireLock(path string) (unlock func(), err error) {
 			// not return one.
 			if uerr != nil || gerr != nil {
 				_ = os.Remove(path)
-				return nil, fmt.Errorf("lock file %s was created owned by root, but SUDO_UID=%q / SUDO_GID=%q could not be parsed as integers (%v / %v): the file has been removed rather than left root-owned -- try again", path, uidStr, gidStr, uerr, gerr)
+				return nil, false, fmt.Errorf("lock file %s was created owned by root, but SUDO_UID=%q / SUDO_GID=%q could not be parsed as integers (%v / %v): the file has been removed rather than left root-owned -- try again", path, uidStr, gidStr, uerr, gerr)
 			}
 			if cerr := f.Chown(uid, gid); cerr != nil {
 				_ = os.Remove(path)
-				return nil, fmt.Errorf("lock file %s was created owned by root and could not be chowned to the invoking user (uid %d, gid %d): %w -- the file has been removed rather than left root-owned; try again", path, uid, gid, cerr)
+				return nil, false, fmt.Errorf("lock file %s was created owned by root and could not be chowned to the invoking user (uid %d, gid %d): %w -- the file has been removed rather than left root-owned; try again", path, uid, gid, cerr)
 			}
 		}
 	}
@@ -370,25 +507,66 @@ func acquireLock(path string) (unlock func(), err error) {
 	// LOCK_EX|LOCK_NB in a bounded retry loop, not a bare blocking LOCK_EX:
 	// see lockAcquireTimeout's own comment for why a plain LOCK_EX is a
 	// silent, indefinite hang the moment any same-uid process already holds
-	// this lock.
-	deadline := time.Now().Add(lockAcquireTimeout)
+	// this lock. deadline is the caller's, not a fresh one computed here --
+	// see acquireLock's own comment for why it must not be recomputed per
+	// attempt.
 	for {
 		flockErr := syscall.Flock(int(f.Fd()), syscall.LOCK_EX|syscall.LOCK_NB)
 		if flockErr == nil {
 			break
 		}
 		if !errors.Is(flockErr, syscall.EWOULDBLOCK) {
-			return nil, fmt.Errorf("lock file %s: %w", path, flockErr)
+			return nil, false, fmt.Errorf("lock file %s: %w", path, flockErr)
 		}
-		if time.Now().After(deadline) {
-			return nil, fmt.Errorf("timed out after %s waiting for the lock on %s: another kairos-lab process is holding it -- wait for it to finish and try again", lockAcquireTimeout, path)
+		if !time.Now().Before(deadline) {
+			return nil, false, fmt.Errorf("timed out after %s waiting for the lock on %s: another kairos-lab process, or another part of this one, is holding it -- wait for it to finish and try again", lockAcquireTimeout, path)
 		}
 		time.Sleep(lockRetryInterval)
+	}
+
+	// The standard lockfile-validation check, and the reason every one of
+	// this function's callers -- not just this one -- has to run it: flock's
+	// exclusivity is a property of the INODE this descriptor points at, not
+	// of path, and path is the name every OTHER process still finds this
+	// lock by. The two can come apart -- a concurrent unlink-then-recreate
+	// at path, landing anywhere from just after this call's own open to
+	// just after this very flock succeeded -- and when they do, this
+	// descriptor is holding a lock on an orphaned inode that guards nothing:
+	// every other process opens the name, gets the NEW inode now sitting at
+	// path, and locks that one immediately, with zero mutual exclusion from
+	// this call. Comparing a stat of path against a stat of the descriptor
+	// is what tells the two apart: st (from the fstat above, unaffected by
+	// the chown, which changes ownership, not device or inode) is this
+	// descriptor's identity; pathStat is a fresh Lstat of the name, not a
+	// Stat, on the same not-attacker-controlled-input reasoning as the
+	// O_NOFOLLOW open above -- a symlink now sitting at path should not be
+	// followed even just to compare, since its own device+inode will simply
+	// (and correctly) fail to match this descriptor's either way. A path
+	// that no longer exists at all (ENOENT) is folded into the same
+	// mismatch, for the same reason as Nlink == 0 above: this descriptor's
+	// lock does not guard whatever is or is not at path any more, and that
+	// is the whole of what this check exists to catch.
+	//
+	// This also makes a user's manual `rm` of the lock file safe -- which
+	// matters because the timed-out error above used to recommend exactly
+	// that ("remove the file and try again", in an earlier version of this
+	// comment) -- rather than a second, silent way to end up with two
+	// processes each believing they hold exclusive access.
+	//
+	// On mismatch this is folded into the same retry as cases 1 and 2 above
+	// (see lockOpenAttempts's comment): the lock this attempt holds is
+	// unlocked and closed, and the caller starts over from the open.
+	var pathStat syscall.Stat_t
+	if serr := syscall.Lstat(path, &pathStat); serr != nil || pathStat.Dev != st.Dev || pathStat.Ino != st.Ino {
+		_ = syscall.Flock(int(f.Fd()), syscall.LOCK_UN)
+		cleanup()
+		closed = true
+		return nil, true, fmt.Errorf("lock file %s was replaced or removed while this process held its lock (path now resolves to a different inode, or none)", path)
 	}
 
 	return func() {
 		_ = syscall.Flock(int(f.Fd()), syscall.LOCK_UN)
 		closed = true
 		_ = f.Close()
-	}, nil
+	}, false, nil
 }
